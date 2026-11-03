@@ -1,0 +1,33 @@
+[Unit]
+Description=CloudPanel (Rust Edition)
+Documentation=https://github.com/marwinlewis/cloudpanel-rust
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/cloudpanel/cloudpanel.env
+WorkingDirectory=/var/lib/cloudpanel
+ExecStart=/usr/local/bin/cloudpanel server
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65535
+UMask=0022
+
+# Hardening. CloudPanel manages nginx, certbot, ufw and cron, so it runs as root,
+# but it only gets write access to the paths it manages.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ProtectClock=yes
+ProtectHostname=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+ReadWritePaths=-/etc/nginx -/etc/cron.d -/etc/letsencrypt -/etc/ufw
+
+[Install]
+WantedBy=multi-user.target

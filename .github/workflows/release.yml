@@ -1,0 +1,53 @@
+name: Release
+
+# Push a tag like v0.2.0 to build static Linux binaries and publish a GitHub release.
+# install.sh downloads `cloudpanel-linux-<arch>` and verifies `<asset>.sha256`.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Build
+        run: cross build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          asset=cloudpanel-linux-${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/cloudpanel "$asset"
+          sha256sum "$asset" > "$asset.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cloudpanel-${{ matrix.arch }}
+          path: cloudpanel-linux-${{ matrix.arch }}*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
