@@ -76,6 +76,88 @@ impl SslService {
             key_path.to_string_lossy().into_owned(),
         ))
     }
+
+    /// Force-renew a Let's Encrypt certificate now.
+    pub fn renew_letsencrypt(cert_name: &str) -> Result<(), String> {
+        match run(
+            "certbot",
+            &[
+                "renew",
+                "--cert-name",
+                cert_name,
+                "--force-renewal",
+                "--non-interactive",
+            ],
+        ) {
+            CmdOutcome::Ok(_) => Ok(()),
+            CmdOutcome::Failed(e) => Err(format!("certbot failed: {}", tail(&e, 1200))),
+            CmdOutcome::Missing => Err("certbot is not installed on this server".into()),
+        }
+    }
+
+    pub fn is_letsencrypt(cert_path: &str) -> bool {
+        cert_path.starts_with("/etc/letsencrypt/")
+    }
+
+    /// Parse the leaf certificate of a PEM file.
+    pub fn cert_info(cert_path: &str) -> Option<CertInfo> {
+        let pem = std::fs::read(cert_path).ok()?;
+        Self::cert_info_pem(&pem)
+    }
+
+    pub fn cert_info_pem(pem: &[u8]) -> Option<CertInfo> {
+        let der = rustls_pemfile::certs(&mut &pem[..]).next()?.ok()?;
+        let (_, cert) = x509_parser::parse_x509_certificate(der.as_ref()).ok()?;
+        let not_after = cert.validity().not_after.timestamp();
+        let not_before = cert.validity().not_before.timestamp();
+        let mut names: Vec<String> = Vec::new();
+        if let Ok(Some(san)) = cert.subject_alternative_name() {
+            for n in &san.value.general_names {
+                if let x509_parser::extensions::GeneralName::DNSName(d) = n {
+                    names.push(d.to_string());
+                }
+            }
+        }
+        let now = chrono::Utc::now().timestamp();
+        let issuer_org = cert
+            .issuer()
+            .iter_organization()
+            .next()
+            .and_then(|o| o.as_str().ok())
+            .map(str::to_string);
+        let issuer_cn = cert
+            .issuer()
+            .iter_common_name()
+            .next()
+            .and_then(|c| c.as_str().ok())
+            .map(str::to_string);
+        let subject = cert
+            .subject()
+            .iter_common_name()
+            .next()
+            .and_then(|c| c.as_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let info = CertInfo {
+            issuer: issuer_org.or(issuer_cn).unwrap_or_else(|| "unknown".into()),
+            subject,
+            names,
+            not_before: chrono::DateTime::from_timestamp(not_before, 0).unwrap_or_default(),
+            not_after: chrono::DateTime::from_timestamp(not_after, 0).unwrap_or_default(),
+            days_left: (not_after - now) / 86400,
+        };
+        Some(info)
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CertInfo {
+    pub issuer: String,
+    pub subject: String,
+    pub names: Vec<String>,
+    pub not_before: chrono::DateTime<chrono::Utc>,
+    pub not_after: chrono::DateTime<chrono::Utc>,
+    pub days_left: i64,
 }
 
 fn normalize(pem: &str) -> String {

@@ -353,3 +353,27 @@ dialog.wide { width: min(880px, calc(100vw - 32px)); }
 td.truncate { max-width: 320px; }
 td code.truncate { display: block; max-width: 460px; }
 td.nowrap { white-space: nowrap; }
+
+/* ---------- v0.3 additions ---------- */
+.row.wrap { flex-wrap: wrap; }
+.row.end { justify-content: flex-end; }
+.row.between { justify-content: space-between; }
+.page-tabs { display: flex; flex-wrap: wrap; width: fit-content; max-width: 100%; }
+.logs.tall { min-height: 420px; }
+.logs.short { min-height: 120px; max-height: 260px; }
+code.secret { display: block; flex: 1; padding: 10px 12px; background: var(--surface-2); border-radius: var(--radius-sm); word-break: break-all; font-size: 14px; user-select: all; }
+.dialog-body hr, .card-body hr { border: 0; border-top: 1px solid var(--border); margin: 4px 0; width: 100%; }
+.kv dd .badge { margin-left: auto; }
+.crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; font-size: 13px; }
+.crumbs button { border: 0; background: transparent; padding: 3px 6px; border-radius: 5px; cursor: pointer; color: var(--text-2); font: inherit; }
+.crumbs button:hover { background: var(--surface-2); color: var(--text); }
+.crumbs .sep { color: var(--text-3, var(--text-2)); }
+tr.clickable { cursor: pointer; }
+tr.selected td { background: var(--surface-2); }
+.editor { width: 100%; min-height: 60vh; font-size: 13px; line-height: 1.5; tab-size: 4; white-space: pre; }
+.qr { display: grid; place-items: center; padding: 12px; background: #fff; border-radius: var(--radius-sm); width: fit-content; margin: 0 auto; }
+.qr svg { width: 200px; height: 200px; display: block; }
+.codes { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; font-size: 14px; }
+.progress { height: 6px; background: var(--surface-2); border-radius: 99px; overflow: hidden; }
+.progress > span { display: block; height: 100%; background: var(--accent, #3b82f6); width: 0; transition: width .2s; }
+.stack { display: grid; gap: 16px; }

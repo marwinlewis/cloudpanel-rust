@@ -1,10 +1,12 @@
 pub mod admin_handlers;
+pub mod app_handlers;
 pub mod auth_handlers;
 pub mod cron_handlers;
 pub mod docker_handlers;
 pub mod error;
 pub mod firewall_handlers;
 pub mod site_handlers;
+pub mod ssh_handlers;
 pub mod system_handlers;
 
 use crate::state::SharedState;
@@ -13,7 +15,7 @@ use axum::{
     http::{header, HeaderValue, Method},
     middleware::{self, Next},
     response::Response,
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use error::ApiError;
@@ -43,9 +45,48 @@ pub fn create_api_router(state: SharedState) -> Router {
         )
         .route(
             "/sites/:id",
-            get(site_handlers::get_site).delete(site_handlers::delete_existing_site),
+            get(site_handlers::get_site)
+                .patch(site_handlers::update_site)
+                .delete(site_handlers::delete_existing_site),
         )
-        .route("/sites/:id/ssl", post(site_handlers::setup_site_ssl))
+        .route(
+            "/sites/:id/ssl",
+            post(site_handlers::setup_site_ssl).delete(site_handlers::remove_site_ssl),
+        )
+        .route("/sites/:id/ssl/renew", post(site_handlers::renew_site_ssl))
+        .route("/sites/:id/state", post(site_handlers::set_site_state))
+        .route("/sites/:id/logs", get(site_handlers::get_site_logs))
+        .route("/sites/:id/vhost", get(site_handlers::get_site_vhost))
+        .route("/sites/:id/directives", put(site_handlers::set_site_directives))
+        .route("/sites/:id/basic-auth", put(site_handlers::set_basic_auth))
+        .route("/sites/:id/basic-auth/users", post(site_handlers::add_basic_auth_user))
+        .route(
+            "/sites/:id/basic-auth/users/:uid",
+            delete(site_handlers::delete_basic_auth_user),
+        )
+        // Site apps
+        .route("/sites/:id/app", put(app_handlers::update_app))
+        .route("/sites/:id/app/logs", get(app_handlers::app_logs))
+        .route("/sites/:id/app/install", post(app_handlers::install_dependencies))
+        .route("/sites/:id/app/:action", post(app_handlers::app_action))
+        // SSH / SFTP users
+        .route(
+            "/sites/:id/ssh-users",
+            get(ssh_handlers::list_ssh_users).post(ssh_handlers::create_ssh_user),
+        )
+        .route(
+            "/sites/:id/ssh-users/:uid",
+            patch(ssh_handlers::update_ssh_user).delete(ssh_handlers::delete_ssh_user),
+        )
+        .route(
+            "/sites/:id/ssh-users/:uid/password",
+            post(ssh_handlers::set_ssh_password),
+        )
+        .route("/sites/:id/ssh-users/:uid/keys", post(ssh_handlers::add_ssh_key))
+        .route(
+            "/sites/:id/ssh-users/:uid/keys/:kid",
+            delete(ssh_handlers::delete_ssh_key),
+        )
         // Docker
         .route("/docker/status", get(docker_handlers::get_docker_status))
         .route("/docker/containers", get(docker_handlers::list_docker_containers))

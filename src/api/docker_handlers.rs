@@ -113,6 +113,8 @@ pub async fn proxy_container_to_site(
                     document_root: None,
                     system_user: None,
                     include_www: p.include_www,
+                    app_command: None,
+                    create_user: false,
                 },
             )
         })

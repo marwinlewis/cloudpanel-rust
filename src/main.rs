@@ -221,6 +221,8 @@ async fn main() -> AnyResult<()> {
                     document_root: None,
                     system_user: None,
                     include_www: www,
+                    app_command: None,
+                    create_user: true,
                 },
             )
             .map_err(|e| format!("{e:?}"))?;

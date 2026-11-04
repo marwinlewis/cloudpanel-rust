@@ -1,36 +1,12 @@
 use super::cmd::{run, CmdOutcome};
 use crate::config::Config;
-use crate::db::models::Site;
+use crate::db::models::{BasicAuthUser, Site};
 use crate::fsutil::write_atomic;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 pub struct NginxService;
-
-const PROXY_LOCATION: &str = r#"    location / {
-        proxy_pass http://127.0.0.1:{port};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 300s;
-        proxy_cache_bypass $http_upgrade;
-    }"#;
-
-const STATIC_LOCATION: &str = r#"    root {root};
-    index index.html index.htm;
-
-    location / {
-        try_files $uri $uri/ /index.html;
-    }
-
-    location ~ /\.(?!well-known) {
-        deny all;
-    }"#;
 
 const SECURITY_HEADERS: &str = r#"    add_header X-Content-Type-Options "nosniff" always;
     add_header X-Frame-Options "SAMEORIGIN" always;
@@ -41,18 +17,118 @@ const UPGRADE_MAP_FILE: &str = "cloudpanel-upgrade-map.conf";
 const UPGRADE_MAP: &str =
     "# Managed by CloudPanel\nmap $http_upgrade $connection_upgrade {\n    default upgrade;\n    ''      close;\n}\n";
 
+const MAINTENANCE_PAGE: &str = "<!doctype html><meta charset=utf-8><title>Maintenance</title>\
+<body style=\"font-family:system-ui;display:grid;place-items:center;height:100vh;margin:0\">\
+<p>This site is temporarily unavailable.</p>";
+
 impl NginxService {
-    /// Render the vhost. All interpolated values are validated before reaching here
-    /// (domain via `validate::domain`, paths via `validate::path_within` or derived from config).
-    pub fn generate_config(site: &Site) -> String {
-        let names = site.server_names().join(" ");
-        let location = if site.site_type == "static" {
-            let root = site.document_root.as_deref().unwrap_or("/var/www/html");
-            STATIC_LOCATION.replace("{root}", root)
+    pub fn htpasswd_path(config: &Config, domain: &str) -> PathBuf {
+        config.etc_dir.join("htpasswd").join(domain)
+    }
+
+    fn location_body(site: &Site) -> String {
+        if site.site_type == "static" {
+            return "        try_files $uri $uri/ /index.html;".to_string();
+        }
+        let port = site.target_port.unwrap_or(3000);
+        let ws = if site.websocket {
+            "        proxy_set_header Upgrade $http_upgrade;\n        \
+             proxy_set_header Connection $connection_upgrade;\n        \
+             proxy_cache_bypass $http_upgrade;\n"
         } else {
-            PROXY_LOCATION.replace("{port}", &site.target_port.unwrap_or(3000).to_string())
+            "        proxy_set_header Connection \"\";\n"
         };
+        format!(
+            "        proxy_pass http://127.0.0.1:{port};\n        \
+             proxy_http_version 1.1;\n\
+             {ws}        \
+             proxy_set_header Host $host;\n        \
+             proxy_set_header X-Real-IP $remote_addr;\n        \
+             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        \
+             proxy_set_header X-Forwarded-Proto $scheme;\n        \
+             proxy_read_timeout 300s;"
+        )
+    }
+
+    /// Basic-auth directives for the `location /` block (empty when disabled).
+    fn auth_block(config: &Config, site: &Site) -> String {
+        if !site.basic_auth_enabled {
+            return String::new();
+        }
+        let file = Self::htpasswd_path(config, &site.domain);
+        let allows: Vec<&str> = site
+            .basic_auth_allow
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        let mut out = String::new();
+        if !allows.is_empty() {
+            out.push_str("        satisfy any;\n");
+            for a in &allows {
+                out.push_str(&format!("        allow {a};\n"));
+            }
+            out.push_str("        deny all;\n");
+        }
+        out.push_str(&format!(
+            "        auth_basic \"Restricted\";\n        auth_basic_user_file {};\n",
+            file.display()
+        ));
+        out
+    }
+
+    /// Everything inside the `server {}` block after listen/server_name/TLS.
+    fn server_body(config: &Config, site: &Site) -> String {
         let domain = &site.domain;
+        let mut out = String::new();
+        out.push_str(SECURITY_HEADERS);
+        out.push('\n');
+        if site.ssl_enabled {
+            out.push_str("    add_header Strict-Transport-Security \"max-age=31536000\" always;\n");
+        }
+        out.push_str(&format!(
+            "\n    client_max_body_size {}M;\n    access_log {log}/{domain}.access.log;\n    \
+             error_log {log}/{domain}.error.log;\n\n",
+            site.max_body_mb.clamp(1, 10240),
+            log = config.nginx_log_dir.display(),
+        ));
+
+        if !site.is_active {
+            out.push_str("    location /.well-known/acme-challenge/ {\n        root /var/www/html;\n    }\n\n");
+            out.push_str(&format!(
+                "    location / {{\n        default_type text/html;\n        \
+                 add_header Retry-After 3600 always;\n        return 503 '{MAINTENANCE_PAGE}';\n    }}\n"
+            ));
+            return out;
+        }
+
+        if site.site_type == "static" {
+            let root = site.document_root.as_deref().unwrap_or("/var/www/html");
+            out.push_str(&format!("    root {root};\n    index index.html index.htm;\n\n"));
+        }
+        out.push_str("    location / {\n");
+        out.push_str(&Self::auth_block(config, site));
+        out.push_str(&Self::location_body(site));
+        out.push_str("\n    }\n\n    location ~ /\\.(?!well-known) {\n        deny all;\n    }\n");
+
+        let custom = site.custom_directives.trim();
+        if !custom.is_empty() {
+            out.push_str("\n    # Custom directives\n");
+            for line in custom.lines() {
+                out.push_str("    ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Render the vhost. All interpolated values are validated before reaching here
+    /// (domain via `validate::domain`, paths via `validate::path_within` or derived from config,
+    /// allow-list entries via `validate::cidr`, directives via `validate::nginx_directives`).
+    pub fn generate_config(config: &Config, site: &Site) -> String {
+        let names = site.server_names().join(" ");
+        let body = Self::server_body(config, site);
 
         match (&site.ssl_enabled, &site.ssl_cert_path, &site.ssl_key_path) {
             (true, Some(cert), Some(key)) => format!(
@@ -83,15 +159,7 @@ server {{
     ssl_session_cache shared:cloudpanel_ssl:10m;
     ssl_session_timeout 1d;
 
-{SECURITY_HEADERS}
-    add_header Strict-Transport-Security "max-age=31536000" always;
-
-    client_max_body_size 128M;
-    access_log /var/log/nginx/{domain}.access.log;
-    error_log /var/log/nginx/{domain}.error.log;
-
-{location}
-}}
+{body}}}
 "#
             ),
             _ => format!(
@@ -101,17 +169,47 @@ server {{
     listen [::]:80;
     server_name {names};
 
-{SECURITY_HEADERS}
-
-    client_max_body_size 128M;
-    access_log /var/log/nginx/{domain}.access.log;
-    error_log /var/log/nginx/{domain}.error.log;
-
-{location}
-}}
+{body}}}
 "#
             ),
         }
+    }
+
+    /// Write the htpasswd file for a site (hashes produced by `hash_htpasswd`).
+    pub fn write_htpasswd(config: &Config, domain: &str, users: &[BasicAuthUser]) -> Result<(), String> {
+        let path = Self::htpasswd_path(config, domain);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        }
+        let mut body = String::new();
+        for u in users {
+            body.push_str(&format!("{}:{}\n", u.username, u.password_hash));
+        }
+        // nginx workers (www-data) must be able to read it; hashes are salted SHA-512 crypt.
+        write_atomic(&path, body.as_bytes(), 0o644).map_err(|e| format!("write htpasswd: {e}"))
+    }
+
+    /// Hash a password for nginx basic auth with `openssl passwd -6` (password on stdin).
+    pub fn hash_htpasswd(password: &str) -> Result<String, String> {
+        use super::cmd::{run_with, CmdOpts};
+        let r = run_with(
+            "openssl",
+            &["passwd", "-6", "-stdin"],
+            &CmdOpts::default().stdin(format!("{password}\n")).timeout(10),
+        );
+        if r.missing {
+            // Development fallback: nginx also accepts {PLAIN}, never used on a real server.
+            if cfg!(windows) {
+                return Ok(format!("{{PLAIN}}{password}"));
+            }
+            return Err("openssl is not installed".into());
+        }
+        let out = r.into_result("openssl", "")?;
+        let hash = out.trim().to_string();
+        if !hash.starts_with("$6$") {
+            return Err("openssl returned an unexpected hash".into());
+        }
+        Ok(hash)
     }
 
     fn paths(config: &Config, domain: &str) -> (PathBuf, PathBuf) {
@@ -152,13 +250,14 @@ server {{
         fs::create_dir_all(&config.nginx_sites_available)
             .map_err(|e| format!("Failed to create sites-available: {e}"))?;
         fs::create_dir_all(&config.nginx_sites_enabled).map_err(|e| format!("Failed to create sites-enabled: {e}"))?;
+        let _ = fs::create_dir_all(&config.nginx_log_dir);
         Self::ensure_upgrade_map(config)?;
 
         let (available, enabled) = Self::paths(config, &site.domain);
         let previous = fs::read(&available).ok();
         let was_enabled = enabled.symlink_metadata().is_ok();
 
-        write_atomic(&available, Self::generate_config(site).as_bytes(), 0o644)
+        write_atomic(&available, Self::generate_config(config, site).as_bytes(), 0o644)
             .map_err(|e| format!("Failed to write nginx config: {e}"))?;
         Self::link(&available, &enabled)?;
 
@@ -166,7 +265,9 @@ server {{
             match previous {
                 Some(prev) => {
                     let _ = write_atomic(&available, &prev, 0o644);
-                    if !was_enabled {
+                    if was_enabled {
+                        let _ = Self::link(&available, &enabled);
+                    } else {
                         let _ = fs::remove_file(&enabled);
                     }
                 }
@@ -191,10 +292,16 @@ server {{
                 fs::remove_file(p).map_err(|e| format!("Failed to remove {}: {e}", p.display()))?;
             }
         }
+        let _ = fs::remove_file(Self::htpasswd_path(config, domain));
         Self::test()?;
         Self::reload()?;
         info!("Removed nginx configuration for {domain}");
         Ok(())
+    }
+
+    /// Current vhost file content (for the read-only vhost viewer).
+    pub fn read_vhost(config: &Config, domain: &str) -> Option<String> {
+        fs::read_to_string(Self::paths(config, domain).0).ok()
     }
 
     pub fn test() -> Result<(), String> {
@@ -223,58 +330,95 @@ server {{
 }
 
 #[cfg(test)]
+pub(crate) fn test_site(site_type: &str) -> Site {
+    use chrono::Utc;
+    Site {
+        id: 1,
+        domain: "app.example.com".into(),
+        site_type: site_type.into(),
+        target_port: Some(3000),
+        document_root: Some("/var/www/app.example.com/public".into()),
+        system_user: "cloudpanel".into(),
+        include_www: false,
+        ssl_enabled: false,
+        ssl_auto_renew: true,
+        ssl_cert_path: None,
+        ssl_key_path: None,
+        is_active: true,
+        app_command: None,
+        app_workdir: None,
+        app_env: "{}".into(),
+        app_enabled: false,
+        home_dir: None,
+        websocket: true,
+        max_body_mb: 128,
+        custom_directives: String::new(),
+        basic_auth_enabled: false,
+        basic_auth_allow: String::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
 
-    fn site(site_type: &str) -> Site {
-        Site {
-            id: 1,
-            domain: "app.example.com".into(),
-            site_type: site_type.into(),
-            target_port: Some(3000),
-            document_root: Some("/var/www/app.example.com/public".into()),
-            system_user: "cloudpanel".into(),
-            include_www: false,
-            ssl_enabled: false,
-            ssl_auto_renew: true,
-            ssl_cert_path: None,
-            ssl_key_path: None,
-            is_active: true,
-            app_command: None,
-            app_workdir: None,
-            app_env: "{}".into(),
-            app_enabled: false,
-            home_dir: None,
-            websocket: true,
-            max_body_mb: 128,
-            custom_directives: String::new(),
-            basic_auth_enabled: false,
-            basic_auth_allow: String::new(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
+    fn cfg() -> Config {
+        let mut c = Config::from_env();
+        c.etc_dir = PathBuf::from("/etc/cloudpanel");
+        c.nginx_log_dir = PathBuf::from("/var/log/nginx");
+        c
     }
 
     #[test]
     fn proxy_config() {
-        let c = NginxService::generate_config(&site("nodejs"));
+        let c = NginxService::generate_config(&cfg(), &test_site("nodejs"));
         assert!(c.contains("server_name app.example.com;"));
         assert!(c.contains("proxy_pass http://127.0.0.1:3000;"));
+        assert!(c.contains("proxy_set_header Upgrade $http_upgrade;"));
+        assert!(c.contains("client_max_body_size 128M;"));
+        assert!(c.contains("access_log /var/log/nginx/app.example.com.access.log;"));
         assert!(!c.contains("listen 443"));
     }
 
     #[test]
     fn static_ssl_config_with_www() {
-        let mut s = site("static");
+        let mut s = test_site("static");
         s.include_www = true;
         s.ssl_enabled = true;
         s.ssl_cert_path = Some("/etc/letsencrypt/live/app.example.com/fullchain.pem".into());
         s.ssl_key_path = Some("/etc/letsencrypt/live/app.example.com/privkey.pem".into());
-        let c = NginxService::generate_config(&s);
+        let c = NginxService::generate_config(&cfg(), &s);
         assert!(c.contains("server_name app.example.com www.app.example.com;"));
         assert!(c.contains("root /var/www/app.example.com/public;"));
         assert!(c.contains("listen 443 ssl http2;"));
         assert!(c.contains("return 301 https://$host$request_uri;"));
+        assert!(c.contains("Strict-Transport-Security"));
+    }
+
+    #[test]
+    fn disabled_site_serves_maintenance() {
+        let mut s = test_site("nodejs");
+        s.is_active = false;
+        let c = NginxService::generate_config(&cfg(), &s);
+        assert!(c.contains("return 503 '"));
+        assert!(!c.contains("proxy_pass"));
+    }
+
+    #[test]
+    fn basic_auth_custom_and_no_websocket() {
+        let mut s = test_site("reverse_proxy");
+        s.basic_auth_enabled = true;
+        s.basic_auth_allow = "10.0.0.0/8\n".into();
+        s.websocket = false;
+        s.custom_directives = "location /health {\n    return 200;\n}".into();
+        let c = NginxService::generate_config(&cfg(), &s);
+        assert!(c.contains("auth_basic \"Restricted\";"));
+        #[cfg(unix)]
+        assert!(c.contains("auth_basic_user_file /etc/cloudpanel/htpasswd/app.example.com;"));
+        assert!(c.contains("satisfy any;\n        allow 10.0.0.0/8;\n        deny all;"));
+        assert!(!c.contains("$connection_upgrade"));
+        assert!(c.contains("    location /health {\n        return 200;\n    }\n"));
     }
 }

@@ -1,4 +1,5 @@
 pub mod alerts;
+pub mod apps;
 pub mod backups;
 pub mod cmd;
 pub mod cron;
@@ -9,6 +10,7 @@ pub mod panel_cert;
 pub mod sites;
 pub mod ssl;
 pub mod system_metrics;
+pub mod sysusers;
 
 pub use cron::CronService;
 pub use docker::{ContainerAction, DockerService};

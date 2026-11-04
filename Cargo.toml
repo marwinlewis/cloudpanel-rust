@@ -44,6 +44,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Asset Embedding (for single-binary distribution)
 rust-embed = { version = "8.5" }
 mime_guess = "2.0"
+sha2 = "0.10"
+base64 = "0.22"
+x509-parser = "0.16"
 
 [profile.release]
 lto = true
@@ -54,3 +57,6 @@ panic = "abort"
 # Optimize dependencies in dev builds (Argon2 is extremely slow unoptimized).
 [profile.dev.package."*"]
 opt-level = 2
+
+[dev-dependencies]
+tempfile = "3"

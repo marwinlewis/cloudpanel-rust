@@ -43,3 +43,33 @@ pub fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     }
     Ok(())
 }
+
+/// Last `lines` lines of a text file, reading at most the final 2 MB.
+pub fn tail_file(path: &Path, lines: usize) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const MAX: u64 = 2 * 1024 * 1024;
+    let mut f = fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let start = len.saturating_sub(MAX);
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    f.read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf);
+    let all: Vec<&str> = text.lines().collect();
+    let skip = all.len().saturating_sub(lines);
+    Ok(all[skip..].join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tails_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.log");
+        fs::write(&p, "a\nb\nc\nd\n").unwrap();
+        assert_eq!(tail_file(&p, 2).unwrap(), "c\nd");
+        assert_eq!(tail_file(&p, 10).unwrap(), "a\nb\nc\nd");
+    }
+}
