@@ -21,7 +21,7 @@
 #   --databases LIST   Same as the three flags above, e.g. --databases mariadb,sqlite
 #   --no-fail2ban      Don't install fail2ban
 #   --port N           Port for the panel (default: 8443)
-#   --swap-size GB     Permanent swap file to create if the server has none (default: ask, 2)
+#   --swap-size GB     Create a permanent swap file of this size (0 = no; asked on low-RAM servers)
 #   --no-firewall      Don't configure or enable UFW
 #   --force            Continue on an untested distribution
 #   --uninstall        Remove CloudPanel (keeps data in /var/lib/cloudpanel)
@@ -97,7 +97,7 @@ CloudPanel installer (Debian 11/12/13, Ubuntu 22.04/24.04)
   --databases LIST   Comma-separated: mariadb,mongodb,sqlite (asked interactively if omitted)
   --no-fail2ban      Don't install fail2ban
   --port N           Port for the panel (default: 8443)
-  --swap-size GB     Permanent swap file to create if the server has none (default: ask, 2)
+  --swap-size GB     Create a permanent swap file of this size (0 = no; asked on low-RAM servers)
   --no-firewall      Don't configure or enable UFW
   --force          Continue on an untested distribution
   --uninstall        Remove CloudPanel (keeps data)
@@ -377,13 +377,47 @@ valid_swap_size() {
 
 mem_kb() { awk '/^MemTotal:/ {print $2}' /proc/meminfo; }
 swap_kb() { awk '/^SwapTotal:/ {print $2}' /proc/meminfo; }
+disk_total_kb() { df -Pk / | awk 'NR==2 {print $2}'; }
+disk_free_kb() { df -Pk / | awk 'NR==2 {print $4}'; }
+kb_to_gb() { awk -v k="$1" 'BEGIN {printf "%.1f", k / 1048576}'; }
+
+# Largest swap file (whole GB) the root disk can take: at most 90% of the
+# disk's size, and always leaving 2 GB free for the panel, logs and the build.
+max_swap_gb() {
+  local by_size by_free
+  by_size=$(( $(disk_total_kb) * 9 / 10 / 1048576 ))
+  by_free=$(( ($(disk_free_kb) - 2 * 1048576) / 1048576 ))
+  [ "$by_free" -lt "$by_size" ] && by_size=$by_free
+  [ "$by_size" -lt 0 ] && by_size=0
+  printf '%s' "$by_size"
+}
+
+# Prints why a size is not ideal (empty when it is fine).
+swap_size_concern() {
+  local gb="$1" ram_gb disk_gb
+  ram_gb=$(( ($(mem_kb) + 1048575) / 1048576 ))
+  disk_gb=$(( $(disk_total_kb) / 1048576 ))
+  if [ "$gb" -gt $(( ram_gb * 4 )) ] && [ "$gb" -gt 4 ]; then
+    printf '%s GB is more than 4x this server'"'"'s RAM (%s GB). Swap is far slower than RAM, so the extra space would rarely help and only uses up disk.' "$gb" "$ram_gb"
+  elif [ "$gb" -gt $(( disk_gb / 4 )) ]; then
+    printf '%s GB is more than a quarter of the %s GB disk, leaving less room for sites, databases and backups.' "$gb" "$disk_gb"
+  fi
+}
+
+# Read one line from the terminal into the named variable. Uses /dev/tty
+# because stdin is the script itself when piped from curl.
+ask() {
+  local __var="$1" __prompt="$2" __reply=""
+  printf '%s' "$__prompt"
+  read -r __reply <&3 || __reply=""
+  printf -v "$__var" '%s' "$__reply"
+}
 
 # Create and enable a swap file of $2 GB at $1. Returns 1 (with a warning)
 # when the system does not allow swap, e.g. in containers or OpenVZ/LXC VPSes.
 make_swap_file() {
-  local file="$1" gb="$2" free_kb
-  free_kb=$(df -Pk "$(dirname "$file")" | awk 'NR==2 {print $4}')
-  if [ "$free_kb" -lt $(( (gb + 1) * 1048576 )) ]; then
+  local file="$1" gb="$2"
+  if [ "$gb" -gt "$(max_swap_gb)" ]; then
     warn "Not enough free disk space for a ${gb} GB swap file; skipping"
     return 1
   fi
@@ -399,53 +433,84 @@ make_swap_file() {
   fi
 }
 
-# Offer a permanent swap file when the server has none. Small VPSes run nginx,
-# databases and PHP/Node apps far more reliably with some swap. Asked on
-# /dev/tty because stdin is the script itself when piped from curl.
+# On a low-memory server without swap, offer (never force) a permanent swap
+# file. --swap-size N answers without asking; 0 means no.
 setup_swap() {
   if [ "$(swap_kb)" -gt 0 ]; then
     [ -n "$SWAP_SIZE" ] && [ "$SWAP_SIZE" -gt 0 ] && info "Swap is already enabled; leaving it as it is"
     return
   fi
-  local answer="$SWAP_SIZE"
-  if [ -z "$answer" ]; then
-    if { exec 3</dev/tty; } 2>/dev/null; then
-      printf '\n%sThis server has no swap. A swap file helps small servers avoid running out of memory.%s\n' "$C_BOLD" "$C_RST"
-      while :; do
-        printf 'Swap file size in GB (0 = no swap) [default: 2]: '
-        read -r answer <&3 || answer=""
-        answer=${answer:-2}
-        answer=${answer%[gG]}
-        valid_swap_size "$answer" && break
-        warn "Enter a whole number from 0 to 64"
-      done
-      exec 3<&-
-    else
-      answer=2
+  local size="$SWAP_SIZE" max concern yn
+  if [ -z "$size" ]; then
+    [ "$(mem_kb)" -lt 2000000 ] || return 0
+    if ! { exec 3</dev/tty; } 2>/dev/null; then
+      info "Low memory and no swap; add one later or re-run with --swap-size 2"
+      return 0
     fi
+    max=$(max_swap_gb)
+    printf '\n%sThis server has %s GB of RAM and no swap.%s\n' "$C_BOLD" "$(kb_to_gb "$(mem_kb)")" "$C_RST"
+    cat <<'EOF'
+Swap is disk space the system uses as overflow when RAM runs out. Without it,
+a memory spike (a busy site, a database import, a backup, Composer or npm)
+makes the kernel kill processes such as MySQL or PHP-FPM, and sites go down.
+With swap, the server slows down for a moment instead of crashing.
+Swap is much slower than RAM, so it is a safety net, not extra memory.
+EOF
+    ask yn 'Create a permanent swap file? [Y/n]: '
+    case "$yn" in
+      [nN]*) info "No swap file created"; exec 3<&-; return 0 ;;
+    esac
+    if [ "$max" -lt 1 ]; then
+      warn "Not enough free disk space for a swap file ($(kb_to_gb "$(disk_free_kb)") GB free); skipping"
+      exec 3<&-
+      return 0
+    fi
+    printf 'Disk: %s GB total, %s GB free. Recommended: 2 GB. Maximum here: %s GB.\n' \
+      "$(kb_to_gb "$(disk_total_kb)")" "$(kb_to_gb "$(disk_free_kb)")" "$max"
+    while :; do
+      ask size 'Swap file size in GB [default: 2]: '
+      size=${size:-2}
+      size=${size%[gG]}
+      if ! valid_swap_size "$size" || [ "$size" -lt 1 ]; then
+        warn "Enter a whole number of GB, e.g. 2"
+        continue
+      fi
+      if [ "$size" -gt "$max" ]; then
+        warn "${size} GB does not fit: swap may use at most 90% of the disk and must leave 2 GB free. Maximum here: ${max} GB."
+        continue
+      fi
+      concern=$(swap_size_concern "$size")
+      if [ -n "$concern" ]; then
+        warn "$concern"
+        ask yn "Use ${size} GB anyway? [y/N]: "
+        case "$yn" in [yY]*) ;; *) continue ;; esac
+      fi
+      break
+    done
+    exec 3<&-
+  elif [ "$size" -eq 0 ]; then
+    return 0
+  else
+    max=$(max_swap_gb)
+    [ "$size" -le "$max" ] || die "--swap-size ${size} does not fit on this disk (maximum ${max} GB: at most 90% of the disk, leaving 2 GB free)"
+    concern=$(swap_size_concern "$size")
+    [ -z "$concern" ] || warn "$concern"
   fi
-  if [ "$answer" -eq 0 ]; then
-    info "No swap file created"
-    return
-  fi
-  log "Creating a ${answer} GB swap file at /swapfile"
-  make_swap_file /swapfile "$answer" || return 0
+  log "Creating a ${size} GB swap file at /swapfile"
+  make_swap_file /swapfile "$size" || return 0
   grep -qE '^\s*/swapfile\s' /etc/fstab || printf '/swapfile none swap sw 0 0\n' >> /etc/fstab
   # Prefer RAM; only use swap under real memory pressure.
   printf 'vm.swappiness=10\n' > /etc/sysctl.d/90-cloudpanel-swap.conf
   sysctl -q -w vm.swappiness=10 2>/dev/null || true
 }
 
-# Compiling needs ~2.5 GB of RAM + swap. If the server still has less, add a
+# Compiling needs ~2.5 GB of RAM + swap. If the server has less, add a 2 GB
 # throwaway swap file that cleanup() removes after the build.
 ensure_build_memory() {
-  local total_kb need_gb
-  total_kb=$(( $(mem_kb) + $(swap_kb) ))
-  [ "$total_kb" -ge 2500000 ] && return
-  need_gb=$(( (3000000 - total_kb) / 1048576 + 1 ))
-  log "Adding a temporary ${need_gb} GB swap file for the build (removed afterwards)"
+  [ $(( $(mem_kb) + $(swap_kb) )) -ge 2500000 ] && return
+  log "Adding a temporary 2 GB swap file for the build (deleted afterwards)"
   SWAP_FILE=/cloudpanel-build.swap
-  make_swap_file "$SWAP_FILE" "$need_gb" || { SWAP_FILE=""; warn "The build may run out of memory"; }
+  make_swap_file "$SWAP_FILE" 2 || { SWAP_FILE=""; warn "The build may run out of memory"; }
 }
 
 build_from_source() {
