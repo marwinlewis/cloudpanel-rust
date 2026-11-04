@@ -38,11 +38,7 @@ fn yes() -> bool {
 type Prepared = (Option<i64>, Option<String>, String, String, String);
 
 /// Validate a request into stored values, enforcing site-manager rules.
-fn prepare(
-    conn: &Connection,
-    user: &AuthUser,
-    p: &CronRequest,
-) -> ApiResult<Prepared> {
+fn prepare(conn: &Connection, user: &AuthUser, p: &CronRequest) -> ApiResult<Prepared> {
     let schedule = validate::cron_schedule(&p.schedule).map_err(ApiError::BadRequest)?;
     let command = validate::cron_command(&p.command).map_err(ApiError::BadRequest)?;
     let name = validate::short_text(p.name.as_deref(), 80).map_err(ApiError::BadRequest)?;

@@ -62,6 +62,7 @@ pub async fn create_user(
     let role = role(&p.role)?;
     let pw = p.password;
     let hash = blocking(move || hash_password(&pw).map_err(ApiError::internal)).await?;
+    let actor_name = admin.0.username.clone();
     let id = state
         .db(move |conn| {
             let id = db::create_user(conn, &username, &hash, &email, role).map_err(|e| {
@@ -75,9 +76,18 @@ pub async fn create_user(
                 db::set_user_sites(conn, id, &p.site_ids)?;
             }
             audit::record(conn, &admin.0, "user.create", Some(&username), Some(role));
-            Ok(id)
+            Ok((id, username))
         })
         .await?;
+    let (id, username) = id;
+    if role == ROLE_ADMIN {
+        crate::services::alerts::notify_event(
+            &state.config,
+            &state.pool,
+            "Security: new administrator",
+            &format!("{actor_name} created the administrator account '{username}'."),
+        );
+    }
     Ok((StatusCode::CREATED, Json(json!({ "id": id }))))
 }
 
@@ -172,15 +182,24 @@ pub async fn reset_2fa(
     admin: AdminUser,
     State(state): State<SharedState>,
 ) -> ApiResult<impl IntoResponse> {
+    let actor_name = admin.0.username.clone();
     state
         .db(move |conn| {
             let user = db::find_user_by_id(conn, id)?.ok_or(ApiError::NotFound("User"))?;
             db::disable_totp(conn, id)?;
             db::bump_token_version(conn, id)?;
             audit::record(conn, &admin.0, "user.2fa_reset", Some(&user.username), None);
-            Ok(())
+            Ok(user.username)
         })
-        .await?;
+        .await
+        .map(|name| {
+            crate::services::alerts::notify_event(
+                &state.config,
+                &state.pool,
+                "Security: two-factor authentication reset",
+                &format!("{actor_name} turned off 2FA for '{name}'."),
+            );
+        })?;
     Ok(Json(
         json!({ "message": "Two-factor authentication was turned off for this user" }),
     ))

@@ -283,7 +283,9 @@ async fn main() -> AnyResult<()> {
         services::fail2ban::ensure(&config, &f2b);
     }
     let jwt_secret = load_jwt_secret(&config)?;
-    let tls = config.tls_enabled();
+    let stored_tls = services::panel_cert::load(&*pool.get()?);
+    let tls_paths = services::panel_cert::effective_paths(&config, stored_tls.as_ref());
+    let tls = tls_paths.is_some();
     let addr: SocketAddr = config
         .bind_addr
         .parse()
@@ -310,7 +312,7 @@ async fn main() -> AnyResult<()> {
     let listener = std::net::TcpListener::bind(addr).map_err(|e| format!("Cannot listen on {addr}: {e}"))?;
     listener.set_nonblocking(true)?;
 
-    if let (Some(cert), Some(key)) = (&config.tls_cert, &config.tls_key) {
+    if let Some((cert, key)) = &tls_paths {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
             .await

@@ -17,7 +17,6 @@ pub mod system;
 pub mod system_metrics;
 pub mod sysusers;
 
-pub use docker::{ContainerAction, DockerService};
 pub use nginx::NginxService;
 pub use ssl::SslService;
 pub use system_metrics::MetricsCollector;

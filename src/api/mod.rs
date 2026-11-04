@@ -1,4 +1,5 @@
 pub mod admin_handlers;
+pub mod alert_handlers;
 pub mod app_handlers;
 pub mod auth_handlers;
 pub mod backup_handlers;
@@ -178,7 +179,15 @@ pub fn create_api_router(state: SharedState) -> Router {
         .route("/system/reboot", post(service_handlers::reboot))
         // Docker
         .route("/docker/status", get(docker_handlers::get_docker_status))
-        .route("/docker/containers", get(docker_handlers::list_docker_containers))
+        .route(
+            "/docker/containers",
+            get(docker_handlers::list_docker_containers).post(docker_handlers::create_container),
+        )
+        .route("/docker/stats", get(docker_handlers::docker_stats))
+        .route(
+            "/docker/containers/:id",
+            delete(docker_handlers::remove_docker_container),
+        )
         .route(
             "/docker/containers/:id/start",
             post(docker_handlers::start_docker_container),
@@ -195,6 +204,34 @@ pub fn create_api_router(state: SharedState) -> Router {
         .route(
             "/docker/containers/:id/proxy-site",
             post(docker_handlers::proxy_container_to_site),
+        )
+        .route(
+            "/docker/images",
+            get(docker_handlers::list_images).post(docker_handlers::pull_image),
+        )
+        .route("/docker/images/prune", post(docker_handlers::prune_images))
+        .route("/docker/images/*id", delete(docker_handlers::remove_image))
+        .route("/docker/stacks", get(docker_handlers::list_stacks))
+        .route(
+            "/docker/stacks/:name",
+            get(docker_handlers::get_stack).put(docker_handlers::save_stack),
+        )
+        .route("/docker/stacks/:name/logs", get(docker_handlers::stack_logs))
+        .route("/docker/stacks/:name/:action", post(docker_handlers::stack_action))
+        // Alerts & panel certificate
+        .route("/alerts", get(alert_handlers::get_alerts))
+        .route("/alerts/rules", put(alert_handlers::set_rules))
+        .route("/alerts/channels", post(alert_handlers::create_channel))
+        .route(
+            "/alerts/channels/:id",
+            delete(alert_handlers::delete_channel).patch(alert_handlers::set_channel_enabled),
+        )
+        .route("/alerts/channels/:id/test", post(alert_handlers::test_channel))
+        .route(
+            "/settings/panel-cert",
+            get(alert_handlers::get_panel_cert)
+                .post(alert_handlers::issue_panel_cert)
+                .delete(alert_handlers::remove_panel_cert),
         )
         // Firewall
         .route(

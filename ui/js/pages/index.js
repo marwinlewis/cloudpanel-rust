@@ -10,11 +10,13 @@ import { renderServices } from './services.js';
 import { renderUsers } from './users.js';
 import { renderEvents } from './events.js';
 import { renderSecurity } from './security.js';
+import { renderAlerts } from './alerts.js';
 // Site detail tabs register themselves.
 import './site-files.js';
 import './site-databases.js';
 import './site-backups.js';
 import './settings-account.js';
+import './settings-panel.js';
 
 export const ROUTES = {
   overview: { title: 'Overview', render: renderOverview, icon: 'overview', section: '', admin: true },
@@ -26,6 +28,7 @@ export const ROUTES = {
   docker: { title: 'Containers', render: renderDocker, icon: 'box', section: 'Server', admin: true },
   users: { title: 'Users', render: renderUsers, icon: 'users', section: 'Admin', admin: true },
   events: { title: 'Events', render: renderEvents, icon: 'activity', section: 'Admin', admin: true },
+  alerts: { title: 'Alerts', render: renderAlerts, icon: 'bell', section: 'Admin', admin: true },
   settings: { title: 'Settings', render: renderSettings, icon: 'settings', section: 'Admin' },
 };
 

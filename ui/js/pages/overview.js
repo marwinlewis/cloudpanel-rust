@@ -109,6 +109,13 @@ export function renderOverview(view) {
       ['Kernel', m.kernel_version], ['Uptime', fmtUptime(m.uptime_seconds)],
       ['Swap', m.total_swap_bytes ? `${fmtBytes(m.used_swap_bytes)} of ${fmtBytes(m.total_swap_bytes)}` : 'None'],
     ];
+    if (sysInfo) {
+      if (sysInfo.public_ipv4) rows.push(['Public IPv4', sysInfo.public_ipv4]);
+      if (sysInfo.public_ipv6) rows.push(['Public IPv6', sysInfo.public_ipv6]);
+      rows.push(['Updates', sysInfo.updates_checked_at ? `${sysInfo.pending_updates} pending (${sysInfo.security_updates} security)` : 'Not checked']);
+      if (sysInfo.reboot_required) rows.push(['Reboot', 'Required to finish updates']);
+      rows.push(['CloudPanel', `v${sysInfo.panel_version}`]);
+    }
     info.replaceChildren(...rows.flatMap(([k, v]) => [h('dt', { text: k }), h('dd', { class: 'truncate', text: v })]));
 
     disks.replaceChildren(...(m.disks.length ? m.disks.map((d) => h('div', { class: 'disk' },
@@ -125,6 +132,8 @@ export function renderOverview(view) {
       h('td', { class: 'num', text: fmtBytes(p.memory_bytes) }))));
   }
 
+  let sysInfo = null;
+  api('/system/info').then((x) => { sysInfo = x; }).catch(() => {});
   tick();
   const timer = setInterval(tick, 3000);
   const onVisible = () => { if (!document.hidden) tick(); };

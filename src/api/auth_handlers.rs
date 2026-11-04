@@ -380,6 +380,7 @@ pub async fn totp_disable(
     Json(p): Json<PasswordConfirm>,
 ) -> ApiResult<impl IntoResponse> {
     check_own_password(&state, &auth, p.password).await?;
+    let name = auth.username.clone();
     state
         .db(move |conn| {
             db::disable_totp(conn, auth.id)?;
@@ -387,6 +388,12 @@ pub async fn totp_disable(
             Ok(())
         })
         .await?;
+    crate::services::alerts::notify_event(
+        &state.config,
+        &state.pool,
+        "Security: two-factor authentication disabled",
+        &format!("'{name}' turned off two-factor authentication."),
+    );
     Ok(Json(json!({ "message": "Two-factor authentication disabled" })))
 }
 
