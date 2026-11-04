@@ -21,7 +21,7 @@
 #   --databases LIST   Same as the three flags above, e.g. --databases mariadb,sqlite
 #   --no-fail2ban      Don't install fail2ban
 #   --port N           Port for the panel (default: 8443)
-#   --swap-size GB     Temporary swap for a low-memory source build (default: 2, 0 = none)
+#   --swap-size GB     Permanent swap file to create if the server has none (default: ask, 2)
 #   --no-firewall      Don't configure or enable UFW
 #   --force            Continue on an untested distribution
 #   --uninstall        Remove CloudPanel (keeps data in /var/lib/cloudpanel)
@@ -97,7 +97,7 @@ CloudPanel installer (Debian 11/12/13, Ubuntu 22.04/24.04)
   --databases LIST   Comma-separated: mariadb,mongodb,sqlite (asked interactively if omitted)
   --no-fail2ban      Don't install fail2ban
   --port N           Port for the panel (default: 8443)
-  --swap-size GB     Temporary swap for a low-memory source build (default: 2, 0 = none)
+  --swap-size GB     Permanent swap file to create if the server has none (default: ask, 2)
   --no-firewall      Don't configure or enable UFW
   --force          Continue on an untested distribution
   --uninstall        Remove CloudPanel (keeps data)
@@ -375,49 +375,77 @@ valid_swap_size() {
   [ "$1" -le 64 ]
 }
 
-# Ask how big the temporary build swap should be (default 2 GB). Uses
-# /dev/tty because stdin is the script itself when piped from curl.
-choose_swap_size() {
-  [ -n "$SWAP_SIZE" ] && return
-  local answer=""
-  if { exec 3</dev/tty; } 2>/dev/null; then
-    while :; do
-      printf '\n%sThis server has less than 1.5 GB of memory. Compiling needs extra swap.%s\n' "$C_BOLD" "$C_RST"
-      printf 'Temporary swap file size in GB (0 = none, removed after the build) [default: 2]: '
-      read -r answer <&3 || answer=""
-      answer=${answer:-2}
-      answer=${answer%[gG]}
-      valid_swap_size "$answer" && break
-      warn "Enter a whole number from 0 to 64"
-    done
-    exec 3<&-
+mem_kb() { awk '/^MemTotal:/ {print $2}' /proc/meminfo; }
+swap_kb() { awk '/^SwapTotal:/ {print $2}' /proc/meminfo; }
+
+# Create and enable a swap file of $2 GB at $1. Returns 1 (with a warning)
+# when the system does not allow swap, e.g. in containers or OpenVZ/LXC VPSes.
+make_swap_file() {
+  local file="$1" gb="$2" free_kb
+  free_kb=$(df -Pk "$(dirname "$file")" | awk 'NR==2 {print $4}')
+  if [ "$free_kb" -lt $(( (gb + 1) * 1048576 )) ]; then
+    warn "Not enough free disk space for a ${gb} GB swap file; skipping"
+    return 1
   fi
-  SWAP_SIZE=${answer:-2}
+  rm -f "$file"
+  if ! fallocate -l "${gb}G" "$file" 2>/dev/null; then
+    dd if=/dev/zero of="$file" bs=1M count=$((gb * 1024)) status=none
+  fi
+  chmod 600 "$file"
+  if ! mkswap "$file" >/dev/null 2>&1 || ! swapon "$file" 2>/dev/null; then
+    rm -f "$file"
+    warn "This system does not allow swap files (container or OpenVZ/LXC VPS?); skipping"
+    return 1
+  fi
 }
 
-ensure_build_memory() {
-  local mem_kb swap_kb free_kb
-  mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
-  swap_kb=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
-  if [ $((mem_kb + swap_kb)) -lt 1600000 ]; then
-    choose_swap_size
-    if [ "$SWAP_SIZE" -eq 0 ]; then
-      warn "No swap added; the build may run out of memory"
-      return
-    fi
-    free_kb=$(df -Pk / | awk 'NR==2 {print $4}')
-    if [ "$free_kb" -lt $(( (SWAP_SIZE + 3) * 1048576 )) ]; then
-      die "Not enough disk space for a ${SWAP_SIZE} GB swap file plus the build (~3 GB). Use a smaller --swap-size."
-    fi
-    log "Adding a temporary ${SWAP_SIZE} GB swap file for the build"
-    SWAP_FILE=/cloudpanel-build.swap
-    if ! fallocate -l "${SWAP_SIZE}G" "$SWAP_FILE" 2>/dev/null; then
-      dd if=/dev/zero of="$SWAP_FILE" bs=1M count=$((SWAP_SIZE * 1024)) status=none
-    fi
-    chmod 600 "$SWAP_FILE"
-    mkswap "$SWAP_FILE" >/dev/null
-    swapon "$SWAP_FILE"
+# Offer a permanent swap file when the server has none. Small VPSes run nginx,
+# databases and PHP/Node apps far more reliably with some swap. Asked on
+# /dev/tty because stdin is the script itself when piped from curl.
+setup_swap() {
+  if [ "$(swap_kb)" -gt 0 ]; then
+    [ -n "$SWAP_SIZE" ] && [ "$SWAP_SIZE" -gt 0 ] && info "Swap is already enabled; leaving it as it is"
+    return
   fi
+  local answer="$SWAP_SIZE"
+  if [ -z "$answer" ]; then
+    if { exec 3</dev/tty; } 2>/dev/null; then
+      printf '\n%sThis server has no swap. A swap file helps small servers avoid running out of memory.%s\n' "$C_BOLD" "$C_RST"
+      while :; do
+        printf 'Swap file size in GB (0 = no swap) [default: 2]: '
+        read -r answer <&3 || answer=""
+        answer=${answer:-2}
+        answer=${answer%[gG]}
+        valid_swap_size "$answer" && break
+        warn "Enter a whole number from 0 to 64"
+      done
+      exec 3<&-
+    else
+      answer=2
+    fi
+  fi
+  if [ "$answer" -eq 0 ]; then
+    info "No swap file created"
+    return
+  fi
+  log "Creating a ${answer} GB swap file at /swapfile"
+  make_swap_file /swapfile "$answer" || return 0
+  grep -qE '^\s*/swapfile\s' /etc/fstab || printf '/swapfile none swap sw 0 0\n' >> /etc/fstab
+  # Prefer RAM; only use swap under real memory pressure.
+  printf 'vm.swappiness=10\n' > /etc/sysctl.d/90-cloudpanel-swap.conf
+  sysctl -q -w vm.swappiness=10 2>/dev/null || true
+}
+
+# Compiling needs ~2.5 GB of RAM + swap. If the server still has less, add a
+# throwaway swap file that cleanup() removes after the build.
+ensure_build_memory() {
+  local total_kb need_gb
+  total_kb=$(( $(mem_kb) + $(swap_kb) ))
+  [ "$total_kb" -ge 2500000 ] && return
+  need_gb=$(( (3000000 - total_kb) / 1048576 + 1 ))
+  log "Adding a temporary ${need_gb} GB swap file for the build (removed afterwards)"
+  SWAP_FILE=/cloudpanel-build.swap
+  make_swap_file "$SWAP_FILE" "$need_gb" || { SWAP_FILE=""; warn "The build may run out of memory"; }
 }
 
 build_from_source() {
@@ -428,15 +456,18 @@ build_from_source() {
   export RUSTUP_HOME="$TMP_DIR/rustup" CARGO_HOME="$TMP_DIR/cargo"
   # Keep rustup's unpacking and cargo's parallel jobs light on small servers.
   export RUSTUP_IO_THREADS=1 TMPDIR="$TMP_DIR"
-  if [ "$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)" -lt 2000000 ]; then
+  if [ "$(mem_kb)" -lt 2000000 ]; then
     export CARGO_BUILD_JOBS=1
   fi
+  info "Installing the Rust toolchain"
   curl -fsSL --proto '=https' --tlsv1.2 https://sh.rustup.rs -o "$TMP_DIR/rustup-init.sh"
-  sh "$TMP_DIR/rustup-init.sh" -y -q --profile minimal --no-modify-path >/dev/null
+  sh "$TMP_DIR/rustup-init.sh" -y -q --profile minimal --no-modify-path
   local ref="$BRANCH"
   [ "$VERSION" != "latest" ] && ref="$VERSION"
+  info "Downloading the source (${ref})"
   git clone -q --depth 1 --branch "$ref" "https://github.com/${REPO}.git" "$TMP_DIR/src"
-  (cd "$TMP_DIR/src" && "$CARGO_HOME/bin/cargo" build --release --locked -q)
+  info "Compiling. Progress is shown below; on a 1 CPU server this takes about 5-15 minutes."
+  (cd "$TMP_DIR/src" && "$CARGO_HOME/bin/cargo" build --release --locked)
   NEW_BIN="$TMP_DIR/src/target/release/cloudpanel"
 }
 
@@ -666,6 +697,7 @@ main() {
     exit 0
   fi
   detect_os
+  setup_swap
   choose_databases
   install_packages
   install_databases
