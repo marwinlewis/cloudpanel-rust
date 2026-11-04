@@ -11,6 +11,19 @@ pub struct Config {
     pub cron_file: PathBuf,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
+    /// Parent of site users' home directories.
+    pub home_dir: PathBuf,
+    pub backup_dir: PathBuf,
+    pub systemd_dir: PathBuf,
+    /// `/etc/cloudpanel`: env files, htpasswd files, encryption key.
+    pub etc_dir: PathBuf,
+    pub log_dir: PathBuf,
+    pub stacks_dir: PathBuf,
+    pub nginx_log_dir: PathBuf,
+    pub fail2ban_dir: PathBuf,
+    pub sshd_config_dir: PathBuf,
+    /// Database engines selected at install time (`CLOUDPANEL_DB_ENGINES`).
+    pub db_engines: Vec<String>,
 }
 
 fn env_or(key: &str, linux_default: &str, dev_default: &str) -> String {
@@ -57,6 +70,33 @@ impl Config {
             )),
             tls_cert: env_path("CLOUDPANEL_TLS_CERT"),
             tls_key: env_path("CLOUDPANEL_TLS_KEY"),
+            home_dir: PathBuf::from(env_or("CLOUDPANEL_HOME_DIR", "/home", "./data/home")),
+            backup_dir: PathBuf::from(env_or(
+                "CLOUDPANEL_BACKUP_DIR",
+                "/var/backups/cloudpanel",
+                "./data/backups",
+            )),
+            systemd_dir: PathBuf::from(env_or(
+                "CLOUDPANEL_SYSTEMD_DIR",
+                "/etc/systemd/system",
+                "./data/systemd",
+            )),
+            etc_dir: PathBuf::from(env_or("CLOUDPANEL_ETC_DIR", "/etc/cloudpanel", "./data/etc")),
+            log_dir: PathBuf::from(env_or("CLOUDPANEL_LOG_DIR", "/var/log/cloudpanel", "./data/log")),
+            stacks_dir: env_path("CLOUDPANEL_STACKS_DIR").unwrap_or_else(|| data_dir.join("stacks")),
+            nginx_log_dir: PathBuf::from(env_or("CLOUDPANEL_NGINX_LOG_DIR", "/var/log/nginx", "./data/log/nginx")),
+            fail2ban_dir: PathBuf::from(env_or("CLOUDPANEL_FAIL2BAN_DIR", "/etc/fail2ban", "./data/fail2ban")),
+            sshd_config_dir: PathBuf::from(env_or(
+                "CLOUDPANEL_SSHD_DIR",
+                "/etc/ssh/sshd_config.d",
+                "./data/ssh/sshd_config.d",
+            )),
+            db_engines: std::env::var("CLOUDPANEL_DB_ENGINES")
+                .unwrap_or_else(|_| if cfg!(windows) { "sqlite".into() } else { String::new() })
+                .split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| matches!(s.as_str(), "mariadb" | "mongodb" | "sqlite"))
+                .collect(),
             data_dir,
         }
     }
@@ -72,5 +112,14 @@ impl Config {
 
     pub fn ssl_dir(&self) -> PathBuf {
         self.data_dir.join("ssl")
+    }
+
+    /// Dev mode: running on a non-Linux host where system tools are absent.
+    pub fn is_dev(&self) -> bool {
+        cfg!(windows)
+    }
+
+    pub fn engine_configured(&self, engine: &str) -> bool {
+        self.db_engines.iter().any(|e| e == engine)
     }
 }

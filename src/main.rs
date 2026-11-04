@@ -1,8 +1,14 @@
+// Temporary while features land phase by phase; removed once every helper is wired up.
+#![allow(dead_code)]
 mod api;
+mod audit;
 mod auth;
+mod authz;
 mod config;
 mod db;
 mod fsutil;
+mod jobs;
+mod scheduler;
 mod services;
 mod state;
 mod validate;
@@ -244,6 +250,7 @@ async fn main() -> AnyResult<()> {
     drop(conn);
 
     seed_admin(&config, &pool)?;
+    db::fail_stale_jobs(&*pool.get()?)?;
     let jwt_secret = load_jwt_secret(&config)?;
     let tls = config.tls_enabled();
     let addr: SocketAddr = config
@@ -257,9 +264,11 @@ async fn main() -> AnyResult<()> {
         jwt_secret,
         limiter: LoginLimiter::default(),
         metrics: Arc::new(Mutex::new(MetricsCollector::default())),
+        tls: Mutex::new(None),
     });
+    scheduler::start(state.clone());
 
-    let app = api::create_api_router(state).fallback(web::static_handler);
+    let app = api::create_api_router(state.clone()).fallback(web::static_handler);
     let app = web::with_security_headers(app, tls).layer(CompressionLayer::new());
     let service = app.into_make_service_with_connect_info::<SocketAddr>();
 
@@ -275,6 +284,7 @@ async fn main() -> AnyResult<()> {
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
             .await
             .map_err(|e| format!("Failed to load TLS certificate {}: {e}", cert.display()))?;
+        *state.tls.lock().unwrap_or_else(|e| e.into_inner()) = Some(tls_config.clone());
         info!("CloudPanel listening on https://{addr}");
         axum_server::from_tcp_rustls(listener, tls_config)
             .handle(handle)

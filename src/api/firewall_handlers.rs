@@ -47,11 +47,19 @@ pub async fn add_rule(
 
     let rule = state
         .db(move |conn| {
-            if firewall_rule_exists(conn, port, protocol.as_str(), action.as_str())? {
+            let new = crate::db::NewRule {
+                port: Some(port),
+                port_end: None,
+                protocol: protocol.as_str(),
+                action: action.as_str(),
+                source: None,
+                comment: comment.as_deref(),
+            };
+            if firewall_rule_exists(conn, &new)? {
                 return Err(ApiError::Conflict("That rule already exists".into()));
             }
             FirewallService::add(port, protocol, action).map_err(ApiError::Unprocessable)?;
-            let id = create_firewall_rule(conn, port, protocol.as_str(), action.as_str(), comment.as_deref())?;
+            let id = create_firewall_rule(conn, &new)?;
             Ok(find_firewall_rule(conn, id)?)
         })
         .await?;
@@ -68,7 +76,7 @@ pub async fn delete_rule(
             let rule = find_firewall_rule(conn, id)?.ok_or(ApiError::NotFound("Rule"))?;
             let protocol = Protocol::parse(&rule.protocol).unwrap_or(Protocol::Tcp);
             let action = Action::parse(&rule.action).unwrap_or(Action::Allow);
-            FirewallService::delete(rule.port, protocol, action).map_err(ApiError::Unprocessable)?;
+            FirewallService::delete(rule.port.unwrap_or(0), protocol, action).map_err(ApiError::Unprocessable)?;
             delete_firewall_rule(conn, id)?;
             Ok(())
         })

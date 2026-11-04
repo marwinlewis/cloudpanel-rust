@@ -5,3 +5,7 @@
 *.db-shm
 jwt.secret
 initial_admin_password
+/target-preview
+/data-dev
+/.claude
+/dev-preview.cmd

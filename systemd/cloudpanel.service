@@ -15,19 +15,22 @@ RestartSec=3
 LimitNOFILE=65535
 UMask=0022
 
-# Hardening. CloudPanel manages nginx, certbot, ufw and cron, so it runs as root,
-# but it only gets write access to the paths it manages.
+# Hardening. CloudPanel manages nginx, certbot, ufw, cron, site users and their apps,
+# so it runs as root, but it only gets write access to the paths it manages.
+# Tools that must rewrite /etc/passwd or /usr (useradd, apt-get) are run outside this
+# sandbox in transient units via systemd-run.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
-ProtectHome=read-only
 ProtectClock=yes
 ProtectHostname=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes
-ReadWritePaths=-/etc/nginx -/etc/cron.d -/etc/letsencrypt -/etc/ufw
+ReadWritePaths=-/etc/nginx -/etc/cron.d -/etc/letsencrypt -/etc/ufw -/etc/cloudpanel -/etc/fail2ban
+ReadWritePaths=-/etc/systemd/system -/etc/ssh/sshd_config.d -/home -/var/www -/var/backups/cloudpanel
+ReadWritePaths=-/var/log/cloudpanel -/var/lib/cloudpanel
 
 [Install]
 WantedBy=multi-user.target

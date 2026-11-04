@@ -39,22 +39,46 @@ pub async fn list_docker_containers(_admin: AdminUser) -> ApiResult<impl IntoRes
     Ok(Json(containers))
 }
 
-async fn act(id: String, action: ContainerAction) -> ApiResult<impl IntoResponse> {
+async fn act(
+    state: SharedState,
+    admin: AdminUser,
+    id: String,
+    action: ContainerAction,
+) -> ApiResult<impl IntoResponse> {
     let id = container(&id)?;
-    blocking(move || DockerService::act(&id, action).map_err(ApiError::Unprocessable)).await?;
+    let cid = id.clone();
+    blocking(move || DockerService::act(&cid, action).map_err(ApiError::Unprocessable)).await?;
+    state
+        .db(move |conn| {
+            crate::audit::record(conn, &admin.0, &format!("docker.{}", action.as_str()), Some(&id), None);
+            Ok(())
+        })
+        .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-pub async fn start_docker_container(Path(id): Path<String>, _admin: AdminUser) -> ApiResult<impl IntoResponse> {
-    act(id, ContainerAction::Start).await
+pub async fn start_docker_container(
+    Path(id): Path<String>,
+    admin: AdminUser,
+    State(state): State<SharedState>,
+) -> ApiResult<impl IntoResponse> {
+    act(state, admin, id, ContainerAction::Start).await
 }
 
-pub async fn stop_docker_container(Path(id): Path<String>, _admin: AdminUser) -> ApiResult<impl IntoResponse> {
-    act(id, ContainerAction::Stop).await
+pub async fn stop_docker_container(
+    Path(id): Path<String>,
+    admin: AdminUser,
+    State(state): State<SharedState>,
+) -> ApiResult<impl IntoResponse> {
+    act(state, admin, id, ContainerAction::Stop).await
 }
 
-pub async fn restart_docker_container(Path(id): Path<String>, _admin: AdminUser) -> ApiResult<impl IntoResponse> {
-    act(id, ContainerAction::Restart).await
+pub async fn restart_docker_container(
+    Path(id): Path<String>,
+    admin: AdminUser,
+    State(state): State<SharedState>,
+) -> ApiResult<impl IntoResponse> {
+    act(state, admin, id, ContainerAction::Restart).await
 }
 
 pub async fn get_docker_logs(

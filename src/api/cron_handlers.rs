@@ -43,7 +43,17 @@ pub async fn add_cron_job(
                 find_site_by_id(conn, site_id)?.ok_or(ApiError::NotFound("Site"))?;
             }
             let tx = conn.unchecked_transaction()?;
-            let id = create_cron_job(&tx, p.site_id, &schedule, &command, &user)?;
+            let id = create_cron_job(
+                &tx,
+                &crate::db::CronInput {
+                    site_id: p.site_id,
+                    name: None,
+                    schedule: &schedule,
+                    command: &command,
+                    user: &user,
+                    is_active: true,
+                },
+            )?;
             CronService::apply(&cron_file, &list_cron_jobs(&tx)?).map_err(ApiError::internal)?;
             tx.commit()?;
             Ok(id)

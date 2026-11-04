@@ -55,6 +55,7 @@ mod tests {
             CronJob {
                 id: 1,
                 site_id: None,
+                name: None,
                 schedule: "0 3 * * *".into(),
                 command: "date +%F >> /tmp/x".into(),
                 user: "root".into(),
@@ -64,6 +65,7 @@ mod tests {
             CronJob {
                 id: 2,
                 site_id: None,
+                name: None,
                 schedule: "@hourly".into(),
                 command: "true".into(),
                 user: "www-data".into(),

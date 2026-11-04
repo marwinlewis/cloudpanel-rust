@@ -45,6 +45,7 @@ pub async fn login(
     }
 
     let username = payload.username.trim().to_string();
+    let payload_username = username.clone();
     let user = state
         .db(move |conn| Ok(find_user_by_username(conn, &username)?))
         .await?;
@@ -67,11 +68,35 @@ pub async fn login(
         _ => {
             state.limiter.record_failure(ip);
             tracing::warn!("failed login from {ip}");
+            let (name, ip_s) = (payload_username.clone(), ip.to_string());
+            let _ = state
+                .db(move |conn| {
+                    crate::audit::record_system(conn, Some(&name), Some(&ip_s), "auth.login_failed", None, None);
+                    Ok(())
+                })
+                .await;
             return Err(ApiError::Unauthorized("Invalid username or password".into()));
         }
     };
 
     state.limiter.reset(ip);
+    let (uid, name, ip_s) = (user.id, user.username.clone(), ip.to_string());
+    state
+        .db(move |conn| {
+            crate::db::insert_event(
+                conn,
+                &crate::db::NewEvent {
+                    user_id: Some(uid),
+                    username: Some(&name),
+                    ip: Some(&ip_s),
+                    action: "auth.login",
+                    target: None,
+                    detail: None,
+                },
+            )?;
+            Ok(())
+        })
+        .await?;
     let token = create_jwt(user.id, &user.username, user.token_version, &state.jwt_secret)?;
     tracing::info!("user '{}' signed in from {ip}", user.username);
 
@@ -82,11 +107,15 @@ pub async fn login(
 }
 
 pub async fn me(auth: AuthUser, State(state): State<SharedState>) -> ApiResult<impl IntoResponse> {
-    let user = state
-        .db(move |conn| Ok(find_user_by_id(conn, auth.id)?))
-        .await?
-        .ok_or(ApiError::NotFound("User"))?;
-    Ok(Json(user))
+    let (user, site_ids) = state
+        .db(move |conn| {
+            let user = find_user_by_id(conn, auth.id)?.ok_or(ApiError::NotFound("User"))?;
+            Ok((user, crate::db::user_site_ids(conn, auth.id)?))
+        })
+        .await?;
+    let mut v = serde_json::to_value(&user).map_err(ApiError::internal)?;
+    v["site_ids"] = serde_json::json!(site_ids);
+    Ok(Json(v))
 }
 
 pub async fn logout(State(state): State<SharedState>) -> impl IntoResponse {
@@ -98,7 +127,13 @@ pub async fn logout(State(state): State<SharedState>) -> impl IntoResponse {
 
 /// Revoke every session for the current user (all devices).
 pub async fn logout_all(auth: AuthUser, State(state): State<SharedState>) -> ApiResult<impl IntoResponse> {
-    state.db(move |conn| Ok(bump_token_version(conn, auth.id)?)).await?;
+    state
+        .db(move |conn| {
+            bump_token_version(conn, auth.id)?;
+            crate::audit::record(conn, &auth, "auth.logout_all", None, None);
+            Ok(())
+        })
+        .await?;
     Ok((
         cookie_headers(&state, None),
         Json(serde_json::json!({ "message": "All sessions revoked" })),
@@ -132,8 +167,13 @@ pub async fn change_password(
     .await?;
 
     let username = user.username.clone();
+    let actor = auth.clone();
     let version = state
-        .db(move |conn| Ok(set_user_password(conn, &username, &new_hash)?))
+        .db(move |conn| {
+            let v = set_user_password(conn, &username, &new_hash)?;
+            crate::audit::record(conn, &actor, "auth.password_changed", None, None);
+            Ok(v)
+        })
         .await?
         .ok_or(ApiError::NotFound("User"))?;
 

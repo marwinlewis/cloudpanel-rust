@@ -1,3 +1,4 @@
+pub mod admin_handlers;
 pub mod auth_handlers;
 pub mod cron_handlers;
 pub mod docker_handlers;
@@ -29,6 +30,10 @@ pub fn create_api_router(state: SharedState) -> Router {
         .route("/auth/logout", post(auth_handlers::logout))
         .route("/auth/logout-all", post(auth_handlers::logout_all))
         .route("/auth/password", post(auth_handlers::change_password))
+        // Jobs & audit log
+        .route("/jobs", get(admin_handlers::list_jobs))
+        .route("/jobs/:id", get(admin_handlers::get_job))
+        .route("/events", get(admin_handlers::list_events))
         // System
         .route("/system/metrics", get(system_handlers::get_system_metrics))
         // Sites

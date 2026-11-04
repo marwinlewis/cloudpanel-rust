@@ -12,6 +12,8 @@ pub struct AppState {
     pub jwt_secret: Vec<u8>,
     pub limiter: LoginLimiter,
     pub metrics: Arc<Mutex<MetricsCollector>>,
+    /// Live TLS config of the panel listener, for hot-reloading its certificate.
+    pub tls: Mutex<Option<axum_server::tls_rustls::RustlsConfig>>,
 }
 
 pub type SharedState = Arc<AppState>;

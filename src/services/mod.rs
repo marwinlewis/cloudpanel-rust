@@ -1,8 +1,11 @@
+pub mod alerts;
+pub mod backups;
 pub mod cmd;
 pub mod cron;
 pub mod docker;
 pub mod firewall;
 pub mod nginx;
+pub mod panel_cert;
 pub mod sites;
 pub mod ssl;
 pub mod system_metrics;

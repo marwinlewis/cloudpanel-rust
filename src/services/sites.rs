@@ -45,6 +45,8 @@ pub fn provision(config: &Config, conn: &Connection, input: SiteInput) -> ApiRes
         document_root: document_root.as_deref(),
         system_user: &system_user,
         include_www: input.include_www,
+        home_dir: None,
+        app_command: None,
     };
     let id = db::create_site(conn, &new).map_err(|e| {
         if db::is_unique_violation(&e) {
