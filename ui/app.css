@@ -377,3 +377,5 @@ tr.selected td { background: var(--surface-2); }
 .progress { height: 6px; background: var(--surface-2); border-radius: 99px; overflow: hidden; }
 .progress > span { display: block; height: 100%; background: var(--accent, #3b82f6); width: 0; transition: width .2s; }
 .stack { display: grid; gap: 16px; }
+.section-title { font-size: 15px; margin: 8px 0 0; color: var(--text-2); font-weight: 600; }
+.card-head .crumbs { min-width: 0; }

@@ -13,6 +13,11 @@
 #   --from-source      Build from source instead of downloading a release binary
 #   --branch NAME      Git branch to build when building from source (default: main)
 #   --with-docker      Also install Docker Engine from the official docker.com repository
+#   --with-mariadb     Install MariaDB (MySQL-compatible) for site databases
+#   --with-mongodb     Install MongoDB Community from the official mongodb.org repository
+#   --with-sqlite      Enable SQLite site databases (installs the sqlite3 CLI)
+#   --databases LIST   Same as the three flags above, e.g. --databases mariadb,sqlite
+#   --no-fail2ban      Don't install fail2ban
 #   --port N           Port for the panel (default: 8443)
 #   --no-firewall      Don't configure or enable UFW
 #   --force            Continue on an untested distribution
@@ -27,6 +32,11 @@ VERSION="latest"
 BRANCH="main"
 FROM_SOURCE=0
 WITH_DOCKER=0
+WITH_MARIADB=0
+WITH_MONGODB=0
+WITH_SQLITE=0
+DB_CHOSEN=0
+NO_FAIL2BAN=0
 NO_FIREWALL=0
 FORCE=0
 UNINSTALL=0
@@ -76,12 +86,31 @@ CloudPanel installer (Debian 11/12/13, Ubuntu 22.04/24.04)
   --from-source      Build from source instead of downloading a release binary
   --branch NAME      Git branch to build when building from source (default: main)
   --with-docker      Also install Docker Engine from docker.com
+  --with-mariadb     Install MariaDB (MySQL-compatible) for site databases
+  --with-mongodb     Install MongoDB Community (mongodb.org repository)
+  --with-sqlite      Enable SQLite site databases
+  --databases LIST   Comma-separated: mariadb,mongodb,sqlite (asked interactively if omitted)
+  --no-fail2ban      Don't install fail2ban
   --port N           Port for the panel (default: 8443)
   --no-firewall      Don't configure or enable UFW
   --force            Continue on an untested distribution
   --uninstall        Remove CloudPanel (keeps data)
   --purge            With --uninstall: also delete data, config and cron jobs
 EOF
+}
+
+set_databases() {
+  local list="$1" e
+  DB_CHOSEN=1
+  for e in $(printf '%s' "$list" | tr ',' ' '); do
+    case "$e" in
+      mariadb|mysql) WITH_MARIADB=1 ;;
+      mongodb|mongo) WITH_MONGODB=1 ;;
+      sqlite) WITH_SQLITE=1 ;;
+      none) ;;
+      *) die "Unknown database engine: $e (use mariadb, mongodb, sqlite)" ;;
+    esac
+  done
 }
 
 parse_args() {
@@ -91,6 +120,11 @@ parse_args() {
       --branch) BRANCH="${2:?--branch needs a value}"; shift ;;
       --from-source) FROM_SOURCE=1 ;;
       --with-docker) WITH_DOCKER=1 ;;
+      --with-mariadb|--with-mysql) WITH_MARIADB=1; DB_CHOSEN=1 ;;
+      --with-mongodb) WITH_MONGODB=1; DB_CHOSEN=1 ;;
+      --with-sqlite) WITH_SQLITE=1; DB_CHOSEN=1 ;;
+      --databases) set_databases "${2:?--databases needs a value}"; shift ;;
+      --no-fail2ban) NO_FAIL2BAN=1 ;;
       --no-firewall) NO_FIREWALL=1 ;;
       --port) PORT="${2:?--port needs a value}"; PORT_SET=1; shift ;;
       --force) FORCE=1 ;;
@@ -159,7 +193,13 @@ install_packages() {
   log "Installing system packages"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -q
-  apt_install ca-certificates curl openssl tar gzip nginx certbot python3-certbot-nginx ufw cron iproute2
+  apt_install ca-certificates curl gnupg openssl tar gzip unzip nginx certbot python3-certbot-nginx ufw cron iproute2 passwd
+  if [ "$NO_FAIL2BAN" -eq 0 ]; then
+    apt_install fail2ban
+  fi
+  if [ "$WITH_SQLITE" -eq 1 ]; then
+    apt_install sqlite3
+  fi
   systemctl enable --now nginx >/dev/null 2>&1 || warn "Could not start nginx (is port 80 in use?)"
   systemctl enable --now cron >/dev/null 2>&1 || true
 }
@@ -179,6 +219,123 @@ install_docker() {
   apt-get update -q
   apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   systemctl enable --now docker >/dev/null 2>&1 || warn "Docker installed but failed to start"
+}
+
+# Ask which database engines to install when no flag was given. The answer is read from
+# /dev/tty because stdin is the script itself when piped from curl.
+choose_databases() {
+  if [ "$DB_CHOSEN" -eq 1 ]; then
+    return
+  fi
+  if [ -f "$ENV_FILE" ] && grep -q '^CLOUDPANEL_DB_ENGINES=' "$ENV_FILE"; then
+    set_databases "$(sed -n 's/^CLOUDPANEL_DB_ENGINES=//p' "$ENV_FILE" | head -n1)"
+    [ -n "$(sed -n 's/^CLOUDPANEL_DB_ENGINES=//p' "$ENV_FILE" | head -n1)" ] || DB_CHOSEN=1
+    info "Keeping database engines: $(sed -n 's/^CLOUDPANEL_DB_ENGINES=//p' "$ENV_FILE" | head -n1)"
+    return
+  fi
+  local answer=""
+  if { exec 3</dev/tty; } 2>/dev/null; then
+    printf '\n%sWhich databases should sites be able to use?%s\n' "$C_BOLD" "$C_RST"
+    printf '  1) MySQL / MariaDB\n  2) MongoDB\n  3) SQLite\n'
+    printf 'Enter numbers separated by commas [default: 3]: '
+    read -r answer <&3 || answer=""
+    exec 3<&-
+  fi
+  answer=${answer:-3}
+  local list="" n
+  for n in $(printf '%s' "$answer" | tr ',' ' '); do
+    case "$n" in
+      1|mariadb|mysql) list="${list},mariadb" ;;
+      2|mongodb|mongo) list="${list},mongodb" ;;
+      3|sqlite) list="${list},sqlite" ;;
+      0|none) ;;
+      *) warn "Ignoring unknown choice: $n" ;;
+    esac
+  done
+  set_databases "${list#,}"
+  [ -n "${list#,}" ] || set_databases none
+}
+
+db_engines_csv() {
+  local out=""
+  [ "$WITH_MARIADB" -eq 1 ] && out="${out},mariadb"
+  [ "$WITH_MONGODB" -eq 1 ] && out="${out},mongodb"
+  [ "$WITH_SQLITE" -eq 1 ] && out="${out},sqlite"
+  printf '%s' "${out#,}"
+}
+
+install_mariadb() {
+  if command -v mariadb >/dev/null 2>&1 || command -v mysql >/dev/null 2>&1; then
+    info "MariaDB/MySQL is already installed"
+  else
+    log "Installing MariaDB"
+    apt_install mariadb-server mariadb-client
+  fi
+  systemctl enable --now mariadb >/dev/null 2>&1 || systemctl enable --now mysql >/dev/null 2>&1 || warn "Could not start MariaDB"
+  # root authenticates over the local socket (unix_socket); there is no network root login.
+}
+
+install_mongodb() {
+  local mv codename repo
+  mv="8.0"
+  case "$OS_ID:$OS_VERSION" in
+    debian:11) mv="7.0"; codename=bullseye ;;
+    debian:12|debian:13) codename=bookworm ;;
+    ubuntu:22.04) codename=jammy ;;
+    ubuntu:24.04) codename=noble ;;
+    *) warn "MongoDB has no packages for ${OS_ID} ${OS_VERSION}; skipping"; WITH_MONGODB=0; return ;;
+  esac
+  if [ "$OS_ID" = "debian" ] && [ "$ARCH" != "x86_64" ]; then
+    warn "MongoDB only publishes amd64 packages for Debian; skipping MongoDB"
+    WITH_MONGODB=0
+    return
+  fi
+  if ! command -v mongod >/dev/null 2>&1; then
+    log "Installing MongoDB ${mv} (repo.mongodb.org)"
+    curl -fsSL "https://www.mongodb.org/static/pgp/server-${mv}.asc" | gpg --dearmor --yes -o "/usr/share/keyrings/mongodb-server-${mv}.gpg"
+    if [ "$OS_ID" = "debian" ]; then
+      repo="deb [ signed-by=/usr/share/keyrings/mongodb-server-${mv}.gpg ] http://repo.mongodb.org/apt/debian ${codename}/mongodb-org/${mv} main"
+    else
+      repo="deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-${mv}.gpg ] https://repo.mongodb.org/apt/ubuntu ${codename}/mongodb-org/${mv} multiverse"
+    fi
+    printf '%s\n' "$repo" > "/etc/apt/sources.list.d/mongodb-org-${mv}.list"
+    apt-get update -q
+    apt_install mongodb-org
+  else
+    info "MongoDB is already installed"
+  fi
+  systemctl enable --now mongod >/dev/null 2>&1 || { warn "Could not start mongod"; return; }
+
+  local creds="$CONF_DIR/mongodb.env"
+  if [ ! -s "$creds" ]; then
+    local pw i
+    pw=$(openssl rand -hex 24)
+    for i in $(seq 1 30); do
+      mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' >/dev/null 2>&1 && break
+      sleep 1
+    done
+    if mongosh --quiet --eval "db.getSiblingDB('admin').createUser({ user: 'cloudpanel', pwd: '${pw}', roles: ['root'] })" >/dev/null; then
+      install -d -m 0700 "$CONF_DIR"
+      umask 077
+      printf 'MONGO_ADMIN_USER=cloudpanel\nMONGO_ADMIN_PASSWORD=%s\n' "$pw" > "$creds"
+      umask 022
+      chmod 600 "$creds"
+    else
+      warn "Could not create the MongoDB admin user (is authorization already enabled?)"
+    fi
+  fi
+  if ! grep -q '^security:' /etc/mongod.conf 2>/dev/null; then
+    printf '\nsecurity:\n  authorization: enabled\n' >> /etc/mongod.conf
+    systemctl restart mongod || warn "mongod failed to restart"
+  fi
+  if ! grep -Eq '^\s*bindIp:\s*127\.0\.0\.1\s*$' /etc/mongod.conf 2>/dev/null; then
+    warn "mongod is not bound to 127.0.0.1 only; check /etc/mongod.conf"
+  fi
+}
+
+install_databases() {
+  if [ "$WITH_MARIADB" -eq 1 ]; then install_mariadb; fi
+  if [ "$WITH_MONGODB" -eq 1 ]; then install_mongodb; fi
 }
 
 download_release() {
@@ -264,6 +421,18 @@ configure() {
   install -d -m 0755 "$CONF_DIR" "$SITES_DIR"
   install -d -m 0700 "$TLS_DIR"
   install -d -m 0755 /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/conf.d /var/www/html
+  install -d -m 0700 /var/backups/cloudpanel
+  install -d -m 0750 /var/log/cloudpanel
+  install -d -m 0755 /etc/ssh/sshd_config.d /etc/ssh/cloudpanel_keys
+  getent group cloudpanel-users >/dev/null || groupadd cloudpanel-users
+  getent group cloudpanel-sftp >/dev/null || groupadd cloudpanel-sftp
+  if ! grep -Eq '^\s*Include\s+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config 2>/dev/null; then
+    warn "/etc/ssh/sshd_config does not include sshd_config.d; SFTP-only users will not be enforced"
+  fi
+  # Reload nginx after certbot renews a certificate.
+  install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
+  printf '#!/bin/sh\n# Installed by CloudPanel\nsystemctl reload nginx\n' > /etc/letsencrypt/renewal-hooks/deploy/cloudpanel-reload-nginx
+  chmod 755 /etc/letsencrypt/renewal-hooks/deploy/cloudpanel-reload-nginx
 
   if [ ! -f "$ENV_FILE" ]; then
     umask 077
@@ -282,6 +451,13 @@ EOF
   else
     PORT=$(sed -n 's/^CLOUDPANEL_BIND=.*:\([0-9]\{1,5\}\)$/\1/p' "$ENV_FILE" | head -n1)
     PORT=${PORT:-8443}
+  fi
+  local engines
+  engines=$(db_engines_csv)
+  if grep -q '^CLOUDPANEL_DB_ENGINES=' "$ENV_FILE"; then
+    sed -i "s|^CLOUDPANEL_DB_ENGINES=.*|CLOUDPANEL_DB_ENGINES=${engines}|" "$ENV_FILE"
+  else
+    printf 'CLOUDPANEL_DB_ENGINES=%s\n' "$engines" >> "$ENV_FILE"
   fi
   chmod 600 "$ENV_FILE"
 
@@ -322,19 +498,22 @@ RestartSec=3
 LimitNOFILE=65535
 UMask=0022
 
-# Hardening. CloudPanel manages nginx, certbot, ufw and cron, so it runs as root,
-# but it only gets write access to the paths it manages.
+# Hardening. CloudPanel manages nginx, certbot, ufw, cron, site users and their apps,
+# so it runs as root, but it only gets write access to the paths it manages.
+# Tools that must rewrite /etc/passwd or /usr (useradd, apt-get) are run outside this
+# sandbox in transient units via systemd-run.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
-ProtectHome=read-only
 ProtectClock=yes
 ProtectHostname=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes
-ReadWritePaths=-/etc/nginx -/etc/cron.d -/etc/letsencrypt -/etc/ufw
+ReadWritePaths=-/etc/nginx -/etc/cron.d -/etc/letsencrypt -/etc/ufw -/etc/cloudpanel -/etc/fail2ban
+ReadWritePaths=-/etc/systemd/system -/etc/ssh/sshd_config.d -/etc/ssh/cloudpanel_keys -/home -/var/www -/var/backups/cloudpanel
+ReadWritePaths=-/var/log/cloudpanel -/var/lib/cloudpanel
 
 [Install]
 WantedBy=multi-user.target
@@ -395,6 +574,7 @@ print_summary() {
   fi
   printf '\n  %sThe panel uses a self-signed certificate, so your browser will show a warning once.%s\n' "$C_DIM" "$C_RST"
   printf '  %sForgot the password?  cloudpanel user-reset-password --username admin%s\n' "$C_DIM" "$C_RST"
+  printf '  Databases %s\n' "$(db_engines_csv | sed 's/^$/none/')"
   if [ "$WITH_DOCKER" -eq 1 ]; then
     printf '  %sNote: ports published by Docker bypass UFW; bind containers to 127.0.0.1 and expose them via a site.%s\n' "$C_DIM" "$C_RST"
   fi
@@ -409,6 +589,9 @@ uninstall() {
   if [ "$PURGE" -eq 1 ]; then
     rm -rf "$DATA_DIR" "$CONF_DIR"
     rm -f /etc/cron.d/cloudpanel /etc/nginx/conf.d/cloudpanel-upgrade-map.conf
+    rm -f /etc/ssh/sshd_config.d/cloudpanel.conf /etc/fail2ban/jail.d/cloudpanel.conf /etc/fail2ban/filter.d/cloudpanel.conf
+    rm -f /etc/letsencrypt/renewal-hooks/deploy/cloudpanel-reload-nginx
+    info "Site users, app services (cloudpanel-app-*) and backups in /var/backups/cloudpanel were left in place"
     info "Removed data, configuration and cron jobs"
     info "nginx site configs in /etc/nginx/sites-available were left in place"
   else
@@ -425,7 +608,9 @@ main() {
     exit 0
   fi
   detect_os
+  choose_databases
   install_packages
+  install_databases
   if [ "$WITH_DOCKER" -eq 1 ]; then
     install_docker
   fi

@@ -25,9 +25,15 @@ pub struct CmdOpts {
     /// Run as this (already validated) local user via `runuser`.
     pub as_user: Option<String>,
     pub cwd: Option<PathBuf>,
+    /// Feed this file to stdin (takes precedence over `stdin`).
+    pub stdin_file: Option<PathBuf>,
 }
 
 impl CmdOpts {
+    pub fn stdin_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.stdin_file = Some(path.into());
+        self
+    }
     pub fn stdin(mut self, data: impl Into<Vec<u8>>) -> Self {
         self.stdin = Some(data.into());
         self
@@ -151,13 +157,18 @@ pub fn run_streaming(program: &str, args: &[&str], opts: &CmdOpts, on_line: &mut
         stderr: String::new(),
     };
     let mut cmd = build(program, args, opts);
-    cmd.stdin(if opts.stdin.is_some() {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    })
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
+    let stdin = match (&opts.stdin_file, &opts.stdin) {
+        (Some(path), _) => match std::fs::File::open(path) {
+            Ok(f) => Stdio::from(f),
+            Err(e) => {
+                on_line(&format!("cannot open {}: {e}", path.display()), true);
+                return empty(Some(-1), false, false);
+            }
+        },
+        (None, Some(_)) => Stdio::piped(),
+        (None, None) => Stdio::null(),
+    };
+    cmd.stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -249,6 +260,7 @@ pub fn run_host(program: &str, args: &[&str], opts: &CmdOpts) -> CmdResult {
         full.extend_from_slice(args);
         let inner = CmdOpts {
             stdin: opts.stdin.clone(),
+            stdin_file: opts.stdin_file.clone(),
             timeout: opts.timeout,
             ..Default::default()
         };

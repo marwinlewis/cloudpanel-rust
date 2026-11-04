@@ -9,6 +9,7 @@ mod db;
 mod fsutil;
 mod jobs;
 mod scheduler;
+mod secrets;
 mod services;
 mod state;
 mod validate;

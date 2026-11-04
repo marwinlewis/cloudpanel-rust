@@ -3,12 +3,16 @@ pub mod apps;
 pub mod backups;
 pub mod cmd;
 pub mod cron;
+pub mod databases;
 pub mod docker;
+pub mod files;
 pub mod firewall;
 pub mod nginx;
 pub mod panel_cert;
+pub mod s3;
 pub mod sites;
 pub mod ssl;
+pub mod system;
 pub mod system_metrics;
 pub mod sysusers;
 

@@ -11,7 +11,7 @@ repository = "https://github.com/marwinlewis/cloudpanel-rust"
 [dependencies]
 # Async runtime & Web framework
 tokio = { version = "1.40", features = ["full"] }
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.7", features = ["macros", "multipart"] }
 axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
@@ -47,6 +47,11 @@ mime_guess = "2.0"
 sha2 = "0.10"
 base64 = "0.22"
 x509-parser = "0.16"
+tokio-util = { version = "0.7", features = ["io"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+rusty-s3 = "0.5"
+chacha20poly1305 = "0.10"
+futures-util = "0.3"
 
 [profile.release]
 lto = true

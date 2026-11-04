@@ -1,10 +1,15 @@
 pub mod admin_handlers;
 pub mod app_handlers;
 pub mod auth_handlers;
+pub mod backup_handlers;
 pub mod cron_handlers;
+pub mod database_handlers;
 pub mod docker_handlers;
+pub mod download;
 pub mod error;
+pub mod file_handlers;
 pub mod firewall_handlers;
+pub mod service_handlers;
 pub mod site_handlers;
 pub mod ssh_handlers;
 pub mod system_handlers;
@@ -87,6 +92,69 @@ pub fn create_api_router(state: SharedState) -> Router {
             "/sites/:id/ssh-users/:uid/keys/:kid",
             delete(ssh_handlers::delete_ssh_key),
         )
+        // Databases
+        .route("/databases/engines", get(database_handlers::list_engines))
+        .route(
+            "/sites/:id/databases",
+            get(database_handlers::list_site_databases).post(database_handlers::create_database),
+        )
+        .route("/databases/:id", delete(database_handlers::delete_database))
+        .route("/databases/:id/users", post(database_handlers::add_database_user))
+        .route(
+            "/databases/:id/users/:username",
+            delete(database_handlers::delete_database_user),
+        )
+        .route(
+            "/databases/:id/users/:username/password",
+            post(database_handlers::set_database_password),
+        )
+        .route("/databases/:id/export", get(database_handlers::export_database))
+        .route(
+            "/databases/:id/import",
+            post(database_handlers::import_database).layer(database_handlers::upload_limit()),
+        )
+        // File manager
+        .route("/sites/:id/files", get(file_handlers::list))
+        .route(
+            "/sites/:id/files/content",
+            get(file_handlers::read)
+                .put(file_handlers::write)
+                .layer(file_handlers::edit_limit()),
+        )
+        .route("/sites/:id/files/op", post(file_handlers::op))
+        .route("/sites/:id/files/download", get(file_handlers::download))
+        .route(
+            "/sites/:id/files/upload",
+            post(file_handlers::upload).layer(file_handlers::upload_limit()),
+        )
+        // Backups
+        .route(
+            "/sites/:id/backups",
+            get(backup_handlers::list_site_backups).post(backup_handlers::create_site_backup),
+        )
+        .route("/sites/:id/backups/policy", put(backup_handlers::set_backup_policy))
+        .route("/backups/:id", delete(backup_handlers::delete_backup))
+        .route("/backups/:id/download", get(backup_handlers::download_backup))
+        .route("/backups/:id/restore", post(backup_handlers::restore_backup))
+        .route(
+            "/backups/panel",
+            get(backup_handlers::list_panel_backups).post(backup_handlers::create_panel_backup),
+        )
+        .route(
+            "/backups/remote",
+            get(backup_handlers::get_remote)
+                .put(backup_handlers::set_remote)
+                .delete(backup_handlers::delete_remote),
+        )
+        // Services & updates
+        .route("/services", get(service_handlers::list_services))
+        .route("/services/:name/logs", get(service_handlers::service_logs))
+        .route("/services/:name/:action", post(service_handlers::service_action))
+        .route("/system/info", get(service_handlers::system_info))
+        .route("/system/updates", get(service_handlers::get_updates))
+        .route("/system/updates/refresh", post(service_handlers::refresh_updates))
+        .route("/system/updates/upgrade", post(service_handlers::upgrade_all))
+        .route("/system/reboot", post(service_handlers::reboot))
         // Docker
         .route("/docker/status", get(docker_handlers::get_docker_status))
         .route("/docker/containers", get(docker_handlers::list_docker_containers))
