@@ -1,5 +1,3 @@
-// Temporary while features land phase by phase; removed once every helper is wired up.
-#![allow(dead_code)]
 mod api;
 mod audit;
 mod auth;

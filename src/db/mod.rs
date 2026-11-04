@@ -260,6 +260,7 @@ pub fn set_user_sites(conn: &Connection, user_id: i64, site_ids: &[i64]) -> rusq
     Ok(())
 }
 
+#[cfg(test)]
 pub fn grant_site(conn: &Connection, user_id: i64, site_id: i64) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO user_sites (user_id, site_id) VALUES (?1, ?2)",
@@ -395,20 +396,6 @@ pub fn delete_site(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
     Ok(conn.execute("DELETE FROM sites WHERE id = ?1", params![id])? > 0)
 }
 
-pub fn update_site_ssl(
-    conn: &Connection,
-    id: i64,
-    ssl_enabled: bool,
-    cert_path: Option<&str>,
-    key_path: Option<&str>,
-) -> rusqlite::Result<bool> {
-    let affected = conn.execute(
-        "UPDATE sites SET ssl_enabled = ?1, ssl_cert_path = ?2, ssl_key_path = ?3, updated_at = ?4 WHERE id = ?5",
-        params![ssl_enabled, cert_path, key_path, Utc::now(), id],
-    )?;
-    Ok(affected > 0)
-}
-
 // ---------- Basic auth ----------
 
 pub fn list_basic_auth_users(conn: &Connection, site_id: i64) -> rusqlite::Result<Vec<BasicAuthUser>> {
@@ -536,12 +523,6 @@ pub fn delete_ssh_key(conn: &Connection, ssh_user_id: i64, id: i64) -> rusqlite:
         "DELETE FROM ssh_keys WHERE id = ?1 AND ssh_user_id = ?2",
         params![id, ssh_user_id],
     )? > 0)
-}
-
-pub fn all_sftp_only_users(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT username FROM ssh_users WHERE sftp_only = 1 ORDER BY username")?;
-    let rows = stmt.query_map([], |r| r.get(0))?;
-    rows.collect()
 }
 
 // ---------- Firewall ----------

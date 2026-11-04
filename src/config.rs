@@ -114,11 +114,6 @@ impl Config {
         self.data_dir.join("ssl")
     }
 
-    /// Dev mode: running on a non-Linux host where system tools are absent.
-    pub fn is_dev(&self) -> bool {
-        cfg!(windows)
-    }
-
     pub fn engine_configured(&self, engine: &str) -> bool {
         self.db_engines.iter().any(|e| e == engine)
     }

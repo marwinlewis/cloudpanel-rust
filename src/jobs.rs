@@ -16,10 +16,6 @@ pub struct JobLog {
 }
 
 impl JobLog {
-    pub fn id(&self) -> i64 {
-        self.id
-    }
-
     /// Append a line. Writes are batched to the database every ~500ms.
     pub fn line(&self, line: &str) {
         let mut guard = self.buf.lock().unwrap_or_else(|e| e.into_inner());
