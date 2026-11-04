@@ -11,7 +11,7 @@
 # Options:
 #   --version vX.Y.Z   Install a specific release (default: latest)
 #   --from-source      Build from source instead of downloading a release binary
-  --binary PATH      Install a local cloudpanel binary instead of downloading one
+#   --binary PATH      Install a local cloudpanel binary instead of downloading one
 #   --binary PATH      Install a locally built cloudpanel binary (offline installs, testing)
 #   --branch NAME      Git branch to build when building from source (default: main)
 #   --with-docker      Also install Docker Engine from the official docker.com repository
@@ -21,6 +21,7 @@
 #   --databases LIST   Same as the three flags above, e.g. --databases mariadb,sqlite
 #   --no-fail2ban      Don't install fail2ban
 #   --port N           Port for the panel (default: 8443)
+#   --swap-size GB     Temporary swap for a low-memory source build (default: 2, 0 = none)
 #   --no-firewall      Don't configure or enable UFW
 #   --force            Continue on an untested distribution
 #   --uninstall        Remove CloudPanel (keeps data in /var/lib/cloudpanel)
@@ -57,6 +58,7 @@ SITES_DIR=/var/www
 
 TMP_DIR=""
 SWAP_FILE=""
+SWAP_SIZE=""   # GB of temporary swap for a source build; asked if empty
 
 if [ -t 1 ]; then
   C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YLW=$'\033[33m'; C_RST=$'\033[0m'
@@ -95,8 +97,9 @@ CloudPanel installer (Debian 11/12/13, Ubuntu 22.04/24.04)
   --databases LIST   Comma-separated: mariadb,mongodb,sqlite (asked interactively if omitted)
   --no-fail2ban      Don't install fail2ban
   --port N           Port for the panel (default: 8443)
+  --swap-size GB     Temporary swap for a low-memory source build (default: 2, 0 = none)
   --no-firewall      Don't configure or enable UFW
-  --force            Continue on an untested distribution
+  --force          Continue on an untested distribution
   --uninstall        Remove CloudPanel (keeps data)
   --purge            With --uninstall: also delete data, config and cron jobs
 EOF
@@ -131,6 +134,7 @@ parse_args() {
       --no-fail2ban) NO_FAIL2BAN=1 ;;
       --no-firewall) NO_FIREWALL=1 ;;
       --port) PORT="${2:?--port needs a value}"; PORT_SET=1; shift ;;
+      --swap-size) SWAP_SIZE="${2:?--swap-size needs a value in GB}"; shift ;;
       --force) FORCE=1 ;;
       --uninstall) UNINSTALL=1 ;;
       --purge) PURGE=1 ;;
@@ -144,6 +148,9 @@ parse_args() {
   esac
   if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ] || [ "$PORT" -eq 80 ] || [ "$PORT" -eq 443 ]; then
     die "--port must be 1-65535 and not 80/443 (used by nginx)"
+  fi
+  if [ -n "$SWAP_SIZE" ] && ! valid_swap_size "$SWAP_SIZE"; then
+    die "--swap-size must be a whole number of GB from 0 to 64"
   fi
   if [ "$VERSION" != "latest" ] && ! printf '%s' "$VERSION" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$'; then
     die "--version must look like v1.2.3"
@@ -363,15 +370,49 @@ download_release() {
   NEW_BIN="$TMP_DIR/$asset"
 }
 
+valid_swap_size() {
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$1" -le 64 ]
+}
+
+# Ask how big the temporary build swap should be (default 2 GB). Uses
+# /dev/tty because stdin is the script itself when piped from curl.
+choose_swap_size() {
+  [ -n "$SWAP_SIZE" ] && return
+  local answer=""
+  if { exec 3</dev/tty; } 2>/dev/null; then
+    while :; do
+      printf '\n%sThis server has less than 1.5 GB of memory. Compiling needs extra swap.%s\n' "$C_BOLD" "$C_RST"
+      printf 'Temporary swap file size in GB (0 = none, removed after the build) [default: 2]: '
+      read -r answer <&3 || answer=""
+      answer=${answer:-2}
+      answer=${answer%[gG]}
+      valid_swap_size "$answer" && break
+      warn "Enter a whole number from 0 to 64"
+    done
+    exec 3<&-
+  fi
+  SWAP_SIZE=${answer:-2}
+}
+
 ensure_build_memory() {
-  local mem_kb swap_kb
+  local mem_kb swap_kb free_kb
   mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
   swap_kb=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
   if [ $((mem_kb + swap_kb)) -lt 1600000 ]; then
-    warn "Less than 1.5 GB of memory; adding a temporary 2 GB swap file for the build"
+    choose_swap_size
+    if [ "$SWAP_SIZE" -eq 0 ]; then
+      warn "No swap added; the build may run out of memory"
+      return
+    fi
+    free_kb=$(df -Pk / | awk 'NR==2 {print $4}')
+    if [ "$free_kb" -lt $(( (SWAP_SIZE + 3) * 1048576 )) ]; then
+      die "Not enough disk space for a ${SWAP_SIZE} GB swap file plus the build (~3 GB). Use a smaller --swap-size."
+    fi
+    log "Adding a temporary ${SWAP_SIZE} GB swap file for the build"
     SWAP_FILE=/cloudpanel-build.swap
-    if ! fallocate -l 2G "$SWAP_FILE" 2>/dev/null; then
-      dd if=/dev/zero of="$SWAP_FILE" bs=1M count=2048 status=none
+    if ! fallocate -l "${SWAP_SIZE}G" "$SWAP_FILE" 2>/dev/null; then
+      dd if=/dev/zero of="$SWAP_FILE" bs=1M count=$((SWAP_SIZE * 1024)) status=none
     fi
     chmod 600 "$SWAP_FILE"
     mkswap "$SWAP_FILE" >/dev/null
@@ -385,6 +426,11 @@ build_from_source() {
   ensure_build_memory
 
   export RUSTUP_HOME="$TMP_DIR/rustup" CARGO_HOME="$TMP_DIR/cargo"
+  # Keep rustup's unpacking and cargo's parallel jobs light on small servers.
+  export RUSTUP_IO_THREADS=1 TMPDIR="$TMP_DIR"
+  if [ "$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)" -lt 2000000 ]; then
+    export CARGO_BUILD_JOBS=1
+  fi
   curl -fsSL --proto '=https' --tlsv1.2 https://sh.rustup.rs -o "$TMP_DIR/rustup-init.sh"
   sh "$TMP_DIR/rustup-init.sh" -y -q --profile minimal --no-modify-path >/dev/null
   local ref="$BRANCH"
@@ -395,7 +441,9 @@ build_from_source() {
 }
 
 install_binary() {
-  TMP_DIR=$(mktemp -d)
+  # /var/tmp is on disk. /tmp is a RAM-backed tmpfs on Debian 13+, too small
+  # on low-memory servers for the Rust toolchain and build (~2 GB).
+  TMP_DIR=$(mktemp -d -p /var/tmp cloudpanel-install.XXXXXX)
   NEW_BIN=""
   if [ -n "$LOCAL_BIN" ]; then
     [ -f "$LOCAL_BIN" ] || die "--binary: $LOCAL_BIN not found"
