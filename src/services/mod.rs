@@ -5,6 +5,7 @@ pub mod cmd;
 pub mod cron;
 pub mod databases;
 pub mod docker;
+pub mod fail2ban;
 pub mod files;
 pub mod firewall;
 pub mod nginx;
@@ -16,9 +17,7 @@ pub mod system;
 pub mod system_metrics;
 pub mod sysusers;
 
-pub use cron::CronService;
 pub use docker::{ContainerAction, DockerService};
-pub use firewall::FirewallService;
 pub use nginx::NginxService;
 pub use ssl::SslService;
 pub use system_metrics::MetricsCollector;

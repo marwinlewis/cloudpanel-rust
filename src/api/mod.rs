@@ -13,6 +13,10 @@ pub mod service_handlers;
 pub mod site_handlers;
 pub mod ssh_handlers;
 pub mod system_handlers;
+pub mod user_handlers;
+
+#[cfg(test)]
+mod tests;
 
 use crate::state::SharedState;
 use axum::{
@@ -37,6 +41,23 @@ pub fn create_api_router(state: SharedState) -> Router {
         .route("/auth/logout", post(auth_handlers::logout))
         .route("/auth/logout-all", post(auth_handlers::logout_all))
         .route("/auth/password", post(auth_handlers::change_password))
+        .route("/auth/login/mfa", post(auth_handlers::login_mfa))
+        .route("/auth/email", post(auth_handlers::change_email))
+        .route("/auth/2fa/setup", post(auth_handlers::totp_setup))
+        .route("/auth/2fa/enable", post(auth_handlers::totp_enable))
+        .route("/auth/2fa/disable", post(auth_handlers::totp_disable))
+        .route("/auth/2fa/recovery-codes", post(auth_handlers::totp_recovery_codes))
+        // Users
+        .route(
+            "/users",
+            get(user_handlers::list_users).post(user_handlers::create_user),
+        )
+        .route(
+            "/users/:id",
+            put(user_handlers::update_user).delete(user_handlers::delete_user),
+        )
+        .route("/users/:id/password", post(user_handlers::reset_password))
+        .route("/users/:id/2fa", delete(user_handlers::reset_2fa))
         // Jobs & audit log
         .route("/jobs", get(admin_handlers::list_jobs))
         .route("/jobs/:id", get(admin_handlers::get_job))
@@ -181,12 +202,24 @@ pub fn create_api_router(state: SharedState) -> Router {
             get(firewall_handlers::get_rules).post(firewall_handlers::add_rule),
         )
         .route("/firewall/rules/:id", delete(firewall_handlers::delete_rule))
+        .route("/firewall/status", get(firewall_handlers::firewall_status))
+        .route(
+            "/fail2ban",
+            get(firewall_handlers::get_fail2ban).put(firewall_handlers::set_fail2ban),
+        )
+        .route("/fail2ban/ban", post(firewall_handlers::fail2ban_ban))
+        .route("/fail2ban/unban", post(firewall_handlers::fail2ban_unban))
         // Cron
         .route(
             "/cron/jobs",
             get(cron_handlers::get_cron_jobs).post(cron_handlers::add_cron_job),
         )
-        .route("/cron/jobs/:id", delete(cron_handlers::remove_cron_job))
+        .route(
+            "/cron/jobs/:id",
+            put(cron_handlers::update_cron_job).delete(cron_handlers::remove_cron_job),
+        )
+        .route("/cron/jobs/:id/run", post(cron_handlers::run_cron_job))
+        .route("/cron/jobs/:id/runs", get(cron_handlers::cron_runs))
         .fallback(|| async { ApiError::NotFound("Endpoint") })
         .layer(middleware::from_fn(csrf_guard))
         .layer(DefaultBodyLimit::max(256 * 1024))

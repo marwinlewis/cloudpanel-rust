@@ -124,7 +124,7 @@ function renderFiles(el, { site }) {
   function row(e) {
     const path = join(cwd, e.name);
     const isDir = e.kind === 'dir';
-    const nameCell = h('button', { class: 'btn ghost sm', type: 'button', style: 'padding-left:0' },
+    const nameCell = h('button', { class: 'btn ghost sm flush-left', type: 'button' },
       icon(isDir ? 'folder' : e.kind === 'symlink' ? 'link' : 'file'), e.name);
     nameCell.addEventListener('click', () => (isDir ? go(path) : e.kind === 'file' ? edit(path) : null));
     const items = [];
@@ -158,7 +158,7 @@ function renderFiles(el, { site }) {
       const r = await api(`/sites/${site.id}/files?path=${encodeURIComponent(cwd)}`);
       const rows = r.entries.map(row);
       if (cwd) {
-        const up = h('button', { class: 'btn ghost sm', type: 'button', style: 'padding-left:0' }, icon('back'), '..');
+        const up = h('button', { class: 'btn ghost sm flush-left', type: 'button' }, icon('back'), '..');
         up.addEventListener('click', () => go(cwd.split('/').slice(0, -1).join('/')));
         rows.unshift(h('tr', null, h('td', { colspan: 5 }, up)));
       }

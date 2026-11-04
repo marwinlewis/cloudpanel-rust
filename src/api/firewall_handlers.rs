@@ -1,11 +1,10 @@
 use crate::api::error::{ApiError, ApiResult};
+use crate::audit;
 use crate::auth::AdminUser;
-use crate::db::{
-    create_firewall_rule, delete_firewall_rule, find_firewall_rule, firewall_rule_exists, list_firewall_rules,
-};
-use crate::services::firewall::{Action, Protocol};
-use crate::services::FirewallService;
-use crate::state::SharedState;
+use crate::db::{self, models::FirewallRule, NewRule};
+use crate::services::fail2ban::{self, Fail2banSettings};
+use crate::services::firewall::{cidr_contains, Action, FirewallService, Protocol, Rule};
+use crate::state::{blocking, SharedState};
 use crate::validate;
 use axum::{
     extract::{Path, State},
@@ -14,72 +13,250 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
+use serde_json::json;
 
 #[derive(Deserialize)]
 pub struct CreateRuleRequest {
-    pub port: u16,
+    /// "port" (default) or "block".
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Port or range "6000:6010" (as a string) for port rules.
+    pub port: Option<serde_json::Value>,
     pub protocol: Option<String>,
     pub action: Option<String>,
+    pub source: Option<String>,
     pub comment: Option<String>,
 }
 
+fn to_rule(r: &FirewallRule) -> Rule {
+    Rule {
+        action: Action::parse(&r.action).unwrap_or(Action::Allow),
+        port: r.port,
+        port_end: r.port_end,
+        protocol: Protocol::parse(&r.protocol).unwrap_or(Protocol::Tcp),
+        source: r.source.clone(),
+    }
+}
+
 pub async fn get_rules(_admin: AdminUser, State(state): State<SharedState>) -> ApiResult<impl IntoResponse> {
-    Ok(Json(state.db(|conn| Ok(list_firewall_rules(conn)?)).await?))
+    Ok(Json(state.db(|conn| Ok(db::list_firewall_rules(conn)?)).await?))
+}
+
+pub async fn firewall_status(_admin: AdminUser) -> ApiResult<impl IntoResponse> {
+    let (status, ssh) = blocking(|| Ok((FirewallService::status(), FirewallService::ssh_ports()))).await?;
+    let active = status.as_deref().map(|s| s.contains("Status: active"));
+    Ok(Json(
+        json!({ "installed": status.is_some(), "active": active, "raw": status, "ssh_ports": ssh }),
+    ))
 }
 
 pub async fn add_rule(
-    _admin: AdminUser,
+    admin: AdminUser,
     State(state): State<SharedState>,
     Json(p): Json<CreateRuleRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    let port = validate::port(Some(p.port)).map_err(ApiError::BadRequest)?;
-    let protocol = Protocol::parse(p.protocol.as_deref().unwrap_or("tcp"))
-        .ok_or_else(|| ApiError::BadRequest("Protocol must be tcp, udp or any".into()))?;
-    let action = Action::parse(p.action.as_deref().unwrap_or("allow"))
-        .ok_or_else(|| ApiError::BadRequest("Action must be allow or deny".into()))?;
+    let block = p.kind.as_deref() == Some("block");
+    let source = match p
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "any")
+    {
+        Some(s) => Some(validate::cidr(s).map_err(ApiError::BadRequest)?),
+        None => None,
+    };
     let comment = validate::short_text(p.comment.as_deref(), 120).map_err(ApiError::BadRequest)?;
+    let rule = if block {
+        Rule {
+            action: Action::Deny,
+            port: None,
+            port_end: None,
+            protocol: Protocol::Any,
+            source: Some(
+                source
+                    .clone()
+                    .ok_or_else(|| ApiError::BadRequest("Enter the IP or network to block".into()))?,
+            ),
+        }
+    } else {
+        let port_s = match &p.port {
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            Some(serde_json::Value::String(s)) => s.clone(),
+            _ => return Err(ApiError::BadRequest("A port or port range is required".into())),
+        };
+        let (port, port_end) = validate::port_range(&port_s).map_err(ApiError::BadRequest)?;
+        let protocol = Protocol::parse(p.protocol.as_deref().unwrap_or("tcp"))
+            .ok_or_else(|| ApiError::BadRequest("Protocol must be tcp, udp or any".into()))?;
+        if port_end.is_some() && protocol == Protocol::Any {
+            return Err(ApiError::BadRequest("Port ranges need a protocol (TCP or UDP)".into()));
+        }
+        Rule {
+            action: Action::parse(p.action.as_deref().unwrap_or("allow"))
+                .ok_or_else(|| ApiError::BadRequest("Action must be allow or deny".into()))?,
+            port: Some(port),
+            port_end,
+            protocol,
+            source: source.clone(),
+        }
+    };
 
-    if action == Action::Deny && (Some(port) == state.config.panel_port() || port == 22) {
-        return Err(ApiError::BadRequest(
-            "Refusing to block the SSH or control panel port; you would lock yourself out".into(),
-        ));
+    // Lockout protection.
+    if rule.action == Action::Deny {
+        let ssh = blocking(|| Ok(FirewallService::ssh_ports())).await?;
+        let protected: Vec<u16> = ssh.into_iter().chain(state.config.panel_port()).collect();
+        let my_ip = admin.0.ip.as_deref().and_then(|i| i.parse().ok());
+        let hits_me = match (&rule.source, my_ip) {
+            (None, _) => true,
+            (Some(src), Some(ip)) => cidr_contains(src, ip),
+            (Some(_), None) => false,
+        };
+        if hits_me && protected.iter().any(|p| rule.covers_port(*p)) {
+            return Err(ApiError::BadRequest(
+                "Refusing a rule that would block SSH or the control panel for your own connection".into(),
+            ));
+        }
     }
 
-    let rule = state
+    let created = state
         .db(move |conn| {
-            let new = crate::db::NewRule {
-                port: Some(port),
-                port_end: None,
-                protocol: protocol.as_str(),
-                action: action.as_str(),
-                source: None,
+            let new = NewRule {
+                port: rule.port,
+                port_end: rule.port_end,
+                protocol: rule.protocol.as_str(),
+                action: rule.action.as_str(),
+                source: rule.source.as_deref(),
                 comment: comment.as_deref(),
             };
-            if firewall_rule_exists(conn, &new)? {
+            if db::firewall_rule_exists(conn, &new)? {
                 return Err(ApiError::Conflict("That rule already exists".into()));
             }
-            FirewallService::add(port, protocol, action).map_err(ApiError::Unprocessable)?;
-            let id = create_firewall_rule(conn, &new)?;
-            Ok(find_firewall_rule(conn, id)?)
+            FirewallService::add(&rule, comment.as_deref()).map_err(ApiError::Unprocessable)?;
+            let id = db::create_firewall_rule(conn, &new)?;
+            let desc = format!("{} {}", rule.action.as_str(), rule.spec().join(" "));
+            audit::record(conn, &admin.0, "firewall.add", None, Some(&desc));
+            Ok(db::find_firewall_rule(conn, id)?)
         })
         .await?;
-    Ok((StatusCode::CREATED, Json(rule)))
+    Ok((StatusCode::CREATED, Json(created)))
 }
 
 pub async fn delete_rule(
     Path(id): Path<i64>,
-    _admin: AdminUser,
+    admin: AdminUser,
     State(state): State<SharedState>,
 ) -> ApiResult<impl IntoResponse> {
     state
         .db(move |conn| {
-            let rule = find_firewall_rule(conn, id)?.ok_or(ApiError::NotFound("Rule"))?;
-            let protocol = Protocol::parse(&rule.protocol).unwrap_or(Protocol::Tcp);
-            let action = Action::parse(&rule.action).unwrap_or(Action::Allow);
-            FirewallService::delete(rule.port.unwrap_or(0), protocol, action).map_err(ApiError::Unprocessable)?;
-            delete_firewall_rule(conn, id)?;
+            let r = db::find_firewall_rule(conn, id)?.ok_or(ApiError::NotFound("Rule"))?;
+            let rule = to_rule(&r);
+            FirewallService::delete(&rule).map_err(ApiError::Unprocessable)?;
+            db::delete_firewall_rule(conn, id)?;
+            let desc = format!("{} {}", rule.action.as_str(), rule.spec().join(" "));
+            audit::record(conn, &admin.0, "firewall.delete", None, Some(&desc));
             Ok(())
         })
         .await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ---------- fail2ban ----------
+
+pub async fn get_fail2ban(_admin: AdminUser, State(state): State<SharedState>) -> ApiResult<impl IntoResponse> {
+    let settings: Fail2banSettings = state
+        .db(|conn| {
+            Ok(db::get_setting(conn, fail2ban::SETTING)?
+                .and_then(|v| serde_json::from_str(&v).ok())
+                .unwrap_or_default())
+        })
+        .await?;
+    let (installed, jails) = blocking(|| Ok((fail2ban::installed(), fail2ban::status()))).await?;
+    Ok(Json(
+        json!({ "installed": installed, "settings": settings, "jails": jails }),
+    ))
+}
+
+pub async fn set_fail2ban(
+    admin: AdminUser,
+    State(state): State<SharedState>,
+    Json(mut s): Json<Fail2banSettings>,
+) -> ApiResult<impl IntoResponse> {
+    s.ignoreip = s
+        .ignoreip
+        .iter()
+        .map(|i| i.trim().to_string())
+        .filter(|i| !i.is_empty())
+        .collect();
+    s.validate().map_err(ApiError::BadRequest)?;
+    for i in s.ignoreip.iter_mut() {
+        *i = validate::cidr(i).map_err(ApiError::BadRequest)?;
+    }
+    let config = state.config.clone();
+    let applied = s.clone();
+    blocking(move || fail2ban::apply(&config, &applied).map_err(ApiError::Unprocessable)).await?;
+    state
+        .db(move |conn| {
+            db::set_json(conn, fail2ban::SETTING, &s)?;
+            audit::record(conn, &admin.0, "fail2ban.configure", None, None);
+            Ok(())
+        })
+        .await?;
+    Ok(Json(json!({ "message": "fail2ban settings applied" })))
+}
+
+#[derive(Deserialize)]
+pub struct BanRequest {
+    pub jail: String,
+    pub ip: String,
+}
+
+pub async fn fail2ban_ban(
+    admin: AdminUser,
+    State(state): State<SharedState>,
+    Json(p): Json<BanRequest>,
+) -> ApiResult<impl IntoResponse> {
+    ban_or_unban(admin, state, p, true).await
+}
+
+pub async fn fail2ban_unban(
+    admin: AdminUser,
+    State(state): State<SharedState>,
+    Json(p): Json<BanRequest>,
+) -> ApiResult<impl IntoResponse> {
+    ban_or_unban(admin, state, p, false).await
+}
+
+async fn ban_or_unban(admin: AdminUser, state: SharedState, p: BanRequest, ban: bool) -> ApiResult<impl IntoResponse> {
+    if !fail2ban::JAILS.contains(&p.jail.as_str()) {
+        return Err(ApiError::BadRequest("Unknown jail".into()));
+    }
+    let ip = validate::cidr(&p.ip).map_err(ApiError::BadRequest)?;
+    if ip.contains('/') {
+        return Err(ApiError::BadRequest("Enter a single IP address".into()));
+    }
+    if ban && admin.0.ip.as_deref() == Some(ip.as_str()) {
+        return Err(ApiError::BadRequest("Refusing to ban your own IP address".into()));
+    }
+    let (jail, addr) = (p.jail.clone(), ip.clone());
+    blocking(move || {
+        if ban {
+            fail2ban::ban(&jail, &addr)
+        } else {
+            fail2ban::unban(&jail, &addr)
+        }
+        .map_err(ApiError::Unprocessable)
+    })
+    .await?;
+    state
+        .db(move |conn| {
+            audit::record(
+                conn,
+                &admin.0,
+                if ban { "fail2ban.ban" } else { "fail2ban.unban" },
+                Some(&p.jail),
+                Some(&ip),
+            );
+            Ok(())
+        })
+        .await?;
+    Ok(Json(json!({ "ok": true })))
 }

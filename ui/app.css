@@ -379,3 +379,9 @@ tr.selected td { background: var(--surface-2); }
 .stack { display: grid; gap: 16px; }
 .section-title { font-size: 15px; margin: 8px 0 0; color: var(--text-2); font-weight: 600; }
 .card-head .crumbs { min-width: 0; }
+details.run { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 10px; }
+details.run summary { cursor: pointer; font-size: 13px; }
+details.run pre { margin-top: 8px; }
+.ml { margin-left: 8px; }
+.btn.flush-left { padding-left: 0; }
+.site-picker { max-height: 260px; overflow: auto; gap: 6px; }

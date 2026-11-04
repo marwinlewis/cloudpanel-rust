@@ -86,6 +86,14 @@ enum Commands {
     /// List all managed sites
     #[command(alias = "site:list")]
     SiteList,
+    /// Turn off two-factor authentication for a user (e.g. lost phone and recovery codes)
+    #[command(name = "user-disable-2fa", alias = "user:disable-2fa")]
+    UserDisable2fa {
+        #[arg(short, long)]
+        username: String,
+    },
+    /// Run a cron job by id and record its output (used by /etc/cron.d/cloudpanel)
+    CronRun { id: i64 },
 }
 
 fn read_password(given: Option<String>) -> AnyResult<String> {
@@ -248,12 +256,32 @@ async fn main() -> AnyResult<()> {
             }
             return Ok(());
         }
+        Some(Commands::UserDisable2fa { username }) => {
+            let user =
+                db::find_user_by_username(&conn, &username)?.ok_or_else(|| format!("User '{username}' not found"))?;
+            db::disable_totp(&conn, user.id)?;
+            db::bump_token_version(&conn, user.id)?;
+            audit::record_system(&conn, Some(&username), None, "user.2fa_reset", None, Some("cli"));
+            println!("Two-factor authentication disabled for '{username}'; their sessions were signed out.");
+            return Ok(());
+        }
+        Some(Commands::CronRun { id }) => {
+            let code = services::cron::run_job(&config, &conn, id)?;
+            std::process::exit(code);
+        }
         Some(Commands::Server) | None => {}
     }
     drop(conn);
 
     seed_admin(&config, &pool)?;
     db::fail_stale_jobs(&*pool.get()?)?;
+    {
+        let conn = pool.get()?;
+        let f2b: services::fail2ban::Fail2banSettings = db::get_setting(&conn, services::fail2ban::SETTING)?
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default();
+        services::fail2ban::ensure(&config, &f2b);
+    }
     let jwt_secret = load_jwt_secret(&config)?;
     let tls = config.tls_enabled();
     let addr: SocketAddr = config

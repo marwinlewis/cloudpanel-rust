@@ -20,9 +20,10 @@ function buildNav() {
 function route() {
   if (!state.user) return;
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
-  const name = parts[0] || 'overview';
+  const home = isAdmin() ? 'overview' : 'sites';
+  const name = parts[0] || home;
   const r = ROUTES[name];
-  if (!r || (r.admin && !isAdmin())) { location.hash = '#/overview'; return; }
+  if (!r || (r.admin && !isAdmin())) { if (name !== home) location.hash = `#/${home}`; return; }
   if (state.cleanup) { state.cleanup(); state.cleanup = null; }
   closeMenu();
   document.querySelectorAll('dialog[open]').forEach((d) => d.close());
