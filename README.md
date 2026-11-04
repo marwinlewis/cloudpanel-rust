@@ -37,6 +37,7 @@ Then open `https://<server-ip>:8443`. Your browser will warn about the self-sign
 | :--- | :--- |
 | `--version v0.2.0` | Install a specific release |
 | `--from-source` | Build from source instead of downloading a binary |
+| `--binary PATH` | Install a locally built binary (offline installs, testing) |
 | `--branch NAME` | Branch to build with `--from-source` (default `main`) |
 | `--with-docker` | Install Docker Engine from the official docker.com repository |
 | `--with-mariadb` | Install MariaDB (MySQL-compatible) for site databases |
@@ -160,6 +161,13 @@ The old `user:add`-style names still work as aliases.
 cargo run            # http://localhost:8443, data stored in ./data
 cargo test
 cargo clippy --all-targets -- -D warnings
+```
+
+To test a real install, run the installer with a locally built binary on a disposable Debian/Ubuntu machine and then the end-to-end smoke test:
+
+```bash
+sudo bash install.sh --binary ./cloudpanel --databases mariadb,mongodb,sqlite
+sudo bash scripts/smoke-test.sh
 ```
 
 On Windows and in local development, system tools (nginx, ufw, certbot, systemctl, useradd, …) are skipped when they aren't installed, and configs are written under `./data`. The UI lives in `ui/` as plain ES modules (`ui/js/core.js` for shared helpers, one module per page under `ui/js/pages/`).

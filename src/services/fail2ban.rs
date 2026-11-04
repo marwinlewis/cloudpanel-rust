@@ -53,9 +53,11 @@ impl Fail2banSettings {
     }
 }
 
+/// fail2ban strips the part matched by `datepattern` before applying `failregex`, so the
+/// regex starts after the timestamp.
 pub fn render_filter() -> String {
     "# Managed by CloudPanel\n[Definition]\n\
-     failregex = ^\\S+ cloudpanel auth failure from <HOST> user=\\S* reason=\\S+$\n\
+     failregex = ^\\s*cloudpanel auth failure from <HOST> user=\\S* reason=\\S+$\n\
      ignoreregex =\n\
      datepattern = ^%%Y-%%m-%%dT%%H:%%M:%%SZ\n"
         .to_string()
@@ -135,7 +137,10 @@ pub fn apply(config: &Config, s: &Fail2banSettings) -> Result<(), String> {
 /// Install the filter and jail on first start so protection works without visiting the UI.
 pub fn ensure(config: &Config, s: &Fail2banSettings) {
     let jail = config.fail2ban_dir.join("jail.d").join("cloudpanel.conf");
-    if !jail.exists() && (installed() || cfg!(windows)) {
+    let filter = config.fail2ban_dir.join("filter.d").join("cloudpanel.conf");
+    // Also refresh a filter written by an older version.
+    let stale = fs::read_to_string(&filter).is_ok_and(|f| f != render_filter());
+    if (!jail.exists() || stale) && (installed() || cfg!(windows)) {
         if let Err(e) = apply(config, s) {
             tracing::warn!("fail2ban setup: {e}");
         }
@@ -221,7 +226,7 @@ mod tests {
         let j = render_jail(&c, &Fail2banSettings::default());
         assert!(j.contains("[cloudpanel]\nenabled = true\nport = 8443"));
         assert!(j.contains("bantime = 60m"));
-        assert!(render_filter().contains("<HOST>"));
+        assert!(render_filter().contains("failregex = ^\\s*cloudpanel auth failure from <HOST> "));
         // The log line format written by the login handler must match the filter.
         let line = "2026-11-04T06:40:31Z cloudpanel auth failure from 1.2.3.4 user=admin reason=password";
         assert!(line.contains(" cloudpanel auth failure from ") && line.ends_with("reason=password"));

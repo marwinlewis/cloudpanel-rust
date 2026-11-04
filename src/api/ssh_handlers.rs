@@ -87,7 +87,7 @@ pub async fn create_ssh_user(
                 .home_dir
                 .clone()
                 .ok_or_else(|| ApiError::BadRequest("This site has no Linux user to share files with".into()))?;
-            if sysusers::user_exists(&username) || db::list_ssh_users(conn, id)?.iter().any(|u| u.username == username)
+            if sysusers::name_in_use(&username) || db::list_ssh_users(conn, id)?.iter().any(|u| u.username == username)
             {
                 return Err(ApiError::Conflict(format!("The user '{username}' already exists")));
             }

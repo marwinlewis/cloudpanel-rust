@@ -60,7 +60,7 @@ pub fn provision(config: &Config, conn: &Connection, input: SiteInput) -> ApiRes
             .transpose()?;
         let user = match requested {
             Some(u) => {
-                if sysusers::user_exists(&u) || ssh_user_taken(conn, &u) {
+                if sysusers::name_in_use(&u) || ssh_user_taken(conn, &u) {
                     return Err(ApiError::Conflict(format!("The system user '{u}' already exists")));
                 }
                 u
@@ -147,6 +147,20 @@ pub fn deprovision(config: &Config, conn: &Connection, site: &Site, delete_files
         warnings.push(format!("nginx: {e}"));
     }
     apps::remove(config, &site.domain);
+    // Databases go with the files; when files are kept, the databases are kept too
+    // (but no longer listed in the panel).
+    for d in db::list_databases(conn, Some(site.id))? {
+        let Some(engine) = super::databases::Engine::parse(&d.engine) else {
+            continue;
+        };
+        if delete_files {
+            if let Err(e) = super::databases::drop_db(config, engine, site, &d.name, &d.users) {
+                warnings.push(format!("database {}: {e}", d.name));
+            }
+        } else if engine != super::databases::Engine::Sqlite {
+            warnings.push(format!("{} database '{}' was kept", engine.label(), d.name));
+        }
+    }
     for u in db::list_ssh_users(conn, site.id)? {
         sysusers::remove_authorized_keys(config, &u.username);
         if !u.is_owner {

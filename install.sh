@@ -11,6 +11,8 @@
 # Options:
 #   --version vX.Y.Z   Install a specific release (default: latest)
 #   --from-source      Build from source instead of downloading a release binary
+  --binary PATH      Install a local cloudpanel binary instead of downloading one
+#   --binary PATH      Install a locally built cloudpanel binary (offline installs, testing)
 #   --branch NAME      Git branch to build when building from source (default: main)
 #   --with-docker      Also install Docker Engine from the official docker.com repository
 #   --with-mariadb     Install MariaDB (MySQL-compatible) for site databases
@@ -31,6 +33,7 @@ REPO="${CLOUDPANEL_REPO:-marwinlewis/cloudpanel-rust}"
 VERSION="latest"
 BRANCH="main"
 FROM_SOURCE=0
+LOCAL_BIN=""
 WITH_DOCKER=0
 WITH_MARIADB=0
 WITH_MONGODB=0
@@ -119,6 +122,7 @@ parse_args() {
       --version) VERSION="${2:?--version needs a value}"; shift ;;
       --branch) BRANCH="${2:?--branch needs a value}"; shift ;;
       --from-source) FROM_SOURCE=1 ;;
+      --binary) LOCAL_BIN="${2:?--binary needs a path}"; shift ;;
       --with-docker) WITH_DOCKER=1 ;;
       --with-mariadb|--with-mysql) WITH_MARIADB=1; DB_CHOSEN=1 ;;
       --with-mongodb) WITH_MONGODB=1; DB_CHOSEN=1 ;;
@@ -195,7 +199,8 @@ install_packages() {
   apt-get update -q
   apt_install ca-certificates curl gnupg openssl tar gzip unzip nginx certbot python3-certbot-nginx ufw cron iproute2 passwd
   if [ "$NO_FAIL2BAN" -eq 0 ]; then
-    apt_install fail2ban
+    # The sshd jail reads the systemd journal (Debian 12+ has no auth.log by default).
+    apt_install fail2ban python3-systemd
   fi
   if [ "$WITH_SQLITE" -eq 1 ]; then
     apt_install sqlite3
@@ -390,7 +395,10 @@ build_from_source() {
 install_binary() {
   TMP_DIR=$(mktemp -d)
   NEW_BIN=""
-  if [ "$FROM_SOURCE" -eq 0 ]; then
+  if [ -n "$LOCAL_BIN" ]; then
+    [ -f "$LOCAL_BIN" ] || die "--binary: $LOCAL_BIN not found"
+    NEW_BIN="$LOCAL_BIN"
+  elif [ "$FROM_SOURCE" -eq 0 ]; then
     if ! download_release; then
       [ "$VERSION" = "latest" ] || die "Release ${VERSION} not found for ${ARCH}"
       warn "No release binary available; falling back to building from source"

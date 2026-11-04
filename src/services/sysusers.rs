@@ -52,14 +52,14 @@ fn ensure_groups() -> Result<(), String> {
 
 /// Pick a free account name based on `base` (appends digits when taken).
 pub fn unique_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
-    if !user_exists(base) && !taken(base) {
+    if !name_in_use(base) && !taken(base) {
         return base.to_string();
     }
     for i in 2..1000 {
         let mut b = base.to_string();
         b.truncate(28);
         let cand = format!("{b}{i}");
-        if !user_exists(&cand) && !taken(&cand) {
+        if !name_in_use(&cand) && !taken(&cand) {
             return cand;
         }
     }
@@ -201,8 +201,18 @@ pub fn delete_user(user: &str, remove_home: bool) -> Result<(), String> {
     args.push("--");
     args.push(user);
     sys("userdel", &args, &CmdOpts::default())?;
+    // userdel keeps the user's group while other accounts (www-data, SSH users) are
+    // members of it; remove it so the name can be reused.
+    if cfg!(unix) && group_exists(user) {
+        let _ = sys("groupdel", &["--", user], &CmdOpts::default());
+    }
     info!("deleted system user {user}");
     Ok(())
+}
+
+/// A user or group with this name already exists.
+pub fn name_in_use(name: &str) -> bool {
+    user_exists(name) || (cfg!(unix) && group_exists(name))
 }
 
 pub fn chown_recursive(path: &Path, user: &str, group: &str) -> Result<(), String> {
@@ -226,7 +236,7 @@ pub fn chown_one(path: &Path, user: &str) -> Result<(), String> {
     let p = path.to_string_lossy();
     run_with(
         "chown",
-        &["--no-dereference", &format!("{user}:{user}"), "--", &p],
+        &["--no-dereference", &format!("{user}:"), "--", &p],
         &CmdOpts::default(),
     )
     .into_result("chown", "chown is not installed")
