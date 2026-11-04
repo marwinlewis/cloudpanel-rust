@@ -291,9 +291,15 @@ async fn csrf_guard(req: Request, next: Next) -> Result<Response, ApiError> {
             }
         }
         if let Some(origin) = h.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-            let host = h.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+            // HTTP/2 (what browsers negotiate over TLS) has no Host header; the
+            // host travels in the :authority pseudo-header, i.e. the request URI.
+            let host = h
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .or_else(|| req.uri().authority().map(|a| a.as_str()))
+                .unwrap_or("");
             let origin_host = origin.split_once("://").map(|(_, rest)| rest).unwrap_or("");
-            if host.is_empty() || origin_host != host {
+            if host.is_empty() || !origin_host.eq_ignore_ascii_case(host) {
                 return denied();
             }
         }

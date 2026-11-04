@@ -144,6 +144,34 @@ async fn csrf_header_is_required_for_mutations() {
     assert_eq!(s, StatusCode::BAD_REQUEST);
 }
 
+/// Browsers talk HTTP/2 to the panel: no Host header, the host is in the URI
+/// authority. A same-origin login must still pass the CSRF check.
+#[tokio::test]
+async fn same_origin_login_over_http2_is_allowed() {
+    let h = harness();
+    let send = |origin: &'static str| {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("https://203.0.113.5:8443/api/auth/login")
+            .version(axum::http::Version::HTTP_2)
+            .header(super::CSRF_HEADER, super::CSRF_VALUE)
+            .header("sec-fetch-site", "same-origin")
+            .header(header::ORIGIN, origin)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"username": "admin", "password": "admin-password-1"}).to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo::<SocketAddr>("127.0.0.1:5555".parse().unwrap()));
+        h.app.clone().oneshot(req)
+    };
+    let res = send("https://203.0.113.5:8443").await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = send("https://evil.example.com").await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn site_managers_only_see_their_sites() {
     let h = harness();
