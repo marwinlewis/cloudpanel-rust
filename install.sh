@@ -160,10 +160,12 @@ require_root() {
 detect_os() {
   [ -r /etc/os-release ] || die "Cannot detect the operating system (/etc/os-release missing)"
   # shellcheck disable=SC1091
-  . /etc/os-release
-  OS_ID="${ID:-}"
-  OS_VERSION="${VERSION_ID:-}"
-  OS_CODENAME="${VERSION_CODENAME:-}"
+  # Read os-release in a subshell: it defines VERSION, NAME, ID etc., which
+  # would otherwise overwrite this script's own VERSION (the release to install).
+  OS_ID=$(. /etc/os-release && printf '%s' "${ID:-}")
+  OS_VERSION=$(. /etc/os-release && printf '%s' "${VERSION_ID:-}")
+  OS_CODENAME=$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")
+  PRETTY_NAME=$(. /etc/os-release && printf '%s' "${PRETTY_NAME:-}")
 
   local supported=0
   case "$OS_ID" in
