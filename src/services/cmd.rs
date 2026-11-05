@@ -112,6 +112,29 @@ impl CmdResult {
 }
 
 fn build(program: &str, args: &[&str], opts: &CmdOpts) -> Command {
+    // Switching user with `runuser` fails inside the panel's systemd sandbox
+    // ("runuser: cannot set user id: Operation not permitted"), so when systemd is
+    // available let PID 1 start the command as the target user in a transient unit.
+    if let Some(user) = &opts.as_user {
+        if cfg!(unix) && which("systemd-run") {
+            let mut c = Command::new("systemd-run");
+            c.args(["--wait", "--pipe", "--collect", "--quiet", "--service-type=exec"]);
+            c.arg(format!("--uid={user}"));
+            c.arg("--setenv=LC_ALL=C");
+            if let Ok(path) = std::env::var("PATH") {
+                c.arg(format!("--setenv=PATH={path}"));
+            }
+            for (k, v) in &opts.env {
+                c.arg(format!("--setenv={k}={v}"));
+            }
+            if let Some(dir) = &opts.cwd {
+                c.arg(format!("--working-directory={}", dir.display()));
+            }
+            c.arg("--").arg(program).args(args);
+            c.env("LC_ALL", "C");
+            return c;
+        }
+    }
     let mut cmd = match &opts.as_user {
         Some(user) => {
             let mut c = Command::new("runuser");
