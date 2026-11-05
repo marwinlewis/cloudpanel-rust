@@ -155,7 +155,11 @@ pub async fn install_dependencies(
         return Err(ApiError::BadRequest("This site has no Linux user".into()));
     }
     let domain = site.domain.clone();
+    let config = state.config.clone();
     let job_id = crate::jobs::spawn(&state.pool, "app.install", Some(&domain), Some(user.id), move |log| {
+        if site.kind() == Some(crate::db::models::SiteType::Nodejs) {
+            crate::services::runtimes::ensure_nodejs(&config, &|l| log.line(l))?;
+        }
         apps::install_dependencies(&site, log)
     })
     .map_err(ApiError::internal)?;

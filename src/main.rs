@@ -237,6 +237,10 @@ async fn main() -> AnyResult<()> {
                 "Site '{}' ({}) created with id {}",
                 site.domain, site.site_type, site.id
             );
+            if site.site_type == "nodejs" && services::runtimes::node_needed(&config) {
+                println!("Node.js is not installed; installing it now...");
+                services::runtimes::ensure_nodejs(&config, &|l| println!("{l}"))?;
+            }
             return Ok(());
         }
         Some(Commands::SiteList) => {

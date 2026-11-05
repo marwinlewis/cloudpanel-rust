@@ -3,9 +3,9 @@ use crate::audit;
 use crate::auth::{AdminUser, AuthUser};
 use crate::authz::{require_admin, require_site, visible_sites};
 use crate::config::Config;
-use crate::db::{self, models::Site};
+use crate::db::{self, models::Site, models::SiteType};
 use crate::services::sites::{deprovision, provision, SiteInput};
-use crate::services::{apps, NginxService, SslService};
+use crate::services::{apps, runtimes, NginxService, SslService};
 use crate::state::SharedState;
 use crate::validate;
 use axum::{
@@ -57,6 +57,7 @@ pub async fn create_new_site(
     Json(p): Json<CreateSiteRequest>,
 ) -> ApiResult<impl IntoResponse> {
     let config = state.config.clone();
+    let admin_id = admin.0.id;
     let site = state
         .db(move |conn| {
             let site = provision(
@@ -77,7 +78,33 @@ pub async fn create_new_site(
             Ok(site)
         })
         .await?;
-    Ok((StatusCode::CREATED, Json(site)))
+    // Node.js sites need a system-wide runtime; install it in the background if missing
+    // and restart the app once it's there.
+    let mut runtime_job_id = None;
+    if site.kind() == Some(SiteType::Nodejs) && runtimes::node_needed(&state.config) {
+        let config = state.config.clone();
+        let s = site.clone();
+        runtime_job_id = Some(
+            crate::jobs::spawn(
+                &state.pool,
+                "runtime.nodejs",
+                Some(&site.domain),
+                Some(admin_id),
+                move |log| {
+                    runtimes::ensure_nodejs(&config, &|l| log.line(l))?;
+                    if s.app_enabled && s.app_command.is_some() {
+                        log.line(&format!("Restarting {}", apps::unit_name(&s.domain)));
+                        apps::act(&s.domain, apps::AppAction::Restart)?;
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(ApiError::internal)?,
+        );
+    }
+    let mut v = serde_json::to_value(&site).map_err(ApiError::internal)?;
+    v["runtime_job_id"] = json!(runtime_job_id);
+    Ok((StatusCode::CREATED, Json(v)))
 }
 
 pub async fn get_site(

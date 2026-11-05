@@ -15,6 +15,7 @@
 #   --binary PATH      Install a locally built cloudpanel binary (offline installs, testing)
 #   --branch NAME      Git branch to build when building from source (default: main)
 #   --with-docker      Also install Docker Engine from the official docker.com repository
+#   --no-nodejs        Don't install Node.js 22 LTS (NodeSource) for Node.js sites
 #   --with-mariadb     Install MariaDB (MySQL-compatible) for site databases
 #   --with-mongodb     Install MongoDB Community from the official mongodb.org repository
 #   --with-sqlite      Enable SQLite site databases (installs the sqlite3 CLI)
@@ -36,6 +37,8 @@ BRANCH="main"
 FROM_SOURCE=0
 LOCAL_BIN=""
 WITH_DOCKER=0
+NO_NODEJS=0
+NODE_MAJOR=22
 WITH_MARIADB=0
 WITH_MONGODB=0
 WITH_SQLITE=0
@@ -91,6 +94,7 @@ CloudPanel installer (Debian 11/12/13, Ubuntu 22.04/24.04)
   --from-source      Build from source instead of downloading a release binary
   --branch NAME      Git branch to build when building from source (default: main)
   --with-docker      Also install Docker Engine from docker.com
+  --no-nodejs        Don't install Node.js 22 LTS (NodeSource) for Node.js sites
   --with-mariadb     Install MariaDB (MySQL-compatible) for site databases
   --with-mongodb     Install MongoDB Community (mongodb.org repository)
   --with-sqlite      Enable SQLite site databases
@@ -127,6 +131,7 @@ parse_args() {
       --from-source) FROM_SOURCE=1 ;;
       --binary) LOCAL_BIN="${2:?--binary needs a path}"; shift ;;
       --with-docker) WITH_DOCKER=1 ;;
+      --no-nodejs) NO_NODEJS=1 ;;
       --with-mariadb|--with-mysql) WITH_MARIADB=1; DB_CHOSEN=1 ;;
       --with-mongodb) WITH_MONGODB=1; DB_CHOSEN=1 ;;
       --with-sqlite) WITH_SQLITE=1; DB_CHOSEN=1 ;;
@@ -236,6 +241,24 @@ install_docker() {
   apt-get update -q
   apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   systemctl enable --now docker >/dev/null 2>&1 || warn "Docker installed but failed to start"
+}
+
+# Node.js sites run `npm start` from a systemd unit that only searches /usr/local/bin and
+# /usr/bin, so the runtime must be installed system-wide (not per user via nvm).
+install_nodejs() {
+  if command -v node >/dev/null 2>&1; then
+    info "Node.js $(node --version) is already installed"
+    return
+  fi
+  log "Installing Node.js ${NODE_MAJOR} LTS (NodeSource repository)"
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor --yes -o /etc/apt/keyrings/nodesource.gpg
+  chmod a+r /etc/apt/keyrings/nodesource.gpg
+  printf 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_%s.x nodistro main
+'     "$NODE_MAJOR" > /etc/apt/sources.list.d/nodesource.list
+  apt-get update -q
+  apt_install nodejs || { warn "Node.js installation failed; the panel retries when a Node.js site is created"; return; }
+  info "Node.js $(node --version), npm $(npm --version)"
 }
 
 # Ask which database engines to install when no flag was given. The answer is read from
@@ -781,6 +804,9 @@ main() {
   choose_databases
   install_packages
   install_databases
+  if [ "$NO_NODEJS" -eq 0 ]; then
+    install_nodejs
+  fi
   if [ "$WITH_DOCKER" -eq 1 ]; then
     install_docker
   fi

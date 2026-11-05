@@ -1,6 +1,6 @@
 'use strict';
 import {
-  api, card, confirmDialog, emptyState, errorState, field, fmtAgo, fmtBytes, fmtDate, formDialog, h, icon, isAdmin,
+  api, card, confirmDialog, emptyState, errorState, field, jobDialog, fmtAgo, fmtBytes, fmtDate, formDialog, h, icon, isAdmin,
   kv, moreButton, openDialog, runJob, secretDialog, selectField, setActions, setSub, skeletonRows, table, tabStrip,
   toast, typedConfirm, withBusy, VALIDATORS,
 } from '../core.js';
@@ -141,6 +141,7 @@ function addSiteDialog(done) {
       toast(`${body.domain} created`);
       done();
       location.hash = `#/sites/${site.id}`;
+      if (site.runtime_job_id) jobDialog(site.runtime_job_id, 'Installing Node.js');
     },
   });
 }

@@ -293,6 +293,27 @@ pub fn run_streaming(program: &str, args: &[&str], opts: &CmdOpts, on_line: &mut
 /// `/etc` or `/usr`, like `useradd` or `apt-get`). Falls back to a direct call when
 /// `systemd-run` is unavailable (development).
 pub fn run_host(program: &str, args: &[&str], opts: &CmdOpts) -> CmdResult {
+    let mut out = String::new();
+    let mut err = String::new();
+    let res = run_host_streaming(program, args, opts, &mut |line, is_err| {
+        let buf = if is_err { &mut err } else { &mut out };
+        buf.push_str(line);
+        buf.push('\n');
+    });
+    CmdResult {
+        stdout: out,
+        stderr: err,
+        ..res
+    }
+}
+
+/// [`run_host`], streaming output lines to `on_line` as they arrive.
+pub fn run_host_streaming(
+    program: &str,
+    args: &[&str],
+    opts: &CmdOpts,
+    on_line: &mut dyn FnMut(&str, bool),
+) -> CmdResult {
     if let Some(sr) = systemd_run() {
         let sr = sr.to_string_lossy().into_owned();
         let mut full: Vec<&str> = vec!["--wait", "--pipe", "--collect", "--quiet", "--service-type=exec"];
@@ -317,9 +338,9 @@ pub fn run_host(program: &str, args: &[&str], opts: &CmdOpts) -> CmdResult {
             timeout: opts.timeout,
             ..Default::default()
         };
-        return run_with(&sr, &full, &inner);
+        return run_streaming(&sr, &full, &inner, on_line);
     }
-    run_with(program, args, opts)
+    run_streaming(program, args, opts, on_line)
 }
 
 /// Is `program` on PATH?

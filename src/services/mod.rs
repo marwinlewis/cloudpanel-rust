@@ -10,6 +10,7 @@ pub mod files;
 pub mod firewall;
 pub mod nginx;
 pub mod panel_cert;
+pub mod runtimes;
 pub mod s3;
 pub mod sites;
 pub mod ssl;
