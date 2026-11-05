@@ -166,13 +166,16 @@ require_root() {
 
 detect_os() {
   [ -r /etc/os-release ] || die "Cannot detect the operating system (/etc/os-release missing)"
-  # shellcheck disable=SC1091
   # Read os-release in a subshell: it defines VERSION, NAME, ID etc., which
   # would otherwise overwrite this script's own VERSION (the release to install).
-  OS_ID=$(. /etc/os-release && printf '%s' "${ID:-}")
-  OS_VERSION=$(. /etc/os-release && printf '%s' "${VERSION_ID:-}")
-  OS_CODENAME=$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")
-  PRETTY_NAME=$(. /etc/os-release && printf '%s' "${PRETTY_NAME:-}")
+  # Values are printed one per line; os-release values never contain newlines.
+  local os_info
+  # shellcheck disable=SC1091
+  os_info=$(. /etc/os-release && printf '%s\n%s\n%s\n%s\n' \
+    "${ID:-}" "${VERSION_ID:-}" "${VERSION_CODENAME:-}" "${PRETTY_NAME:-}")
+  { read -r OS_ID; read -r OS_VERSION; read -r OS_CODENAME; read -r PRETTY_NAME; } <<EOF
+$os_info
+EOF
 
   local supported=0
   case "$OS_ID" in
@@ -322,9 +325,9 @@ install_mongodb() {
 
   local creds="$CONF_DIR/mongodb.env"
   if [ ! -s "$creds" ]; then
-    local pw i
+    local pw
     pw=$(openssl rand -hex 24)
-    for i in $(seq 1 30); do
+    for _ in $(seq 1 30); do
       mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' >/dev/null 2>&1 && break
       sleep 1
     done
