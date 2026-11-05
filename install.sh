@@ -524,6 +524,15 @@ build_from_source() {
   if [ "$(mem_kb)" -lt 2000000 ]; then
     export CARGO_BUILD_JOBS=1
   fi
+  # The release profile's fat LTO with one codegen unit makes the final link of the
+  # cloudpanel binary need several GB of RAM. On smaller servers that step gets
+  # OOM-killed (often taking sshd with it), so use thin LTO there instead. The
+  # binary is slightly larger but behaves identically.
+  if [ "$(mem_kb)" -lt 4000000 ]; then
+    info "Low memory: building with thin LTO to keep the final link small"
+    export CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO:-thin}"
+    export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-16}"
+  fi
   info "Installing the Rust toolchain"
   curl -fsSL --proto '=https' --tlsv1.2 https://sh.rustup.rs -o "$TMP_DIR/rustup-init.sh"
   sh "$TMP_DIR/rustup-init.sh" -y -q --profile minimal --no-modify-path
