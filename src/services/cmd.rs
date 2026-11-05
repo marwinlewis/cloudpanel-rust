@@ -111,15 +111,44 @@ impl CmdResult {
     }
 }
 
+/// Locate `systemd-run`. The panel's own PATH can be minimal (or overridden by its env
+/// file), so the standard locations are checked directly as well.
+pub fn systemd_run() -> Option<PathBuf> {
+    if !cfg!(unix) {
+        return None;
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        if let Some(p) = std::env::split_paths(&path)
+            .map(|d| d.join("systemd-run"))
+            .find(|p| p.is_file())
+        {
+            return Some(p);
+        }
+    }
+    ["/usr/bin/systemd-run", "/bin/systemd-run", "/usr/local/bin/systemd-run"]
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+}
+
 fn build(program: &str, args: &[&str], opts: &CmdOpts) -> Command {
+    build_with(program, args, opts, systemd_run())
+}
+
+fn build_with(program: &str, args: &[&str], opts: &CmdOpts, systemd_run: Option<PathBuf>) -> Command {
     // Switching user with `runuser` fails inside the panel's systemd sandbox
-    // ("runuser: cannot set user id: Operation not permitted"), so when systemd is
-    // available let PID 1 start the command as the target user in a transient unit.
+    // (NoNewPrivileges/RestrictSUIDSGID: "runuser: cannot set user id: Operation not
+    // permitted"), so when systemd is available let PID 1 start the command as the
+    // target user in a transient unit.
     if let Some(user) = &opts.as_user {
-        if cfg!(unix) && which("systemd-run") {
-            let mut c = Command::new("systemd-run");
+        if let Some(sr) = systemd_run {
+            let mut c = Command::new(sr);
             c.args(["--wait", "--pipe", "--collect", "--quiet", "--service-type=exec"]);
             c.arg(format!("--uid={user}"));
+            if let Some(t) = opts.timeout {
+                // Killing the systemd-run client on timeout doesn't stop the unit.
+                c.arg(format!("--property=RuntimeMaxSec={}", t.as_secs().max(1)));
+            }
             c.arg("--setenv=LC_ALL=C");
             if let Ok(path) = std::env::var("PATH") {
                 c.arg(format!("--setenv=PATH={path}"));
@@ -264,7 +293,8 @@ pub fn run_streaming(program: &str, args: &[&str], opts: &CmdOpts, on_line: &mut
 /// `/etc` or `/usr`, like `useradd` or `apt-get`). Falls back to a direct call when
 /// `systemd-run` is unavailable (development).
 pub fn run_host(program: &str, args: &[&str], opts: &CmdOpts) -> CmdResult {
-    if cfg!(unix) && which("systemd-run") {
+    if let Some(sr) = systemd_run() {
+        let sr = sr.to_string_lossy().into_owned();
         let mut full: Vec<&str> = vec!["--wait", "--pipe", "--collect", "--quiet", "--service-type=exec"];
         let envs: Vec<String> = opts.env.iter().map(|(k, v)| format!("--setenv={k}={v}")).collect();
         full.extend(envs.iter().map(String::as_str));
@@ -287,7 +317,7 @@ pub fn run_host(program: &str, args: &[&str], opts: &CmdOpts) -> CmdResult {
             timeout: opts.timeout,
             ..Default::default()
         };
-        return run_with("systemd-run", &full, &inner);
+        return run_with(&sr, &full, &inner);
     }
     run_with(program, args, opts)
 }
@@ -324,6 +354,57 @@ mod tests {
         let r = run_with("definitely-not-a-real-binary-xyz", &[], &CmdOpts::default());
         assert!(r.missing);
         assert!(matches!(r.outcome("x"), CmdOutcome::Missing));
+    }
+
+    fn argv(c: &Command) -> (String, Vec<String>) {
+        (
+            c.get_program().to_string_lossy().into_owned(),
+            c.get_args().map(|a| a.to_string_lossy().into_owned()).collect(),
+        )
+    }
+
+    /// Regression: commands run as a site user (e.g. `npm install`) must go through
+    /// systemd-run, because `runuser` cannot switch users inside the panel's sandbox.
+    #[test]
+    fn user_commands_use_systemd_run_when_available() {
+        let opts = CmdOpts::default()
+            .user("shop")
+            .cwd("/home/shop/app")
+            .env("HOME", "/home/shop")
+            .timeout(1200);
+        let (prog, args) = argv(&build_with(
+            "npm",
+            &["install", "--no-audit"],
+            &opts,
+            Some(PathBuf::from("/usr/bin/systemd-run")),
+        ));
+        assert_eq!(prog, "/usr/bin/systemd-run");
+        assert!(!args.iter().any(|a| a == "runuser"));
+        assert!(args.contains(&"--uid=shop".to_string()));
+        assert!(args.contains(&"--wait".to_string()));
+        assert!(args.contains(&"--pipe".to_string()));
+        assert!(args.contains(&"--setenv=HOME=/home/shop".to_string()));
+        assert!(args.contains(&"--property=RuntimeMaxSec=1200".to_string()));
+        assert!(args.contains(&"--working-directory=/home/shop/app".to_string()));
+        let sep = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(&args[sep + 1..], ["npm", "install", "--no-audit"]);
+    }
+
+    #[test]
+    fn runuser_is_only_a_fallback_without_systemd() {
+        let opts = CmdOpts::default().user("shop");
+        let (prog, args) = argv(&build_with("npm", &["ci"], &opts, None));
+        assert_eq!(prog, "runuser");
+        assert_eq!(args, ["-u", "shop", "--", "npm", "ci"]);
+        // No user switch requested: run the program directly.
+        let (prog, args) = argv(&build_with(
+            "npm",
+            &["ci"],
+            &CmdOpts::default(),
+            Some(PathBuf::from("/usr/bin/systemd-run")),
+        ));
+        assert_eq!(prog, "npm");
+        assert_eq!(args, ["ci"]);
     }
 
     #[test]
