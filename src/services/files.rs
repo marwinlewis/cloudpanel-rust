@@ -331,10 +331,24 @@ impl SiteFs {
 mod tests {
     use super::*;
 
+    /// The user running the tests. Writes are chowned to the site user, and only root
+    /// may chown to someone else (CI runs unprivileged), but anyone may chown to themselves.
+    fn current_user() -> String {
+        std::process::Command::new("id")
+            .arg("-un")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|u| !u.is_empty())
+            .or_else(|| std::env::var("USER").ok())
+            .unwrap_or_else(|| "nobody".into())
+    }
+
     fn sfs() -> (tempfile::TempDir, SiteFs) {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("home/htdocs")).unwrap();
-        let s = SiteFs::new(&dir.path().join("home").to_string_lossy(), "nobody").unwrap();
+        let s = SiteFs::new(&dir.path().join("home").to_string_lossy(), &current_user()).unwrap();
         (dir, s)
     }
 
