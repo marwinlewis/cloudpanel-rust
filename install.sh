@@ -438,7 +438,7 @@ make_swap_file() {
 setup_swap() {
   if [ "$(swap_kb)" -gt 0 ]; then
     [ -n "$SWAP_SIZE" ] && [ "$SWAP_SIZE" -gt 0 ] && info "Swap is already enabled; leaving it as it is"
-    return
+    return 0
   fi
   local size="$SWAP_SIZE" max concern yn
   if [ -z "$size" ]; then
