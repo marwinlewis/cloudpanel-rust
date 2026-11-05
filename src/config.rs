@@ -118,3 +118,32 @@ impl Config {
         self.db_engines.iter().any(|e| e == engine)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derived_settings() {
+        let mut c = Config::from_env();
+        c.bind_addr = "0.0.0.0:8443".into();
+        assert_eq!(c.panel_port(), Some(8443));
+        c.bind_addr = "[::]:9000".into();
+        assert_eq!(c.panel_port(), Some(9000));
+        c.bind_addr = "garbage".into();
+        assert_eq!(c.panel_port(), None);
+
+        c.tls_cert = Some("cert.pem".into());
+        c.tls_key = None;
+        assert!(!c.tls_enabled());
+        c.tls_key = Some("key.pem".into());
+        assert!(c.tls_enabled());
+
+        c.data_dir = PathBuf::from("base");
+        assert_eq!(c.ssl_dir(), PathBuf::from("base").join("ssl"));
+
+        c.db_engines = vec!["sqlite".into(), "mariadb".into()];
+        assert!(c.engine_configured("mariadb"));
+        assert!(!c.engine_configured("mongodb"));
+    }
+}

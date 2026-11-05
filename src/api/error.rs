@@ -73,3 +73,44 @@ impl IntoResponse for ApiError {
         (status, Json(serde_json::json!({ "error": message }))).into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_codes() {
+        let cases = [
+            (ApiError::BadRequest("x".into()), StatusCode::BAD_REQUEST),
+            (ApiError::Unauthorized("x".into()), StatusCode::UNAUTHORIZED),
+            (ApiError::Forbidden, StatusCode::FORBIDDEN),
+            (ApiError::NotFound("Site"), StatusCode::NOT_FOUND),
+            (ApiError::Conflict("x".into()), StatusCode::CONFLICT),
+            (ApiError::Unprocessable("x".into()), StatusCode::UNPROCESSABLE_ENTITY),
+            (ApiError::TooManyRequests(90), StatusCode::TOO_MANY_REQUESTS),
+            (
+                ApiError::Internal("secret detail".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+        for (err, want) in cases {
+            assert_eq!(err.into_response().status(), want);
+        }
+    }
+
+    #[test]
+    fn retry_after_header() {
+        let res = ApiError::TooManyRequests(90).into_response();
+        assert_eq!(res.headers().get(header::RETRY_AFTER).unwrap(), "90");
+    }
+
+    #[tokio::test]
+    async fn internal_details_are_not_leaked() {
+        use http_body_util::BodyExt;
+        let res = ApiError::Internal("database: secret detail".into()).into_response();
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(!text.contains("secret"));
+        assert!(text.contains("Internal server error"));
+    }
+}

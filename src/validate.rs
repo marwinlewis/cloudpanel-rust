@@ -613,6 +613,80 @@ mod tests {
         assert!(system_user("-x").is_err());
     }
 
+    #[test]
+    fn usernames_and_passwords() {
+        assert_eq!(username("  jane.doe ").unwrap(), "jane.doe");
+        assert!(username("ab").is_err());
+        assert!(username(&"a".repeat(33)).is_err());
+        assert!(username("bad name").is_err());
+        assert!(password("123456789").is_err());
+        assert!(password("1234567890").is_ok());
+        assert!(password(&"x".repeat(128)).is_ok());
+        assert!(password(&"x".repeat(129)).is_err());
+        // Counted in characters, not bytes.
+        assert!(password("ääääääääää").is_ok());
+    }
+
+    #[test]
+    fn ports_and_text() {
+        assert!(port(None).is_err());
+        assert!(port(Some(0)).is_err());
+        assert_eq!(port(Some(443)).unwrap(), 443);
+        assert!(port_range("0").is_err());
+        assert!(port_range("70000").is_err());
+        assert_eq!(port_range("100-200").unwrap(), (100, Some(200)));
+        assert_eq!(short_text(None, 10).unwrap(), None);
+        assert_eq!(short_text(Some("   "), 10).unwrap(), None);
+        assert_eq!(short_text(Some(" hi "), 10).unwrap(), Some("hi".into()));
+        assert!(short_text(Some("toolongtext"), 5).is_err());
+        assert!(short_text(Some("a\u{7}b"), 10).is_err());
+    }
+
+    #[test]
+    fn commands() {
+        assert!(app_command("npm start").is_ok());
+        assert!(app_command("").is_err());
+        assert!(app_command("a\nb").is_err());
+        assert!(app_command(&"x".repeat(1001)).is_err());
+        assert!(cron_command("").is_err());
+        assert!(cron_command("a\0b").is_err());
+        assert!(env_value(&"v".repeat(4097)).is_err());
+        assert!(env_key("_PRIVATE_1").is_ok());
+        assert!(env_key("A-B").is_err());
+    }
+
+    #[test]
+    fn more_edge_cases() {
+        assert!(cidr("::/0").is_ok());
+        assert!(cidr("::1/129").is_err());
+        assert!(cidr("10.0.0.0/x").is_err());
+        assert!(file_name("").is_err());
+        assert!(file_name("a\\b").is_err());
+        assert_eq!(file_mode("0644").unwrap(), 0o644);
+        assert!(file_mode("75555").is_err());
+        assert!(file_mode("").is_err());
+        assert!(db_identifier("").is_err());
+        assert!(db_identifier(&format!("a{}", "b".repeat(32))).is_err());
+        assert_eq!(service_name("nginx.service").unwrap(), "nginx");
+        assert!(service_name("cloudpanel-app-").is_err());
+        assert!(service_name("cloudpanel-app-Bad").is_err());
+        assert!(image_ref("nginx:1.27").is_ok());
+        assert!(image_ref("nginx latest").is_err());
+        assert!(nginx_directives("http { }").is_err());
+        assert!(nginx_directives("include /etc/nginx/../passwd;").is_err());
+        assert!(nginx_directives("location / {").is_err());
+        assert_eq!(nginx_directives("gzip on;\r\n").unwrap(), "gzip on;");
+        let long = site_user_from_domain("averyveryverylongsubdomainname.example.com");
+        assert!(long.len() <= 28 && !long.ends_with('-'));
+        assert!(system_user(&"a".repeat(33)).is_err());
+        assert!(email(&format!("{}@example.com", "a".repeat(65))).is_err());
+        assert!(email("a@localhost").is_err());
+        assert!(domain(&format!("{}.com", "a".repeat(64))).is_err());
+        assert!(cron_schedule("*/0 * * * *").is_err());
+        assert!(cron_schedule("@every5m").is_err());
+        assert_eq!(cron_schedule("  0   3 * * *  ").unwrap(), "0 3 * * *");
+    }
+
     #[cfg(unix)]
     #[test]
     fn paths() {

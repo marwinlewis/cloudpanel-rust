@@ -36,3 +36,34 @@ pub fn random_password(len: usize) -> String {
         .map(char::from)
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash_and_verify_roundtrip() {
+        let h = hash_password("correct horse battery").unwrap();
+        assert!(h.starts_with("$argon2"));
+        assert!(verify_password("correct horse battery", &h));
+        assert!(!verify_password("wrong", &h));
+        // Salted: the same password hashes differently each time.
+        assert_ne!(h, hash_password("correct horse battery").unwrap());
+    }
+
+    #[test]
+    fn malformed_hash_never_verifies() {
+        assert!(!verify_password("x", ""));
+        assert!(!verify_password("x", "not-a-hash"));
+        verify_dummy("anything");
+    }
+
+    #[test]
+    fn random_passwords() {
+        let a = random_password(24);
+        assert_eq!(a.len(), 24);
+        assert!(a.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_ne!(a, random_password(24));
+        assert!(random_password(0).is_empty());
+    }
+}

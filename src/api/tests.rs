@@ -341,3 +341,310 @@ async fn two_factor_login_flow() {
         .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests: authentication, sessions, user management and router basics.
+// ---------------------------------------------------------------------------
+
+async fn try_login(h: &Harness, user: &str, pw: &str) -> (StatusCode, Value, Option<String>) {
+    h.call(
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({"username": user, "password": pw})),
+        true,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn protected_endpoints_require_a_session() {
+    let h = harness();
+    for path in ["/auth/me", "/sites", "/users", "/cron/jobs", "/jobs", "/events"] {
+        let (s, _, _) = h.call("GET", path, None, None, false).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{path}");
+    }
+    let (s, _, _) = h
+        .call("GET", "/auth/me", Some("cp_session=not-a-jwt"), None, false)
+        .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn unknown_endpoints_return_json_404_and_no_store() {
+    let h = harness();
+    let (s, v, _) = h.call("GET", "/does-not-exist", None, None, false).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert!(v["error"].is_string());
+
+    let mut req = Request::builder().uri("/api/auth/me").body(Body::empty()).unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo::<SocketAddr>("127.0.0.1:5555".parse().unwrap()));
+    let res = h.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
+}
+
+#[tokio::test]
+async fn cross_site_fetch_metadata_is_blocked() {
+    let h = harness();
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/api/auth/login")
+        .header(super::CSRF_HEADER, super::CSRF_VALUE)
+        .header("sec-fetch-site", "cross-site")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"username": "admin", "password": "admin-password-1"}).to_string(),
+        ))
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo::<SocketAddr>("127.0.0.1:5555".parse().unwrap()));
+    let res = h.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn login_rejects_bad_credentials_and_reports_identity() {
+    let h = harness();
+    for (user, pw) in [("admin", "wrong-password"), ("nobody", "admin-password-1")] {
+        let (s, v, c) = try_login(&h, user, pw).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{user}");
+        assert!(c.is_none());
+        // Same message for unknown users and wrong passwords (no user enumeration).
+        assert_eq!(v["error"], "Invalid username or password");
+    }
+    let cookie = h.login("admin").await;
+    assert!(cookie.starts_with("cp_session="));
+    let (s, me, _) = h.call("GET", "/auth/me", Some(&cookie), None, false).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(me["username"], "admin");
+    assert_eq!(me["role"], "admin");
+}
+
+#[tokio::test]
+async fn repeated_failed_logins_are_rate_limited() {
+    let h = harness();
+    let mut last = StatusCode::OK;
+    for _ in 0..6 {
+        last = try_login(&h, "admin", "wrong-password").await.0;
+    }
+    assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
+    // Even the right password is refused while locked out.
+    let (s, _, _) = try_login(&h, "admin", "admin-password-1").await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn logout_clears_cookie_and_logout_all_revokes_sessions() {
+    let h = harness();
+    let (s, _, c) = h.call("POST", "/auth/logout", None, None, true).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(c.as_deref().map(|c| c.trim_end_matches('=')), Some("cp_session"));
+
+    let first = h.login("admin").await;
+    let second = h.login("admin").await;
+    let (s, _, _) = h.call("POST", "/auth/logout-all", Some(&first), None, true).await;
+    assert_eq!(s, StatusCode::OK);
+    for cookie in [&first, &second] {
+        let (s, _, _) = h.call("GET", "/auth/me", Some(cookie), None, false).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[tokio::test]
+async fn change_password_flow() {
+    let h = harness();
+    let old = h.login("admin").await;
+    let change = |cur: &str, new: &str| Some(json!({"current_password": cur, "new_password": new}));
+
+    for (body, why) in [
+        (change("admin-password-1", "short"), "too short"),
+        (change("admin-password-1", "admin-password-1"), "unchanged"),
+        (change("wrong-password", "brand-new-pass-2"), "wrong current"),
+    ] {
+        let (s, _, _) = h.call("POST", "/auth/password", Some(&old), body, true).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{why}");
+    }
+
+    let (s, _, fresh) = h
+        .call(
+            "POST",
+            "/auth/password",
+            Some(&old),
+            change("admin-password-1", "brand-new-pass-2"),
+            true,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let fresh = fresh.unwrap();
+    // The old session is revoked, the returned one works.
+    let (s, _, _) = h.call("GET", "/auth/me", Some(&old), None, false).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _, _) = h.call("GET", "/auth/me", Some(&fresh), None, false).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        try_login(&h, "admin", "admin-password-1").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(try_login(&h, "admin", "brand-new-pass-2").await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn change_email_validates_and_rejects_duplicates() {
+    let h = harness();
+    let cookie = h.login("admin").await;
+    for (email, want) in [
+        ("not-an-email", StatusCode::BAD_REQUEST),
+        ("m@example.com", StatusCode::CONFLICT),
+        ("root@example.org", StatusCode::OK),
+    ] {
+        let (s, _, _) = h
+            .call(
+                "POST",
+                "/auth/email",
+                Some(&cookie),
+                Some(json!({"email": email})),
+                true,
+            )
+            .await;
+        assert_eq!(s, want, "{email}");
+    }
+}
+
+#[tokio::test]
+async fn admin_user_management_lifecycle() {
+    let h = harness();
+    let admin = h.login("admin").await;
+    let new_user = |name: &str, email: &str, pw: &str, role: &str| json!({"username": name, "email": email, "password": pw, "role": role});
+
+    for (body, want) in [
+        (
+            new_user("x", "x@example.com", "long-enough-pw", "admin"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            new_user("valid", "bad", "long-enough-pw", "admin"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            new_user("valid", "v@example.com", "short", "admin"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            new_user("valid", "v@example.com", "long-enough-pw", "root"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            new_user("manager", "z@example.com", "long-enough-pw", "admin"),
+            StatusCode::CONFLICT,
+        ),
+    ] {
+        let (s, _, _) = h.call("POST", "/users", Some(&admin), Some(body.clone()), true).await;
+        assert_eq!(s, want, "{body}");
+    }
+
+    let (s, created, _) = h
+        .call(
+            "POST",
+            "/users",
+            Some(&admin),
+            Some(new_user(
+                "second.admin",
+                "second@example.com",
+                "long-enough-pw",
+                "admin",
+            )),
+            true,
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED);
+    let id = created["id"].as_i64().unwrap();
+
+    let (_, users, _) = h.call("GET", "/users", Some(&admin), None, false).await;
+    let list = users.as_array().unwrap();
+    assert!(list.iter().any(|u| u["username"] == "second.admin"));
+    // Password hashes must never leak through the API.
+    assert!(!users.to_string().contains("argon2"));
+    let my_id = list.iter().find(|u| u["username"] == "admin").unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // Reset their password, then they can log in with it.
+    let (s, _, _) = h
+        .call(
+            "POST",
+            &format!("/users/{id}/password"),
+            Some(&admin),
+            Some(json!({"password": "reset-password-9"})),
+            true,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        try_login(&h, "second.admin", "reset-password-9").await.0,
+        StatusCode::OK
+    );
+
+    // With two admins, demotion is allowed.
+    let (s, _, _) = h
+        .call(
+            "PUT",
+            &format!("/users/{id}"),
+            Some(&admin),
+            Some(json!({"email": "second@example.com", "role": "site_manager"})),
+            true,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // Admins cannot delete themselves.
+    let (s, _, _) = h
+        .call("DELETE", &format!("/users/{my_id}"), Some(&admin), None, true)
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    let (s, _, _) = h
+        .call("DELETE", &format!("/users/{id}"), Some(&admin), None, true)
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _, _) = h
+        .call("DELETE", &format!("/users/{id}"), Some(&admin), None, true)
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn site_managers_cannot_manage_users() {
+    let h = harness();
+    let cookie = h.login("manager").await;
+    let body = json!({"username": "evil", "email": "e@example.com", "password": "long-enough-pw", "role": "admin"});
+    let (s, _, _) = h.call("POST", "/users", Some(&cookie), Some(body), true).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _, _) = h
+        .call(
+            "POST",
+            "/users/1/password",
+            Some(&cookie),
+            Some(json!({"password": "takeover-pass-1"})),
+            true,
+        )
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _, _) = h.call("DELETE", "/users/1", Some(&cookie), None, true).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn admin_sees_all_sites_and_missing_sites_are_404() {
+    let h = harness();
+    let cookie = h.login("admin").await;
+    let (s, v, _) = h.call("GET", "/sites", Some(&cookie), None, false).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v.as_array().unwrap().len(), 2);
+    let (s, _, _) = h.call("GET", "/sites/999999", Some(&cookie), None, false).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    for path in ["/events", "/jobs"] {
+        let (s, _, _) = h.call("GET", path, Some(&cookie), None, false).await;
+        assert_eq!(s, StatusCode::OK, "{path}");
+    }
+}
