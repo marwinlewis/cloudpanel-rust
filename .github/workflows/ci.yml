@@ -21,6 +21,10 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
-      - run: node --check ui/app.js
+      - name: Check UI JavaScript syntax
+        run: |
+          files=$(git ls-files 'ui/*.js')
+          [ -n "$files" ] || { echo "no UI JavaScript files found"; exit 1; }
+          for f in $files; do node --check "$f"; done
       - name: shellcheck
         run: shellcheck install.sh
