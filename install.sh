@@ -370,6 +370,8 @@ download_release() {
   }
   (cd "$TMP_DIR" && sha256sum -c --status "$asset.sha256") || die "Checksum verification failed for $asset"
   info "Checksum verified"
+  # curl saves the download without the executable bit.
+  chmod 0755 "$TMP_DIR/$asset"
   NEW_BIN="$TMP_DIR/$asset"
 }
 
@@ -565,7 +567,8 @@ install_binary() {
   else
     build_from_source
   fi
-  "$NEW_BIN" --version >/dev/null 2>&1 || die "The downloaded binary does not run on this system"
+  local check
+  check=$("$NEW_BIN" --version 2>&1) || die "The new binary does not run on this system: ${check}"
   # Copy then rename so a running binary is replaced atomically.
   install -m 0755 "$NEW_BIN" "$BIN.new"
   mv -f "$BIN.new" "$BIN"
