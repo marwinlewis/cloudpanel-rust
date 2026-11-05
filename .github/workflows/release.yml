@@ -1,10 +1,18 @@
 name: Release
 
 # Push a tag like v0.2.0 to build static Linux binaries and publish a GitHub release.
+# Or run it manually from the Actions tab ("Run workflow") with a new tag name; the
+# tag is then created on the selected branch's latest commit.
 # install.sh downloads `cloudpanel-linux-<arch>` and verifies `<asset>.sha256`.
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to create, e.g. v0.3.1'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -49,5 +57,7 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
           files: dist/*
           generate_release_notes: true
