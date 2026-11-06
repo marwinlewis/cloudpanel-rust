@@ -15,6 +15,16 @@ export const SITE_TYPES = {
 };
 const HAS_APP = new Set(['nodejs', 'python', 'reverse_proxy']);
 
+export const WWW_OPTIONS = [
+  ['redirect', 'Redirect www to the naked domain (recommended)'],
+  ['alias', 'Serve the site on both'],
+  ['off', 'Don’t handle www'],
+];
+/** The API's two www fields for a choice from WWW_OPTIONS. */
+export function wwwBody(mode) { return { include_www: mode !== 'off', www_redirect: mode === 'redirect' }; }
+function wwwMode(site) { return !site.include_www ? 'off' : site.www_redirect ? 'redirect' : 'alias'; }
+function wwwLabel(site) { return site.www_redirect ? `www.${site.domain} redirects here` : `www.${site.domain}`; }
+
 VALIDATORS.sysuser = (v) => (!v || /^[a-z_][a-z0-9_-]{0,31}$/.test(v) ? '' : 'Lowercase letters, digits, - and _ (max 32)');
 VALIDATORS.username = (v) => (/^[A-Za-z0-9._-]{3,32}$/.test(v) ? '' : '3-32 letters, digits, . _ -');
 VALIDATORS.optionalPassword = (v) => (!v || v.length >= 10 ? '' : 'Use at least 10 characters');
@@ -84,7 +94,7 @@ export function renderSites(view, params) {
       return h('tr', null,
         h('td', null,
           h('div', { class: 'cell-title' }, h('a', { href: `#/sites/${s.id}`, text: s.domain })),
-          s.include_www && h('div', { class: 'cell-sub', text: `www.${s.domain}` })),
+          s.include_www && h('div', { class: 'cell-sub', text: wwwLabel(s) })),
         h('td', null, h('span', { class: 'badge', text: t.label })),
         h('td', { class: 'hide-sm mono muted truncate', text: s.site_type === 'static' ? (s.document_root || '') : `127.0.0.1:${s.target_port}` }),
         h('td', null, statusBadge(s)),
@@ -111,7 +121,7 @@ function addSiteDialog(done) {
       h('input', { type: 'radio', name: 'site_type', value: k, checked: i === 0 }),
       h('strong', { text: SITE_TYPES[k].label }), h('span', { text: SITE_TYPES[k].desc }))));
   const portField = field({ label: 'App port', name: 'target_port', type: 'number', placeholder: '3000', validate: 'port', hint: 'The port your app listens on at 127.0.0.1 (exposed to it as $PORT).', attrs: { min: 1, max: 65535, inputmode: 'numeric' } });
-  const cmdField = field({ label: 'Start command (optional)', name: 'app_command', placeholder: SITE_TYPES.nodejs.cmd, hint: 'Run as the site user under systemd and restarted if it crashes. You can set this later.', attrs: { class: 'input mono', spellcheck: 'false' } });
+  const cmdField = field({ label: 'Start command (optional)', name: 'app_command', placeholder: SITE_TYPES.nodejs.cmd, hint: 'Run as the site user and restarted if it crashes (PM2 for Node.js, systemd for the rest). You can set this later.', attrs: { class: 'input mono', spellcheck: 'false' } });
   const userField = field({ label: 'Site user (optional)', name: 'system_user', validate: 'sysuser', hint: 'Linux user that owns the files and runs the app. Derived from the domain if empty.', attrs: { autocapitalize: 'off', spellcheck: 'false' } });
 
   typeGroup.addEventListener('change', () => {
@@ -130,10 +140,10 @@ function addSiteDialog(done) {
       field({ label: 'Domain', name: 'domain', placeholder: 'app.example.com', validate: 'domain', attrs: { autocapitalize: 'off', spellcheck: 'false' } }),
       h('div', { class: 'field' }, h('span', { class: 'label', text: 'Type' }), typeGroup),
       portField, cmdField, userField,
-      h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'include_www' }), 'Also serve the www. subdomain'),
+      selectField({ label: 'www subdomain', name: 'www', options: WWW_OPTIONS, value: 'redirect' }),
     ],
     async onSubmit(d) {
-      const body = { domain: d.domain.toLowerCase(), site_type: d.site_type, include_www: !!d.include_www };
+      const body = { domain: d.domain.toLowerCase(), site_type: d.site_type, ...wwwBody(d.www) };
       if (d.site_type !== 'static') body.target_port = Number(d.target_port);
       if (d.app_command && HAS_APP.has(d.site_type)) body.app_command = d.app_command;
       if (d.system_user) body.system_user = d.system_user;
@@ -141,7 +151,7 @@ function addSiteDialog(done) {
       toast(`${body.domain} created`);
       done();
       location.hash = `#/sites/${site.id}`;
-      if (site.runtime_job_id) jobDialog(site.runtime_job_id, 'Installing Node.js');
+      if (site.runtime_job_id) jobDialog(site.runtime_job_id, 'Installing the Node.js runtime');
     },
   });
 }
@@ -245,7 +255,7 @@ function tabOverview(el, { site }) {
   el.append(h('div', { class: 'grid two' },
     card({
       title: 'Site', body: kv([
-        ['Domain', site.domain], site.include_www && ['Alias', `www.${site.domain}`], ['Type', t.label],
+        ['Domain', site.domain], site.include_www && [site.www_redirect ? 'Redirect' : 'Alias', wwwLabel(site)], ['Type', t.label],
         site.target_port && ['App port', `127.0.0.1:${site.target_port}`],
         site.document_root && ['Document root', h('span', { class: 'mono', text: site.document_root })],
         ['Site user', h('span', { class: 'mono', text: site.system_user })],
@@ -256,7 +266,7 @@ function tabOverview(el, { site }) {
     h('div', { class: 'grid' },
       site.app && card({
         title: 'Application', sub: site.app.unit, body: kv([
-          ['Status', appBadge(site.app)], site.app.main_pid && ['PID', site.app.main_pid],
+          ['Status', appBadge(site.app)], ['Runs under', site.app_manager === 'pm2' ? 'PM2' : 'systemd'], site.app.main_pid && ['PID', site.app.main_pid],
           site.app.memory_bytes && ['Memory', fmtBytes(site.app.memory_bytes)],
           site.app.since && ['Since', site.app.since], ['Command', h('code', { class: 'truncate', text: site.app_command || '—' })],
         ]),
@@ -271,76 +281,201 @@ function tabOverview(el, { site }) {
 
 // ---------- Application ----------
 
-function envToText(env) { return Object.entries(env || {}).map(([k, v]) => `${k}=${v}`).join('\n'); }
-function textToEnv(text) {
-  const env = {};
-  for (const raw of text.split('\n')) {
-    const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
-    const i = line.indexOf('=');
-    if (i < 1) throw new Error(`Invalid environment line: ${line}`);
-    env[line.slice(0, i).trim()] = line.slice(i + 1);
-  }
-  return env;
-}
-
 function tabApp(el, { site, reload }) {
   const status = h('div');
   const logs = h('pre', { class: 'logs mono', text: 'Loading…' });
   const t = SITE_TYPES[site.site_type] || {};
+  const isNode = site.site_type === 'nodejs';
+  const options = site.pm2 || {};
+  const project = site.project || {};
+
+  // Environment: the box shows the site's .env file, so it can't disagree with the File Manager.
+  const envField = field({ label: 'Environment variables', name: 'env', type: 'textarea', placeholder: 'NODE_ENV=production\nDATABASE_URL=…', hint: 'Loading…', attrs: { class: 'input mono', rows: 8, disabled: true } });
+  const envInput = envField.querySelector('textarea');
+  const envHint = envField.querySelector('.hint');
+  const envNotes = h('div', { class: 'form' });
+  let envLoaded = false;
+
+  function notice(kind, text) { return h('div', { class: `alert ${kind}` }, icon('alert'), h('div', { text })); }
+
+  async function loadEnv() {
+    try {
+      const r = await api(`/sites/${site.id}/app/env`);
+      envInput.value = r.content;
+      envInput.disabled = false;
+      envLoaded = true;
+      envHint.textContent = r.path
+        ? `This is ${r.path}, the same file you see in the File Manager. Edit it in either place. Restart the app to apply changes.`
+        : 'One KEY=value per line. Restart the app to apply changes.';
+      const notes = [];
+      if (r.pending) notes.push(notice('warn', 'This file has changes the running app hasn’t picked up. Restart the app to apply them.'));
+      if (r.imported_keys.length) notes.push(notice('info', `${r.imported_keys.join(', ')} ${r.imported_keys.length === 1 ? 'is' : 'are'} only stored in the panel so far and ${r.imported_keys.length === 1 ? 'was' : 'were'} added below. Saving moves ${r.imported_keys.length === 1 ? 'it' : 'them'} to .env.`));
+      if (r.port_conflict) notes.push(notice('warn', `PORT in this file is ${r.port_conflict}, but the site’s app port is ${site.target_port}. The app gets ${site.target_port}, because that is where nginx sends traffic. Change the app port in Settings if you want a different one.`));
+      for (const w of r.warnings) notes.push(notice('warn', w));
+      envNotes.replaceChildren(...notes);
+    } catch (e) {
+      envHint.textContent = '';
+      envNotes.replaceChildren(notice('error', `The environment can’t be edited here: ${e.message}`));
+    }
+  }
+  loadEnv();
+
+  // Process manager
+  const managerField = isNode && selectField({ label: 'Process manager', name: 'manager', value: site.app_manager, options: [['pm2', 'PM2'], ['systemd', 'systemd']] });
+  const managerInput = managerField && managerField.querySelector('select');
+  const usesPm2 = () => !!managerInput && managerInput.value === 'pm2';
+
+  const ecoCheck = h('input', { type: 'checkbox', name: 'use_ecosystem', checked: options.use_ecosystem !== false });
+  const ecoRow = site.ecosystem_file && h('label', { class: 'check' }, ecoCheck, `Use ${site.ecosystem_file.split('/').pop()} from the working directory`);
+  const pm2Fields = h('div', { class: 'form' },
+    field({ label: 'Instances', name: 'instances', value: options.instances || '1', hint: 'A number or max. More than 1 runs in cluster mode, which needs a JavaScript file such as server.js as the start command.', attrs: { class: 'input mono', spellcheck: 'false' } }),
+    field({ label: 'Restart above this memory', name: 'max_memory', value: options.max_memory || '', placeholder: '512M', attrs: { class: 'input mono', spellcheck: 'false' } }),
+    field({ label: 'Node.js arguments', name: 'node_args', value: options.node_args || '', placeholder: '--max-old-space-size=512', hint: 'For a JavaScript start command.', attrs: { class: 'input mono', spellcheck: 'false' } }),
+    field({ label: 'Scheduled restart (cron)', name: 'cron_restart', value: options.cron_restart || '', placeholder: '0 4 * * *', attrs: { class: 'input mono', spellcheck: 'false' } }));
+  const pm2Box = h('div', { class: 'form' }, ecoRow, pm2Fields);
+  const commandField = field({ label: 'Start command', name: 'command', value: site.app_command || '', placeholder: t.cmd || './server', hint: '', attrs: { class: 'input mono', spellcheck: 'false' } });
+  const commandHint = commandField.querySelector('.hint') || commandField.appendChild(h('div', { class: 'hint' }));
+  function syncManager() {
+    const pm2 = usesPm2();
+    const eco = pm2 && !!site.ecosystem_file && ecoCheck.checked;
+    pm2Box.hidden = !pm2;
+    pm2Fields.hidden = eco;
+    commandField.hidden = eco;
+    commandHint.textContent = pm2
+      ? 'A JavaScript file such as server.js runs directly and can use cluster mode. Anything else runs with /bin/sh -c. $PORT and your environment variables are available.'
+      : 'Runs with /bin/sh -c as the site user. $PORT and your environment variables are available.';
+  }
+  if (managerInput) managerInput.addEventListener('change', syncManager);
+  ecoCheck.addEventListener('change', syncManager);
+  syncManager();
+
   const form = h('form', { class: 'form', novalidate: true },
-    field({ label: 'Start command', name: 'command', value: site.app_command || '', placeholder: t.cmd || './server', hint: 'Runs with /bin/sh -c as the site user. $PORT and your environment variables are available.', attrs: { class: 'input mono', spellcheck: 'false' } }),
+    managerField,
+    pm2Box,
+    commandField,
     field({ label: 'Working directory', name: 'workdir', value: site.app_workdir || '', placeholder: site.app_workdir_default, validate: 'optionalPath', hint: 'Defaults to the site’s htdocs folder.', attrs: { class: 'input mono', spellcheck: 'false' } }),
-    field({ label: 'Environment variables', name: 'env', type: 'textarea', value: envToText(site.env), placeholder: 'NODE_ENV=production\nDATABASE_URL=…', hint: 'One KEY=value per line. Stored in a root-only file. PORT is set automatically.', attrs: { class: 'input mono', rows: 6 } }),
+    envField, envNotes,
     h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'enabled', checked: site.app_enabled }), 'Run this app (start now and on boot)'),
     h('div', { class: 'row' }, h('button', { class: 'btn primary', type: 'submit', text: 'Save & apply' })));
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const btn = form.querySelector('button[type=submit]');
     const d = Object.fromEntries(new FormData(form));
+    const body = { command: (d.command || '').trim() || null, workdir: d.workdir.trim() || null, enabled: form.elements.enabled.checked };
+    if (envLoaded) body.env_text = envInput.value;
+    if (isNode) {
+      body.manager = managerInput.value;
+      if (usesPm2()) {
+        body.pm2 = { use_ecosystem: ecoCheck.checked, instances: d.instances.trim(), max_memory: d.max_memory.trim(), node_args: d.node_args.trim(), cron_restart: d.cron_restart.trim() };
+        if (site.app && site.app.foreign_daemon) {
+          const ok = await confirmDialog({ title: 'Take over the running PM2 daemon?', message: 'A PM2 daemon started by hand is running for this site. The panel will stop it and start it again under its own service, so it comes back after a reboot. Its apps restart briefly. The old process list is kept as ~/.pm2/dump.pm2.pre-cloudpanel.', confirmText: 'Take over' });
+          if (!ok) return;
+          body.adopt = true;
+        }
+      }
+    }
     await withBusy(btn, async () => {
-      const env = textToEnv(d.env || '');
-      await api(`/sites/${site.id}/app`, { method: 'PUT', body: { command: d.command.trim() || null, workdir: d.workdir.trim() || null, env, enabled: form.elements.enabled.checked } });
-      toast('Application saved');
+      const r = await api(`/sites/${site.id}/app`, { method: 'PUT', body });
+      if (r.env_warnings && r.env_warnings.length) toast(`Saved. Some .env lines were skipped: ${r.env_warnings.join('; ')}`, 'error');
+      else toast('Application saved');
+      if (r.job_id) await jobDialog(r.job_id, 'Installing PM2');
       reload();
     });
   });
 
+  // Actions
+  const canStart = !!site.app_command || (site.app_manager === 'pm2' && !!site.ecosystem_file && options.use_ecosystem !== false);
+  const pm2Active = site.app_manager === 'pm2';
   const act = (action) => {
-    const b = h('button', { class: 'btn', disabled: !site.app_command }, icon({ start: 'play', stop: 'stop', restart: 'refresh' }[action]), action[0].toUpperCase() + action.slice(1));
+    const label = action[0].toUpperCase() + action.slice(1);
+    const b = h('button', { class: 'btn', disabled: !canStart }, icon({ start: 'play', stop: 'stop', restart: 'refresh', reload: 'refresh' }[action]), label);
     b.addEventListener('click', () => withBusy(b, async () => {
       const st = await api(`/sites/${site.id}/app/${action}`, { method: 'POST' });
-      toast(`App ${action}ed`.replace('stoped', 'stopped'));
+      toast({ start: 'App started', stop: 'App stopped', restart: 'App restarted', reload: 'App reloaded' }[action]);
       drawStatus(st);
+      loadEnv();
       setTimeout(loadLogs, 800);
     }));
     return b;
   };
-  const install = h('button', { class: 'btn' }, icon('download'), 'Install dependencies');
-  install.addEventListener('click', async () => {
-    try { await runJob(`/sites/${site.id}/app/install`, `Install dependencies · ${site.domain}`); } catch (e) { toast(e.message, 'error'); }
+  /** A button that runs a background job, then shows the result. */
+  const jobButton = (label, iconName, path, title, before) => {
+    const b = h('button', { class: 'btn' }, icon(iconName), label);
+    b.addEventListener('click', async () => {
+      try {
+        const target = before ? await before() : path;
+        if (!target) return;
+        const j = await runJob(target, `${title} · ${site.domain}`);
+        if (j && j.status === 'failed') toast(`${title} failed. The log has the details.`, 'error');
+        reload();
+      } catch (e) { toast(e.message, 'error'); }
+    });
+    return b;
+  };
+  const appPath = `/sites/${site.id}/app`;
+  const hasDeps = isNode || site.site_type === 'python';
+  const install = jobButton('Install dependencies', 'download', `${appPath}/install`, 'Install dependencies', async () => {
+    if (!project.prebuilt) return `${appPath}/install`;
+    const ok = await confirmDialog({ title: 'Install anyway?', message: `${project.note} Installing replaces its node_modules with a full install.`, confirmText: 'Install anyway', danger: true });
+    return ok ? `${appPath}/install?force=true` : null;
   });
-  install.hidden = !['nodejs', 'python'].includes(site.site_type);
+  install.hidden = !hasDeps;
+  const build = jobButton('Build', 'terminal', `${appPath}/build`, 'Build');
+  build.hidden = !isNode;
+  if (project.prebuilt || !project.has_build_script) {
+    build.disabled = true;
+    build.title = project.prebuilt ? 'Prebuilt deploy: there is no source here to build' : 'package.json has no build script';
+  }
+  const deploy = jobButton('Deploy', 'play', `${appPath}/deploy`, 'Deploy');
+  deploy.hidden = !hasDeps;
+  deploy.title = 'Install dependencies, build, then restart the app';
 
+  const processes = h('div');
   function drawStatus(app) {
     status.replaceChildren(kv([
       ['Status', appBadge(app)], ['Unit', h('code', { text: app ? app.unit : '—' })],
       app && app.main_pid && ['PID', app.main_pid], app && app.memory_bytes && ['Memory', fmtBytes(app.memory_bytes)],
       app && app.restarts != null && ['Restarts', app.restarts],
     ]));
+    const list = (app && app.processes) || [];
+    processes.replaceChildren(...(list.length ? [table(['App', 'Mode', 'Status', 'CPU', 'Memory', 'Restarts'], list.map((p) => h('tr', null,
+      h('td', { class: 'mono truncate', text: `${p.name} #${p.id}` }),
+      h('td', { text: p.exec_mode }),
+      h('td', null, h('span', { class: `badge ${p.status === 'online' ? 'ok' : p.status === 'errored' ? 'danger' : 'warn'}`, text: p.status })),
+      h('td', { text: `${p.cpu}%` }),
+      h('td', { text: fmtBytes(p.memory_bytes) }),
+      h('td', { text: p.restarts }))))] : []));
   }
   drawStatus(site.app);
 
   async function loadLogs() {
-    try { const r = await api(`/sites/${site.id}/app/logs?lines=300`); logs.textContent = r.logs || '(no output)'; logs.scrollTop = logs.scrollHeight; } catch (e) { logs.textContent = e.message; }
+    try { const r = await api(`${appPath}/logs?lines=300`); logs.textContent = r.logs || '(no output)'; logs.scrollTop = logs.scrollHeight; } catch (e) { logs.textContent = e.message; }
   }
   const refresh = h('button', { class: 'icon-btn', title: 'Refresh', 'aria-label': 'Refresh logs' }, icon('refresh'));
   refresh.addEventListener('click', () => withBusy(refresh, loadLogs));
+  const flush = h('button', { class: 'icon-btn', title: 'Clear log files', 'aria-label': 'Clear log files', hidden: !pm2Active }, icon('trash'));
+  flush.addEventListener('click', async () => {
+    if (!(await confirmDialog({ title: 'Clear the log files?', message: 'Everything in this app’s PM2 log files is deleted.', confirmText: 'Clear logs', danger: true }))) return;
+    await withBusy(flush, async () => { await api(`${appPath}/flush`, { method: 'POST' }); toast('Logs cleared'); await loadLogs(); });
+  });
+
+  const processBanners = [];
+  if (site.app && site.app.foreign_daemon) {
+    processBanners.push(notice('warn', pm2Active
+      ? 'A PM2 daemon started by hand is running for this site, and it won’t come back after a reboot. Save the settings to let the panel take it over.'
+      : 'A PM2 daemon started by hand is running for this site, and it won’t come back after a reboot. Choose PM2 above and save to let the panel take it over.'));
+  }
+  if (project.note) processBanners.push(notice('info', project.note));
 
   el.append(h('div', { class: 'grid two' },
     card({ title: 'Configuration', body: form }),
-    card({ title: 'Process', sub: 'Managed by systemd', body: h('div', { class: 'form' }, status, h('div', { class: 'row wrap' }, act('start'), act('stop'), act('restart'), install)) })),
-  card({ title: 'Output', sub: 'journalctl', actions: refresh, body: logs }));
+    card({
+      title: 'Process', sub: pm2Active ? 'Managed by PM2' : 'Managed by systemd',
+      body: h('div', { class: 'form' }, ...processBanners, status, processes,
+        h('div', { class: 'row wrap' }, act('start'), act('stop'), act('restart'), pm2Active && act('reload')),
+        hasDeps && h('div', { class: 'row wrap' }, install, build, deploy)),
+    })),
+  card({ title: 'Output', sub: pm2Active ? '~/.pm2/logs' : 'journalctl', actions: h('div', { class: 'row' }, flush, refresh), body: logs }));
   loadLogs();
 }
 
@@ -465,6 +600,7 @@ function tabSsl(el, { site, reload }) {
     body: h('div', { class: 'form' },
       cert ? kv([['Issuer', cert.issuer], ['Names', cert.names.join(', ') || cert.subject], ['Valid from', fmtDate(cert.not_before)], ['Expires', `${fmtDate(cert.not_after)} (${cert.days_left} days)`], ['Certificate', h('span', { class: 'mono small', text: site.ssl_cert_path })]])
         : h('p', { class: 'muted', text: 'No certificate is installed. Visitors connect over HTTP.' }),
+      wwwCertWarning(site, reload),
       h('div', { class: 'row wrap' }, install, renew, remove)),
   }));
 }
@@ -473,7 +609,7 @@ export function sslDialog(site, done) {
   let mode = 'le';
   const le = h('div', { class: 'form' },
     h('div', { class: 'alert info' }, icon('alert'),
-      h('div', { text: `DNS for ${site.domain}${site.include_www ? ` and www.${site.domain}` : ''} must already point to this server, and port 80 must be open.` })),
+      h('div', { text: `DNS for ${site.domain} must already point to this server, and port 80 must be open.${site.include_www ? ` www.${site.domain} is added too if it has a DNS record; if it can’t be validated, the certificate covers ${site.domain} only.` : ''}` })),
     field({ label: 'Email for expiry notices', name: 'email', type: 'email', placeholder: 'you@example.com', validate: 'email', attrs: { autocomplete: 'email' } }));
   const custom = h('div', { class: 'form', hidden: true },
     field({ label: 'Certificate (PEM, full chain)', name: 'custom_cert', type: 'textarea', placeholder: '-----BEGIN CERTIFICATE-----', validate: 'required' }),
@@ -486,8 +622,9 @@ export function sslDialog(site, done) {
     content: [strip, le, custom],
     async onSubmit(d) {
       const body = mode === 'le' ? { email: d.email } : { custom_cert: d.custom_cert, custom_key: d.custom_key };
-      await api(`/sites/${site.id}/ssl`, { method: 'POST', body });
-      toast(`SSL enabled for ${site.domain}`);
+      const r = await api(`/sites/${site.id}/ssl`, { method: 'POST', body });
+      if (r.warning) toast(`SSL enabled for ${site.domain}. ${r.warning}`, 'error');
+      else toast(`SSL enabled for ${site.domain}`);
       done();
     },
   });
@@ -515,18 +652,28 @@ function tabLogs(el, { site }) {
 
 // ---------- Settings ----------
 
+/** Warn when https://www can't work because the certificate doesn't cover it. */
+function wwwCertWarning(site, reload) {
+  if (!site.include_www || !site.ssl_enabled || site.certificate_covers_www) return null;
+  const text = `The certificate doesn’t cover www.${site.domain}, so https://www.${site.domain} shows a certificate error. http://www still works.`;
+  const add = h('button', { class: 'btn sm', type: 'button', text: site.certificate_managed ? 'Add www to certificate' : 'Replace certificate' });
+  add.addEventListener('click', () => sslDialog(site, reload));
+  return h('div', { class: 'alert warn' }, icon('alert'), h('div', { class: 'form' }, h('div', { text }), h('div', null, add)));
+}
+
 function tabSettings(el, { site, reload }) {
   const general = h('form', { class: 'form', novalidate: true },
     site.site_type !== 'static' && field({ label: 'App port', name: 'target_port', type: 'number', value: site.target_port, validate: 'port' }),
     site.site_type === 'static' && field({ label: 'Document root', name: 'document_root', value: site.document_root || '', validate: 'optionalPath', attrs: { class: 'input mono' } }),
     field({ label: 'Upload limit (MB)', name: 'max_body_mb', type: 'number', value: site.max_body_mb, hint: 'nginx client_max_body_size.', attrs: { min: 1, max: 10240 } }),
-    h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'include_www', checked: site.include_www }), `Also serve www.${site.domain}`),
+    !site.domain.startsWith('www.') && selectField({ label: `www.${site.domain}`, name: 'www', options: WWW_OPTIONS, value: wwwMode(site) }),
+    wwwCertWarning(site, reload),
     site.site_type !== 'static' && h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'websocket', checked: site.websocket }), 'WebSocket support'),
     h('div', null, h('button', { class: 'btn primary', type: 'submit', text: 'Save' })));
   general.addEventListener('submit', async (e) => {
     e.preventDefault();
     const f = general.elements;
-    const body = { include_www: f.include_www.checked, max_body_mb: Number(f.max_body_mb.value) };
+    const body = { max_body_mb: Number(f.max_body_mb.value), ...(f.www ? wwwBody(f.www.value) : {}) };
     if (f.target_port) body.target_port = Number(f.target_port.value);
     if (f.websocket) body.websocket = f.websocket.checked;
     if (f.document_root && f.document_root.value.trim()) body.document_root = f.document_root.value.trim();

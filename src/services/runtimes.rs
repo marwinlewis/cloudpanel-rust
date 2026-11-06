@@ -15,9 +15,12 @@ static INSTALL_LOCK: Mutex<()> = Mutex::new(());
 
 /// Where app units (and the panel) look for `node`.
 const NODE_PATHS: &[&str] = &["/usr/bin/node", "/usr/local/bin/node"];
+const NPM_PATHS: &[&str] = &["/usr/bin/npm", "/usr/local/bin/npm"];
 
+/// Both `node` and `npm`: distro packages can ship Node.js without npm.
 pub fn node_installed() -> bool {
-    NODE_PATHS.iter().any(|p| Path::new(p).is_file()) || super::cmd::which("node")
+    let found = |paths: &[&str], name| paths.iter().any(|p| Path::new(p).is_file()) || super::cmd::which(name);
+    found(NODE_PATHS, "node") && found(NPM_PATHS, "npm")
 }
 
 /// True when the panel manages a real Debian/Ubuntu host (not development or tests),

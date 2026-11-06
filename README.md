@@ -69,9 +69,13 @@ sudo cloudpanel user-disable-2fa --username admin
 **Sites**
 - Node.js, Python, static sites, generic reverse proxies and Docker proxies, each with its own nginx vhost.
 - Every site gets its own **Linux user** and home (`/home/<user>/htdocs/<domain>`). nginx reads static files through the site group.
-- **App process manager**: the start command runs as the site user in a hardened systemd unit (`cloudpanel-app-<domain>`) with auto-restart, an environment editor, start/stop/restart, live journal output and an *Install dependencies* job (`npm ci` + build, or venv + `pip install -r`).
-- **Site settings**: app port, `www.` alias, WebSocket support, upload limit, document root, enable/disable (maintenance page), HTTP basic auth with an IP allow-list, and custom nginx directives (admins only, checked with `nginx -t`).
-- **SSL**: one-click Let's Encrypt or your own certificate, certificate details and expiry, renew now, disable HTTPS. HTTP redirects to HTTPS.
+- **App process manager**: apps run as the site user with auto-restart, start/stop/restart, live output and a hardened systemd unit (`cloudpanel-app-<domain>`) that brings them back at boot. Node.js sites choose per site between **PM2** (the default for new sites) and plain **systemd**; other app types use systemd.
+  - **PM2** adds zero-downtime reload, cluster mode, a memory limit, scheduled restarts, per-process status and log rotation, and uses `ecosystem.config.{js,cjs}` when the working directory has one. Each site user has their own daemon in `~/.pm2`, so `pm2 ls` over SSH shows what the panel shows. A daemon started by hand can be taken over.
+  - **Install dependencies**, **Build** and **Deploy** (install, build, restart) are separate jobs. They detect npm, yarn and pnpm from the lockfile. Prebuilt deploys (build output and `node_modules`, but no source or lockfile) are left alone.
+- **Environment variables** live in the `.env` file in the app's working directory. The Application tab and the File Manager edit the same file, and apps pick it up when they start. The site's app port always wins over a `PORT` in `.env`.
+- **Site settings**: app port, `www.` handling, WebSocket support, upload limit, document root, enable/disable (maintenance page), HTTP basic auth with an IP allow-list, and custom nginx directives (admins only, checked with `nginx -t`).
+- **www**: new sites redirect `www.<domain>` to the naked domain. You can serve both instead, or not handle www at all, per site.
+- **SSL**: one-click Let's Encrypt or your own certificate, certificate details and expiry, renew now, disable HTTPS. HTTP redirects to HTTPS. Let's Encrypt certificates include www when it resolves; if it can't be validated, the certificate covers the naked domain and the panel tells you.
 - **SSH/SFTP users** per site sharing the site's files, SFTP-only accounts (`internal-sftp`), passwords and authorized keys. Keys live in root-owned files, so a site cannot rewrite them.
 - **File manager**: browse, edit, upload (up to 1 GB, drag and drop), download, rename/move, delete, chmod, and extract or compress archives. It is confined to the site home and safe against symlink escapes.
 - **Databases**: MySQL/MariaDB, MongoDB and SQLite. Create databases and users, reset passwords (shown once, never stored), export/download and import dumps.
@@ -148,7 +152,7 @@ cloudpanel server                                   # start (default)
 cloudpanel user-add --username alice --email alice@example.com   # prompts for password
 cloudpanel user-reset-password --username admin     # prompts for password, signs out sessions
 cloudpanel user-disable-2fa --username admin        # turn off 2FA (lost device)
-cloudpanel site-add --domain api.example.com --site-type nodejs --port 3000 [--www]
+cloudpanel site-add --domain api.example.com --site-type nodejs --port 3000 [--no-www | --www-alias]
 cloudpanel site-list
 cloudpanel cron-run <id>                            # used by /etc/cron.d/cloudpanel
 ```
@@ -168,6 +172,12 @@ To test a real install, run the installer with a locally built binary on a dispo
 ```bash
 sudo bash install.sh --binary ./cloudpanel --databases mariadb,mongodb,sqlite
 sudo bash scripts/smoke-test.sh
+```
+
+Or test on a throwaway Debian 13 container with real systemd, which needs only Docker. It builds the binary, installs it, and checks site apps (PM2 and systemd), `.env` handling and the www redirect through the API, including a reboot:
+
+```bash
+scripts/debian-e2e/run.sh
 ```
 
 On Windows and in local development, system tools (nginx, ufw, certbot, systemctl, useradd, …) are skipped when they aren't installed, and configs are written under `./data`. The UI lives in `ui/` as plain ES modules (`ui/js/core.js` for shared helpers, one module per page under `ui/js/pages/`).

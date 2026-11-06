@@ -77,9 +77,12 @@ enum Commands {
         site_type: String,
         #[arg(short, long)]
         port: Option<u16>,
-        /// Also serve www.<domain>
+        /// Don't handle www.<domain> at all (by default it redirects to the naked domain)
+        #[arg(long, conflicts_with = "www_alias")]
+        no_www: bool,
+        /// Serve the site on www.<domain> as well, instead of redirecting it
         #[arg(long)]
-        www: bool,
+        www_alias: bool,
     },
     /// List all managed sites
     #[command(alias = "site:list")]
@@ -216,7 +219,8 @@ async fn main() -> AnyResult<()> {
             domain,
             site_type,
             port,
-            www,
+            no_www,
+            www_alias,
         }) => {
             let site = provision(
                 &config,
@@ -227,8 +231,10 @@ async fn main() -> AnyResult<()> {
                     target_port: port,
                     document_root: None,
                     system_user: None,
-                    include_www: www,
+                    include_www: !no_www,
+                    www_redirect: !no_www && !www_alias,
                     app_command: None,
+                    app_manager: None,
                     create_user: true,
                 },
             )
@@ -240,6 +246,9 @@ async fn main() -> AnyResult<()> {
             if site.site_type == "nodejs" && services::runtimes::node_needed(&config) {
                 println!("Node.js is not installed; installing it now...");
                 services::runtimes::ensure_nodejs(&config, &|l| println!("{l}"))?;
+            }
+            if site.uses_pm2() && !services::pm2::installed() && services::runtimes::can_install(&config) {
+                services::pm2::ensure(&config, &|l| println!("{l}"))?;
             }
             return Ok(());
         }

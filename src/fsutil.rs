@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::Path;
 
 /// Atomically write `contents` to `path` (write temp file + rename) with the given unix mode.
+#[allow(unused_variables)]
 pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(dir)?;
@@ -12,19 +13,32 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<
         .unwrap_or_else(|| "file".to_string());
     let tmp = dir.join(format!(".{}.tmp{}", file_name, std::process::id()));
 
+    // The directory may be writable by a site user while the panel runs as root, and the
+    // temp name is predictable: never open a planted file or follow a planted symlink.
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     {
         let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(mode);
         }
         let mut f = opts.open(&tmp)?;
+        // Set the mode on the open file, so the umask can't widen or narrow it and a swapped
+        // path can't redirect the chmod.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(fs::Permissions::from_mode(mode))?;
+        }
         f.write_all(contents)?;
         f.sync_all()?;
     }
-    set_mode(&tmp, mode)?;
     fs::rename(&tmp, path)
 }
 

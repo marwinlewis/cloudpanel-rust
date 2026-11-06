@@ -214,7 +214,7 @@ install_packages() {
   log "Installing system packages"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -q
-  apt_install ca-certificates curl gnupg openssl tar gzip unzip nginx certbot python3-certbot-nginx ufw cron iproute2 passwd
+  apt_install ca-certificates curl gnupg openssl tar gzip unzip nginx certbot python3-certbot-nginx ufw cron iproute2 passwd logrotate
   if [ "$NO_FAIL2BAN" -eq 0 ]; then
     # The sshd jail reads the systemd journal (Debian 12+ has no auth.log by default).
     apt_install fail2ban python3-systemd

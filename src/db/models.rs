@@ -91,9 +91,46 @@ pub struct Site {
     pub basic_auth_allow: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Process manager for the app: `systemd` or `pm2` (Node.js sites only).
+    pub app_manager: String,
+    /// JSON [`Pm2Options`].
+    #[serde(skip_serializing)]
+    pub app_pm2: String,
+    /// With `include_www`: send www to the naked domain instead of serving both.
+    pub www_redirect: bool,
+}
+
+pub const MANAGER_SYSTEMD: &str = "systemd";
+pub const MANAGER_PM2: &str = "pm2";
+
+/// Runtime options for a PM2 app. An ecosystem file in the workdir overrides these.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Pm2Options {
+    /// Run `ecosystem.config.{js,cjs}` when the workdir has one.
+    pub use_ecosystem: bool,
+    /// A number or `max`; more than one means cluster mode.
+    pub instances: String,
+    /// e.g. `512M`; empty for no limit.
+    pub max_memory: String,
+    pub node_args: String,
+    pub cron_restart: String,
+}
+
+impl Default for Pm2Options {
+    fn default() -> Self {
+        Pm2Options {
+            use_ecosystem: true,
+            instances: "1".into(),
+            max_memory: String::new(),
+            node_args: String::new(),
+            cron_restart: String::new(),
+        }
+    }
 }
 
 impl Site {
+    /// Every name the site answers on, which is also what its certificate should cover.
     pub fn server_names(&self) -> Vec<String> {
         let mut names = vec![self.domain.clone()];
         if self.include_www {
@@ -102,8 +139,21 @@ impl Site {
         names
     }
 
+    /// True when www gets a 301 to the naked domain rather than serving the site.
+    pub fn redirects_www(&self) -> bool {
+        self.include_www && self.www_redirect
+    }
+
     pub fn kind(&self) -> Option<SiteType> {
         SiteType::parse(&self.site_type)
+    }
+
+    pub fn uses_pm2(&self) -> bool {
+        self.app_manager == MANAGER_PM2
+    }
+
+    pub fn pm2_options(&self) -> Pm2Options {
+        serde_json::from_str(&self.app_pm2).unwrap_or_default()
     }
 
     pub fn env_map(&self) -> std::collections::BTreeMap<String, String> {

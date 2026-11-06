@@ -215,4 +215,10 @@ pub const MIGRATIONS: &[&str] = &[
         last_sent DATETIME
     );
     "#,
+    // 6: PM2 process manager, www redirect. Existing rows keep systemd and their www behaviour.
+    r#"
+    ALTER TABLE sites ADD COLUMN app_manager TEXT NOT NULL DEFAULT 'systemd';
+    ALTER TABLE sites ADD COLUMN app_pm2 TEXT NOT NULL DEFAULT '{}';
+    ALTER TABLE sites ADD COLUMN www_redirect BOOLEAN NOT NULL DEFAULT 0;
+    "#,
 ];

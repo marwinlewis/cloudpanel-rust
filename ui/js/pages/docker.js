@@ -3,6 +3,7 @@ import {
   api, card, confirmDialog, emptyState, errorState, field, formDialog, h, icon, jobDialog, moreButton, openDialog, runJob,
   selectField, setActions, setSub, skeletonRows, table, tabStrip, toast, withBusy, VALIDATORS,
 } from '../core.js';
+import { WWW_OPTIONS, wwwBody } from './sites.js';
 
 VALIDATORS.image = (v) => (/^[A-Za-z0-9][A-Za-z0-9._\-/:@]{0,254}$/.test(v) ? '' : 'e.g. nginx:1.27 or ghcr.io/org/app:latest');
 VALIDATORS.cname = (v) => (/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(v) ? '' : 'Letters, digits, _ . - (start with a letter or digit)');
@@ -139,11 +140,11 @@ function exposeDialog(c) {
     content: [
       field({ label: 'Domain', name: 'domain', placeholder: 'app.example.com', validate: 'domain', attrs: { autocapitalize: 'off', spellcheck: 'false' } }),
       field({ label: 'Host port', name: 'host_port', type: 'number', value: guess, validate: 'port', hint: 'The port published on the host (left side of host:container).' }),
-      h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'include_www' }), 'Also serve the www. subdomain'),
+      selectField({ label: 'www subdomain', name: 'www', options: WWW_OPTIONS, value: 'redirect' }),
     ],
     async onSubmit(d) {
       await api(`/docker/containers/${encodeURIComponent(c.id)}/proxy-site`, {
-        method: 'POST', body: { domain: d.domain.toLowerCase(), host_port: Number(d.host_port), include_www: !!d.include_www },
+        method: 'POST', body: { domain: d.domain.toLowerCase(), host_port: Number(d.host_port), ...wwwBody(d.www) },
       });
       toast(`${d.domain} now proxies to ${c.name}`);
     },

@@ -1,4 +1,5 @@
 use super::cmd::{run, CmdOutcome};
+use super::ssl::SslService;
 use crate::config::Config;
 use crate::db::models::{BasicAuthUser, Site};
 use crate::fsutil::write_atomic;
@@ -127,6 +128,23 @@ impl NginxService {
     /// (domain via `validate::domain`, paths via `validate::path_within` or derived from config,
     /// allow-list entries via `validate::cidr`, directives via `validate::nginx_directives`).
     pub fn generate_config(config: &Config, site: &Site) -> String {
+        Self::render_config(config, site, Self::cert_covers_www(site))
+    }
+
+    /// Whether the site's certificate is valid for its www name.
+    pub fn cert_covers_www(site: &Site) -> bool {
+        site.ssl_cert_path
+            .as_deref()
+            .and_then(SslService::cert_info)
+            .is_some_and(|c| c.covers(&format!("www.{}", site.domain)))
+    }
+
+    /// Render the vhost. `www_tls` says whether the certificate covers www, without which
+    /// nginx could only answer `https://www` with a certificate error.
+    fn render_config(config: &Config, site: &Site, www_tls: bool) -> String {
+        if site.redirects_www() {
+            return Self::render_with_www_redirect(config, site, www_tls);
+        }
         let names = site.server_names().join(" ");
         let body = Self::server_body(config, site);
 
@@ -171,6 +189,48 @@ server {{
 
 {body}}}
 "#
+            ),
+        }
+    }
+
+    /// The vhost when www redirects to the naked domain. Every www block keeps its port 80
+    /// ACME location, or the www name on the certificate could no longer renew.
+    fn render_with_www_redirect(config: &Config, site: &Site, www_tls: bool) -> String {
+        let domain = &site.domain;
+        let www = format!("www.{domain}");
+        let body = Self::server_body(config, site);
+        const ACME: &str = "    location /.well-known/acme-challenge/ {\n        root /var/www/html;\n    }\n";
+
+        match (&site.ssl_enabled, &site.ssl_cert_path, &site.ssl_key_path) {
+            (true, Some(cert), Some(key)) => {
+                let tls = format!(
+                    "    ssl_certificate {cert};\n    ssl_certificate_key {key};\n    \
+                     ssl_protocols TLSv1.2 TLSv1.3;\n    ssl_prefer_server_ciphers off;\n    \
+                     ssl_session_cache shared:cloudpanel_ssl:10m;\n    ssl_session_timeout 1d;\n"
+                );
+                let www_block = if www_tls {
+                    format!(
+                        "\nserver {{\n    listen 443 ssl http2;\n    listen [::]:443 ssl http2;\n    \
+                         server_name {www};\n\n{tls}\n    \
+                         add_header Strict-Transport-Security \"max-age=31536000\" always;\n    \
+                         return 301 https://{domain}$request_uri;\n}}\n"
+                    )
+                } else {
+                    String::new()
+                };
+                format!(
+                    "# Managed by CloudPanel - changes will be overwritten\n\
+                     server {{\n    listen 80;\n    listen [::]:80;\n    server_name {domain} {www};\n\n{ACME}\n    \
+                     location / {{\n        return 301 https://{domain}$request_uri;\n    }}\n}}\n{www_block}\n\
+                     server {{\n    listen 443 ssl http2;\n    listen [::]:443 ssl http2;\n    \
+                     server_name {domain};\n\n{tls}\n{body}}}\n"
+                )
+            }
+            _ => format!(
+                "# Managed by CloudPanel - changes will be overwritten\n\
+                 server {{\n    listen 80;\n    listen [::]:80;\n    server_name {www};\n\n{ACME}\n    \
+                 location / {{\n        return 301 http://{domain}$request_uri;\n    }}\n}}\n\n\
+                 server {{\n    listen 80;\n    listen [::]:80;\n    server_name {domain};\n\n{body}}}\n"
             ),
         }
     }
@@ -357,6 +417,9 @@ pub(crate) fn test_site(site_type: &str) -> Site {
         basic_auth_allow: String::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        app_manager: "systemd".into(),
+        app_pm2: "{}".into(),
+        www_redirect: false,
     }
 }
 
@@ -395,6 +458,67 @@ mod tests {
         assert!(c.contains("listen 443 ssl http2;"));
         assert!(c.contains("return 301 https://$host$request_uri;"));
         assert!(c.contains("Strict-Transport-Security"));
+    }
+
+    fn redirecting(ssl: bool) -> Site {
+        let mut s = test_site("nodejs");
+        s.domain = "example.com".into();
+        s.include_www = true;
+        s.www_redirect = true;
+        if ssl {
+            s.ssl_enabled = true;
+            s.ssl_cert_path = Some("/etc/letsencrypt/live/example.com/fullchain.pem".into());
+            s.ssl_key_path = Some("/etc/letsencrypt/live/example.com/privkey.pem".into());
+        }
+        s
+    }
+
+    #[test]
+    fn www_redirect_over_https_when_certificate_covers_it() {
+        let c = NginxService::render_config(&cfg(), &redirecting(true), true);
+        // Port 80 goes straight to the naked domain, in one hop, and can still renew www.
+        assert!(c.contains("server_name example.com www.example.com;"));
+        assert!(c.contains("acme-challenge"));
+        assert!(!c.contains("return 301 https://$host"));
+        // The www block answers on 443 and only redirects.
+        let www = c.split("server_name www.example.com;").nth(1).unwrap();
+        let www = &www[..www.find("\n}").unwrap()];
+        assert!(www.contains("ssl_certificate /etc/letsencrypt/live/example.com/fullchain.pem;"));
+        assert!(www.contains("return 301 https://example.com$request_uri;"));
+        assert!(!www.contains("proxy_pass"));
+        // The site itself is only on the naked domain.
+        assert!(c.contains("server_name example.com;"));
+        assert_eq!(c.matches("proxy_pass").count(), 1);
+        assert_eq!(c.matches("listen 443 ssl http2;").count(), 2);
+    }
+
+    #[test]
+    fn no_https_www_block_without_a_covering_certificate() {
+        let c = NginxService::render_config(&cfg(), &redirecting(true), false);
+        assert!(!c.contains("server_name www.example.com;"));
+        assert_eq!(c.matches("listen 443 ssl http2;").count(), 1);
+        assert!(c.contains("server_name example.com www.example.com;"));
+        assert!(c.contains("return 301 https://example.com$request_uri;"));
+    }
+
+    #[test]
+    fn www_redirect_without_https() {
+        let c = NginxService::render_config(&cfg(), &redirecting(false), false);
+        assert!(c.contains("server_name www.example.com;"));
+        assert!(c.contains("return 301 http://example.com$request_uri;"));
+        assert!(c.contains("server_name example.com;"));
+        assert!(c.contains("acme-challenge"));
+        assert!(!c.contains("listen 443"));
+        assert_eq!(c.matches("proxy_pass").count(), 1);
+    }
+
+    #[test]
+    fn disabled_site_still_redirects_www() {
+        let mut s = redirecting(false);
+        s.is_active = false;
+        let c = NginxService::render_config(&cfg(), &s, false);
+        assert!(c.contains("return 301 http://example.com$request_uri;"));
+        assert!(c.contains("return 503 '"));
     }
 
     #[test]

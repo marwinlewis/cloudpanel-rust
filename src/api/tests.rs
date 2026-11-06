@@ -51,8 +51,10 @@ fn harness() -> Harness {
                     document_root: None,
                     system_user: "cloudpanel",
                     include_www: false,
+                    www_redirect: false,
                     home_dir: None,
                     app_command: None,
+                    app_manager: "systemd",
                 },
             )
             .unwrap()

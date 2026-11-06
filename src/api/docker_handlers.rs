@@ -2,7 +2,7 @@ use crate::api::error::{ApiError, ApiResult};
 use crate::audit;
 use crate::auth::AdminUser;
 use crate::services::docker::{self as dk, ContainerAction, DockerService, RunSpec};
-use crate::services::sites::{provision, SiteInput};
+use crate::services::sites::{provision, www_choice, SiteInput};
 use crate::state::{blocking, SharedState};
 use crate::validate;
 use axum::{
@@ -23,8 +23,8 @@ pub struct LogsQuery {
 pub struct DockerProxyRequest {
     pub domain: String,
     pub host_port: u16,
-    #[serde(default)]
-    pub include_www: bool,
+    pub include_www: Option<bool>,
+    pub www_redirect: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -151,6 +151,7 @@ pub async fn proxy_container_to_site(
 ) -> ApiResult<impl IntoResponse> {
     container(&id)?;
     let config = state.config.clone();
+    let (include_www, www_redirect) = www_choice(p.include_www, p.www_redirect);
     let site = state
         .db(move |conn| {
             let site = provision(
@@ -162,8 +163,10 @@ pub async fn proxy_container_to_site(
                     target_port: Some(p.host_port),
                     document_root: None,
                     system_user: None,
-                    include_www: p.include_www,
+                    include_www,
+                    www_redirect,
                     app_command: None,
+                    app_manager: None,
                     create_user: false,
                 },
             )?;

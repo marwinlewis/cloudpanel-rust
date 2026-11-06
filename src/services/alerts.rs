@@ -344,8 +344,8 @@ fn collect_checks(state: &SharedState, rules: &AlertRules) -> Vec<Check> {
 
     if rules.services {
         for s in &sites {
-            if s.app_enabled && s.is_active && s.app_command.is_some() {
-                let st = super::apps::status(&state.config, &s.domain);
+            if s.app_enabled && s.is_active && super::apps::has_start(s) {
+                let st = super::apps::status(&state.config, s);
                 if st.installed && st.active_state != "unknown" {
                     checks.push(Check {
                         key: format!("app:{}", s.domain),

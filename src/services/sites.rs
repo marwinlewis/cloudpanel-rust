@@ -1,7 +1,8 @@
-use super::{apps, sysusers, NginxService};
+use super::{apps, pm2, sysusers, NginxService};
 use crate::api::error::{ApiError, ApiResult};
 use crate::config::Config;
-use crate::db::{self, models::Site, models::SiteType, NewSite};
+use crate::db::models::{Site, SiteType, MANAGER_PM2, MANAGER_SYSTEMD};
+use crate::db::{self, NewSite};
 use crate::validate;
 use rusqlite::Connection;
 use std::fs;
@@ -15,10 +16,20 @@ pub struct SiteInput {
     /// Linux user to create for the site; derived from the domain when omitted.
     pub system_user: Option<String>,
     pub include_www: bool,
+    /// With `include_www`: redirect www to the naked domain instead of serving both.
+    pub www_redirect: bool,
     /// Start command for app sites (optional; can be set later).
     pub app_command: Option<String>,
+    /// `systemd` or `pm2`. Node.js sites default to PM2.
+    pub app_manager: Option<String>,
     /// Docker proxies point at a container and get no Linux user.
     pub create_user: bool,
+}
+
+/// Resolve the two www request fields, where omitted means redirect, the default for new sites.
+pub fn www_choice(include_www: Option<bool>, www_redirect: Option<bool>) -> (bool, bool) {
+    let include = include_www.unwrap_or(true);
+    (include, include && www_redirect.unwrap_or(true))
 }
 
 /// Validate input, create the site's Linux user and home, store the site and apply its
@@ -44,12 +55,32 @@ pub fn provision(config: &Config, conn: &Connection, input: SiteInput) -> ApiRes
         Some(port)
     };
 
-    if db::list_sites(conn)?.iter().any(|s| s.domain == domain) {
+    let existing = db::list_sites(conn)?;
+    if existing.iter().any(|s| s.domain == domain) {
         return Err(ApiError::Conflict(format!("{domain} already exists")));
     }
+    // www belongs to the naked domain's site unless a separate site already claims it.
+    if let Some(naked) = domain.strip_prefix("www.") {
+        if existing.iter().any(|s| s.domain == naked && s.include_www) {
+            return Err(ApiError::Conflict(format!(
+                "{domain} is already handled by the site for {naked}"
+            )));
+        }
+    }
+    let www_available = !domain.starts_with("www.") && !existing.iter().any(|s| s.domain == format!("www.{domain}"));
+    let include_www = input.include_www && www_available;
+    let www_redirect = include_www && input.www_redirect;
 
     // Linux user + home directory.
     let create_user = input.create_user && site_type != SiteType::DockerProxy;
+    let app_manager = match input.app_manager.as_deref() {
+        Some(MANAGER_SYSTEMD) => MANAGER_SYSTEMD,
+        Some(MANAGER_PM2) if site_type == SiteType::Nodejs && create_user => MANAGER_PM2,
+        Some(MANAGER_PM2) => return Err(ApiError::BadRequest("PM2 is only available for Node.js sites".into())),
+        Some(_) => return Err(ApiError::BadRequest("Process manager must be systemd or pm2".into())),
+        None if site_type == SiteType::Nodejs && create_user => MANAGER_PM2,
+        None => MANAGER_SYSTEMD,
+    };
     let (system_user, home) = if create_user {
         let requested = input
             .system_user
@@ -97,9 +128,11 @@ pub fn provision(config: &Config, conn: &Connection, input: SiteInput) -> ApiRes
         target_port,
         document_root: document_root.as_deref(),
         system_user: &system_user,
-        include_www: input.include_www,
+        include_www,
+        www_redirect,
         home_dir: home_dir.as_deref(),
         app_command: app_command.as_deref(),
+        app_manager,
     };
     let id = db::create_site(conn, &new).map_err(|e| {
         if db::is_unique_violation(&e) {
@@ -124,8 +157,11 @@ pub fn provision(config: &Config, conn: &Connection, input: SiteInput) -> ApiRes
     if site.app_command.is_some() {
         site.app_enabled = true;
         db::save_site(conn, &site)?;
-        if let Err(e) = apps::apply(config, &site) {
-            tracing::warn!("app unit for {domain}: {e}");
+        // Without PM2 yet, the job that installs it (see `create_new_site`) starts the app.
+        if !site.uses_pm2() || pm2::installed() {
+            if let Err(e) = apps::apply(config, &site) {
+                tracing::warn!("app unit for {domain}: {e}");
+            }
         }
     }
     Ok(site)
@@ -146,7 +182,7 @@ pub fn deprovision(config: &Config, conn: &Connection, site: &Site, delete_files
     if let Err(e) = NginxService::remove_site(config, &site.domain) {
         warnings.push(format!("nginx: {e}"));
     }
-    apps::remove(config, &site.domain);
+    apps::remove(config, site);
     // Databases go with the files; when files are kept, the databases are kept too
     // (but no longer listed in the panel).
     for d in db::list_databases(conn, Some(site.id))? {

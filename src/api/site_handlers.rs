@@ -4,8 +4,8 @@ use crate::auth::{AdminUser, AuthUser};
 use crate::authz::{require_admin, require_site, visible_sites};
 use crate::config::Config;
 use crate::db::{self, models::Site, models::SiteType};
-use crate::services::sites::{deprovision, provision, SiteInput};
-use crate::services::{apps, runtimes, NginxService, SslService};
+use crate::services::sites::{deprovision, provision, www_choice, SiteInput};
+use crate::services::{apps, pm2, runtimes, NginxService, SslService};
 use crate::state::SharedState;
 use crate::validate;
 use axum::{
@@ -25,9 +25,13 @@ pub struct CreateSiteRequest {
     pub target_port: Option<u16>,
     pub document_root: Option<String>,
     pub system_user: Option<String>,
-    #[serde(default)]
-    pub include_www: bool,
+    /// Handle www.<domain>. Defaults to on.
+    pub include_www: Option<bool>,
+    /// Redirect www to the naked domain rather than serving both. Defaults to on.
+    pub www_redirect: Option<bool>,
     pub app_command: Option<String>,
+    /// `systemd` or `pm2`. Node.js sites default to PM2.
+    pub app_manager: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -58,6 +62,7 @@ pub async fn create_new_site(
 ) -> ApiResult<impl IntoResponse> {
     let config = state.config.clone();
     let admin_id = admin.0.id;
+    let (include_www, www_redirect) = www_choice(p.include_www, p.www_redirect);
     let site = state
         .db(move |conn| {
             let site = provision(
@@ -69,8 +74,10 @@ pub async fn create_new_site(
                     target_port: p.target_port,
                     document_root: p.document_root,
                     system_user: p.system_user,
-                    include_www: p.include_www,
+                    include_www,
+                    www_redirect,
                     app_command: p.app_command,
+                    app_manager: p.app_manager,
                     create_user: true,
                 },
             )?;
@@ -78,10 +85,11 @@ pub async fn create_new_site(
             Ok(site)
         })
         .await?;
-    // Node.js sites need a system-wide runtime; install it in the background if missing
-    // and restart the app once it's there.
+    // Node.js sites need a system-wide runtime (and PM2, if that runs the app); install what
+    // is missing in the background and start the app once it's there.
     let mut runtime_job_id = None;
-    if site.kind() == Some(SiteType::Nodejs) && runtimes::node_needed(&state.config) {
+    let needs_pm2 = site.uses_pm2() && !pm2::installed() && runtimes::can_install(&state.config);
+    if site.kind() == Some(SiteType::Nodejs) && (runtimes::node_needed(&state.config) || needs_pm2) {
         let config = state.config.clone();
         let s = site.clone();
         runtime_job_id = Some(
@@ -92,9 +100,12 @@ pub async fn create_new_site(
                 Some(admin_id),
                 move |log| {
                     runtimes::ensure_nodejs(&config, &|l| log.line(l))?;
-                    if s.app_enabled && s.app_command.is_some() {
-                        log.line(&format!("Restarting {}", apps::unit_name(&s.domain)));
-                        apps::act(&s.domain, apps::AppAction::Restart)?;
+                    if s.uses_pm2() {
+                        pm2::ensure(&config, &|l| log.line(l))?;
+                    }
+                    if s.app_enabled && apps::has_start(&s) {
+                        log.line(&format!("Starting {}", apps::unit_name(&s.domain)));
+                        apps::apply(&config, &s)?;
                     }
                     Ok(())
                 },
@@ -120,10 +131,16 @@ pub async fn get_site(
             let app = site
                 .kind()
                 .filter(|k| k.has_app())
-                .map(|_| apps::status(&config, &site.domain));
+                .map(|_| apps::status(&config, &site));
             let mut v = serde_json::to_value(&site).map_err(ApiError::internal)?;
-            v["env"] = json!(site.env_map());
             v["certificate"] = json!(cert);
+            v["certificate_covers_www"] = json!(NginxService::cert_covers_www(&site));
+            if site.kind() == Some(SiteType::Nodejs) {
+                v["pm2"] = json!(site.pm2_options());
+                v["pm2_installed"] = json!(pm2::installed());
+                v["ecosystem_file"] = json!(pm2::detect_ecosystem(&site));
+                v["project"] = json!(apps::inspect_project(std::path::Path::new(&apps::workdir(&site))));
+            }
             v["certificate_managed"] = json!(site.ssl_cert_path.as_deref().is_some_and(SslService::is_letsencrypt));
             v["app"] = json!(app);
             v["app_workdir_default"] = json!(apps::workdir(&Site {
@@ -141,6 +158,7 @@ pub async fn get_site(
 pub struct UpdateSiteRequest {
     pub target_port: Option<u16>,
     pub include_www: Option<bool>,
+    pub www_redirect: Option<bool>,
     pub document_root: Option<String>,
     pub websocket: Option<bool>,
     pub max_body_mb: Option<i64>,
@@ -170,8 +188,15 @@ pub async fn update_site(
                 site.target_port = Some(port);
             }
             if let Some(w) = p.include_www {
+                if w && site.domain.starts_with("www.") {
+                    return Err(ApiError::BadRequest("This domain already starts with www.".into()));
+                }
                 site.include_www = w;
             }
+            if let Some(r) = p.www_redirect {
+                site.www_redirect = r;
+            }
+            site.www_redirect = site.www_redirect && site.include_www;
             if let Some(ws) = p.websocket {
                 site.websocket = ws;
             }
@@ -250,11 +275,12 @@ pub async fn setup_site_ssl(
     Json(payload): Json<SslRequest>,
 ) -> ApiResult<impl IntoResponse> {
     let config = state.config.clone();
-    let site = state
+    let (site, warning) = state
         .db(move |conn| {
             let mut site = require_site(conn, &user, id)?;
             // Re-validate the stored domain before it reaches certbot or the filesystem.
             let domain = validate::domain(&site.domain).map_err(ApiError::BadRequest)?;
+            let mut warning = None;
 
             let (cert, key, kind) = match (
                 payload.custom_cert.as_deref(),
@@ -268,9 +294,10 @@ pub async fn setup_site_ssl(
                 }
                 (_, _, Some(email)) if !email.trim().is_empty() => {
                     let email = validate::email(email).map_err(ApiError::BadRequest)?;
-                    let (c, k) =
-                        SslService::issue_letsencrypt(&site.server_names(), &email).map_err(ApiError::Unprocessable)?;
-                    (c, k, "letsencrypt")
+                    let issued =
+                        SslService::issue_for_site(&site.server_names(), &email).map_err(ApiError::Unprocessable)?;
+                    warning = issued.warning;
+                    (issued.cert_path, issued.key_path, "letsencrypt")
                 }
                 _ => {
                     return Err(ApiError::BadRequest(
@@ -285,10 +312,12 @@ pub async fn setup_site_ssl(
             site.ssl_key_path = Some(key);
             apply_site(&config, conn, &previous, &site)?;
             audit::record(conn, &user, "site.ssl_install", Some(&site.domain), Some(kind));
-            Ok(site)
+            Ok((site, warning))
         })
         .await?;
-    Ok(Json(site))
+    let mut v = serde_json::to_value(&site).map_err(ApiError::internal)?;
+    v["warning"] = json!(warning);
+    Ok(Json(v))
 }
 
 pub async fn renew_site_ssl(
@@ -400,7 +429,7 @@ pub async fn get_site_logs(
                     let path = config.nginx_log_dir.join(format!("{domain}.{kind}.log"));
                     Ok(crate::fsutil::tail_file(&path, lines).unwrap_or_else(|_| String::new()))
                 }
-                "app" => apps::journal(&apps::unit_name(&domain), lines).map_err(ApiError::Unprocessable),
+                "app" => apps::logs(&site, lines).map_err(ApiError::Unprocessable),
                 _ => Err(ApiError::BadRequest("kind must be access, error or app".into())),
             }
         })

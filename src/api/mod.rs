@@ -93,8 +93,11 @@ pub fn create_api_router(state: SharedState) -> Router {
         )
         // Site apps
         .route("/sites/:id/app", put(app_handlers::update_app))
+        .route("/sites/:id/app/env", get(app_handlers::get_env))
         .route("/sites/:id/app/logs", get(app_handlers::app_logs))
         .route("/sites/:id/app/install", post(app_handlers::install_dependencies))
+        .route("/sites/:id/app/build", post(app_handlers::build_app))
+        .route("/sites/:id/app/deploy", post(app_handlers::deploy_app))
         .route("/sites/:id/app/:action", post(app_handlers::app_action))
         // SSH / SFTP users
         .route(

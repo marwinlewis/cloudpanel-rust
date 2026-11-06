@@ -124,12 +124,19 @@ pub fn backup_site(config: &Config, pool: &DbPool, site_id: i64, log: &JobLog) -
         let parent_s = home_parent.to_string_lossy().into_owned();
         let ex_cache = format!("--exclude={home_name}/.cache");
         let ex_npm = format!("--exclude={home_name}/.npm");
+        // PM2's sockets and pid files mean nothing once restored.
+        let ex_sock = format!("--exclude={home_name}/.pm2/*.sock");
+        let ex_pids = format!("--exclude={home_name}/.pm2/pids");
+        let ex_pid = format!("--exclude={home_name}/.pm2/pm2.pid");
         tar(
             &[
                 "-czf",
                 &dest_s,
                 &ex_cache,
                 &ex_npm,
+                &ex_sock,
+                &ex_pids,
+                &ex_pid,
                 "-C",
                 &staging_s,
                 "manifest.json",
@@ -287,7 +294,7 @@ pub fn restore(config: &Config, pool: &DbPool, backup_id: i64, log: &JobLog) -> 
     }
 
     log.line("Stopping the app…");
-    let _ = apps::act(&site.domain, apps::AppAction::Stop);
+    apps::stop_unit(&site.domain);
     let old = home_parent.join(format!(".cloudpanel-old-{}-{ts}", manifest.home_name));
     fs::rename(&home, &old).map_err(|e| format!("move current files aside: {e}"))?;
     if let Err(e) = fs::rename(&restored_home, &home) {

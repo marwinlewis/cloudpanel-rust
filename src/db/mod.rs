@@ -274,7 +274,7 @@ pub fn grant_site(conn: &Connection, user_id: i64, site_id: i64) -> rusqlite::Re
 const SITE_COLS: &str = "id, domain, site_type, target_port, document_root, system_user, include_www, ssl_enabled, \
                          ssl_auto_renew, ssl_cert_path, ssl_key_path, is_active, app_command, app_workdir, app_env, \
                          app_enabled, home_dir, websocket, max_body_mb, custom_directives, basic_auth_enabled, \
-                         basic_auth_allow, created_at, updated_at";
+                         basic_auth_allow, created_at, updated_at, app_manager, app_pm2, www_redirect";
 
 fn site_from_row(row: &Row) -> rusqlite::Result<Site> {
     Ok(Site {
@@ -302,6 +302,9 @@ fn site_from_row(row: &Row) -> rusqlite::Result<Site> {
         basic_auth_allow: row.get(21)?,
         created_at: row.get(22)?,
         updated_at: row.get(23)?,
+        app_manager: row.get(24)?,
+        app_pm2: row.get(25)?,
+        www_redirect: row.get(26)?,
     })
 }
 
@@ -335,16 +338,19 @@ pub struct NewSite<'a> {
     pub document_root: Option<&'a str>,
     pub system_user: &'a str,
     pub include_www: bool,
+    pub www_redirect: bool,
     pub home_dir: Option<&'a str>,
     pub app_command: Option<&'a str>,
+    pub app_manager: &'a str,
 }
 
 pub fn create_site(conn: &Connection, s: &NewSite) -> rusqlite::Result<i64> {
     let now = Utc::now();
     conn.execute(
         "INSERT INTO sites (domain, site_type, target_port, document_root, system_user, include_www,
-                            ssl_enabled, ssl_auto_renew, is_active, home_dir, app_command, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 1, 1, ?7, ?8, ?9, ?9)",
+                            ssl_enabled, ssl_auto_renew, is_active, home_dir, app_command, created_at, updated_at,
+                            www_redirect, app_manager)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 1, 1, ?7, ?8, ?9, ?9, ?10, ?11)",
         params![
             s.domain,
             s.site_type,
@@ -354,7 +360,9 @@ pub fn create_site(conn: &Connection, s: &NewSite) -> rusqlite::Result<i64> {
             s.include_www,
             s.home_dir,
             s.app_command,
-            now
+            now,
+            s.www_redirect,
+            s.app_manager
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -366,7 +374,8 @@ pub fn save_site(conn: &Connection, s: &Site) -> rusqlite::Result<bool> {
         "UPDATE sites SET target_port = ?1, document_root = ?2, include_www = ?3, ssl_enabled = ?4,
              ssl_cert_path = ?5, ssl_key_path = ?6, is_active = ?7, app_command = ?8, app_workdir = ?9,
              app_env = ?10, app_enabled = ?11, websocket = ?12, max_body_mb = ?13, custom_directives = ?14,
-             basic_auth_enabled = ?15, basic_auth_allow = ?16, updated_at = ?17
+             basic_auth_enabled = ?15, basic_auth_allow = ?16, updated_at = ?17,
+             app_manager = ?19, app_pm2 = ?20, www_redirect = ?21
          WHERE id = ?18",
         params![
             s.target_port,
@@ -386,7 +395,10 @@ pub fn save_site(conn: &Connection, s: &Site) -> rusqlite::Result<bool> {
             s.basic_auth_enabled,
             s.basic_auth_allow,
             Utc::now(),
-            s.id
+            s.id,
+            s.app_manager,
+            s.app_pm2,
+            s.www_redirect
         ],
     )?;
     Ok(n > 0)

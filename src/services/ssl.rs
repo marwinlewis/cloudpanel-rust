@@ -7,30 +7,104 @@ pub struct SslService;
 
 const MAX_PEM_BYTES: usize = 64 * 1024;
 
+/// A certificate from [`SslService::issue_for_site`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct Issued {
+    pub cert_path: String,
+    pub key_path: String,
+    /// Set when the certificate covers fewer names than the site asked for.
+    pub warning: Option<String>,
+}
+
+/// certbot's arguments. `--expand` lets an existing certificate gain names, such as www when
+/// a site turns its redirect on; without it certbot refuses in non-interactive mode.
+fn certbot_args<'a>(names: &'a [String], email: &'a str) -> Vec<&'a str> {
+    let mut args: Vec<&str> = vec![
+        "certonly",
+        "--nginx",
+        "--non-interactive",
+        "--agree-tos",
+        "--keep-until-expiring",
+        "--expand",
+        "--cert-name",
+        names.first().map_or("", String::as_str),
+        "-m",
+        email,
+    ];
+    for n in names {
+        args.push("-d");
+        args.push(n);
+    }
+    args
+}
+
+/// Does this name resolve at all? Used to avoid asking for a name that is bound to fail.
+fn resolves(name: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    (name, 80).to_socket_addrs().is_ok_and(|mut a| a.next().is_some())
+}
+
+/// Get a certificate for `names`, giving up on the extra names rather than on HTTPS: www is on
+/// by default, and one bad name would otherwise fail the whole certificate. `issue` asks for a
+/// certificate and `resolve` checks DNS.
+fn issue_with_fallback<I, R>(names: &[String], issue: I, resolve: R) -> Result<Issued, String>
+where
+    I: Fn(&[String]) -> Result<(String, String), String>,
+    R: Fn(&str) -> bool,
+{
+    let primary = names.first().ok_or("No domain given")?.clone();
+    let done = |(cert_path, key_path): (String, String), warning| Issued {
+        cert_path,
+        key_path,
+        warning,
+    };
+    let extras: Vec<&String> = names.iter().skip(1).collect();
+    if extras.is_empty() {
+        return issue(names).map(|p| done(p, None));
+    }
+    let list = |v: &[&String]| v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+    let only_primary = std::slice::from_ref(&primary);
+
+    let unresolved: Vec<&String> = extras.iter().copied().filter(|n| !resolve(n)).collect();
+    if !unresolved.is_empty() {
+        let names_left: Vec<String> = names.iter().filter(|n| !unresolved.contains(n)).cloned().collect();
+        let warning = format!(
+            "{} has no DNS record yet, so the certificate doesn't cover it. Add the record, then replace the \
+             certificate.",
+            list(&unresolved)
+        );
+        return issue(&names_left).map(|p| done(p, Some(warning)));
+    }
+    match issue(names) {
+        Ok(p) => Ok(done(p, None)),
+        Err(first) => match issue(only_primary) {
+            Ok(p) => Ok(done(
+                p,
+                Some(format!(
+                    "Let's Encrypt could not validate {}, so the certificate only covers {primary}. Check that \
+                     name's DNS, then replace the certificate. certbot said: {}",
+                    list(&extras),
+                    tail(&first, 400)
+                )),
+            )),
+            Err(_) => Err(first),
+        },
+    }
+}
+
 impl SslService {
+    /// Issue a certificate for a site. See [`issue_with_fallback`].
+    pub fn issue_for_site(names: &[String], email: &str) -> Result<Issued, String> {
+        issue_with_fallback(names, |n| Self::issue_letsencrypt(n, email), resolves)
+    }
+
     /// Issue a Let's Encrypt certificate with certbot. `names[0]` is the primary domain.
     /// Every value has already been validated (no leading '-', strict charset).
     pub fn issue_letsencrypt(names: &[String], email: &str) -> Result<(String, String), String> {
         let primary = names.first().ok_or("No domain given")?;
         info!("Requesting Let's Encrypt certificate for {}", names.join(", "));
 
-        let mut args: Vec<&str> = vec![
-            "certonly",
-            "--nginx",
-            "--non-interactive",
-            "--agree-tos",
-            "--keep-until-expiring",
-            "--cert-name",
-            primary,
-            "-m",
-            email,
-        ];
-        for n in names {
-            args.push("-d");
-            args.push(n);
-        }
-
-        match run("certbot", &args) {
+        match run("certbot", &certbot_args(names, email)) {
             CmdOutcome::Ok(_) => Ok((
                 format!("/etc/letsencrypt/live/{primary}/fullchain.pem"),
                 format!("/etc/letsencrypt/live/{primary}/privkey.pem"),
@@ -160,6 +234,24 @@ pub struct CertInfo {
     pub days_left: i64,
 }
 
+impl CertInfo {
+    /// Whether the certificate is valid for `host`, including through a wildcard.
+    pub fn covers(&self, host: &str) -> bool {
+        let matches = |pattern: &str| {
+            let pattern = pattern.to_ascii_lowercase();
+            let host = host.to_ascii_lowercase();
+            if let Some(suffix) = pattern.strip_prefix("*.") {
+                return host.split_once('.').is_some_and(|(_, rest)| rest == suffix);
+            }
+            pattern == host
+        };
+        if self.names.is_empty() {
+            return matches(&self.subject);
+        }
+        self.names.iter().any(|n| matches(n))
+    }
+}
+
 fn normalize(pem: &str) -> String {
     let mut s = pem.replace("\r\n", "\n").trim().to_string();
     s.push('\n');
@@ -175,4 +267,118 @@ fn tail(s: &str, max: usize) -> &str {
         start += 1;
     }
     &s[start..]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    fn names() -> Vec<String> {
+        vec!["example.com".to_string(), "www.example.com".to_string()]
+    }
+
+    fn paths() -> (String, String) {
+        ("c".to_string(), "k".to_string())
+    }
+
+    #[test]
+    fn certbot_can_expand_and_gets_every_name() {
+        let n = names();
+        let args = certbot_args(&n, "me@example.com");
+        assert!(args.contains(&"--expand"));
+        assert!(args.contains(&"--non-interactive"));
+        assert_eq!(args.iter().filter(|a| **a == "-d").count(), 2);
+        let cert_name = args.iter().position(|a| *a == "--cert-name").unwrap();
+        assert_eq!(args[cert_name + 1], "example.com");
+    }
+
+    #[test]
+    fn both_names_when_all_goes_well() {
+        let i = issue_with_fallback(
+            &names(),
+            |n| {
+                assert_eq!(n.len(), 2);
+                Ok(paths())
+            },
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(i.warning, None);
+    }
+
+    #[test]
+    fn skips_www_without_dns_and_says_so() {
+        let asked = RefCell::new(Vec::new());
+        let i = issue_with_fallback(
+            &names(),
+            |n| {
+                asked.borrow_mut().push(n.to_vec());
+                Ok(paths())
+            },
+            |host| host == "example.com",
+        )
+        .unwrap();
+        assert_eq!(asked.borrow().as_slice(), &[vec!["example.com".to_string()]]);
+        assert!(i.warning.unwrap().contains("www.example.com has no DNS record"));
+    }
+
+    #[test]
+    fn retries_without_www_when_validation_fails() {
+        let asked = RefCell::new(0);
+        let i = issue_with_fallback(
+            &names(),
+            |n| {
+                *asked.borrow_mut() += 1;
+                if n.len() == 2 {
+                    Err("www failed".to_string())
+                } else {
+                    Ok(paths())
+                }
+            },
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(*asked.borrow(), 2);
+        let w = i.warning.unwrap();
+        assert!(w.contains("only covers example.com"));
+        assert!(w.contains("www failed"));
+    }
+
+    #[test]
+    fn reports_the_original_error_if_the_naked_domain_fails_too() {
+        let e = issue_with_fallback(
+            &names(),
+            |n| Err(if n.len() == 2 { "first" } else { "second" }.to_string()),
+            |_| true,
+        )
+        .unwrap_err();
+        assert_eq!(e, "first");
+    }
+
+    #[test]
+    fn a_single_name_has_no_fallback() {
+        let n = vec!["example.com".to_string()];
+        assert_eq!(
+            issue_with_fallback(&n, |_| Err("no".to_string()), |_| true).unwrap_err(),
+            "no"
+        );
+    }
+
+    #[test]
+    fn coverage_checks_names_and_wildcards() {
+        let info = |names: &[&str]| CertInfo {
+            issuer: String::new(),
+            subject: "example.com".into(),
+            names: names.iter().map(|s| s.to_string()).collect(),
+            not_before: chrono::Utc::now(),
+            not_after: chrono::Utc::now(),
+            days_left: 1,
+        };
+        assert!(info(&["example.com", "www.example.com"]).covers("www.example.com"));
+        assert!(!info(&["example.com"]).covers("www.example.com"));
+        assert!(info(&["*.example.com"]).covers("www.example.com"));
+        assert!(!info(&["*.example.com"]).covers("a.b.example.com"));
+        assert!(!info(&[]).covers("www.example.com"));
+    }
 }

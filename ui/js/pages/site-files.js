@@ -116,7 +116,10 @@ function renderFiles(el, { site }) {
     close.addEventListener('click', d.close);
     save.addEventListener('click', () => withBusy(save, async () => {
       await api(`/sites/${site.id}/files/content`, { method: 'PUT', body: { path, content: ta.value } });
-      toast('Saved');
+      // This file is the one the Application tab edits; apps read it when they start.
+      const workdir = site.app_workdir || site.app_workdir_default;
+      const isAppEnv = workdir && `${site.home_dir}/${path}` === `${workdir}/.env`;
+      toast(isAppEnv ? 'Saved. Restart the app to apply these variables.' : 'Saved');
     }));
     setTimeout(() => ta.focus(), 30);
   }
