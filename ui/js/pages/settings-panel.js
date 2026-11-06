@@ -11,7 +11,7 @@ function panelCertCard() {
     const issue = h('button', { class: 'btn primary', type: 'button' }, icon('lock'), r.managed ? 'Re-issue certificate' : 'Use a Let’s Encrypt certificate');
     issue.addEventListener('click', () => formDialog({
       title: 'Certificate for the panel', submitText: 'Issue certificate',
-      description: 'The hostname must point to this server and port 80 must be reachable. certbot renews it automatically.',
+      description: 'The hostname must point to this server and ports 80 and 443 must be reachable. The panel will open at https://hostname with no port number. certbot renews the certificate automatically.',
       content: [
         field({ label: 'Panel hostname', name: 'hostname', value: r.hostname || (/[a-z]/i.test(location.hostname) && location.hostname !== 'localhost' ? location.hostname : ''), placeholder: 'panel.example.com', validate: 'domain' }),
         field({ label: 'Email for expiry notices', name: 'email', type: 'email', validate: 'email' }),
@@ -29,7 +29,7 @@ function panelCertCard() {
       try { const x = await api('/settings/panel-cert', { method: 'DELETE' }); toast(x.message); load(); } catch (e) { toast(e.message, 'error'); }
     });
     body.replaceChildren(
-      c ? kv([['Hostname', r.hostname || c.subject || '—'], ['Issuer', c.issuer], ['Expires', `${fmtDate(c.not_after)} (${c.days_left} days)`]])
+      c ? kv([['Hostname', r.hostname || c.subject || '—'], r.url && ['Address', h('a', { href: r.url, text: r.url })], ['Issuer', c.issuer], ['Expires', `${fmtDate(c.not_after)} (${c.days_left} days)`]])
         : h('p', { class: 'muted small', text: r.tls ? 'Serving a certificate that could not be read.' : 'The panel is running without TLS.' }),
       h('div', { class: 'row wrap' }, issue, revert));
   }

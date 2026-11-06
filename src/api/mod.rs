@@ -21,18 +21,20 @@ mod tests;
 
 use crate::state::SharedState;
 use axum::{
-    extract::{DefaultBodyLimit, Request},
-    http::{header, HeaderValue, Method},
+    extract::{ConnectInfo, DefaultBodyLimit, Request, State},
+    http::{header, HeaderMap, HeaderValue, Method},
     middleware::{self, Next},
     response::Response,
     routing::{delete, get, patch, post, put},
     Router,
 };
 use error::ApiError;
+use std::net::{IpAddr, SocketAddr};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 pub const CSRF_HEADER: &str = "x-requested-with";
 pub const CSRF_VALUE: &str = "cloudpanel";
+const PROXY_HEADER: &str = "x-cloudpanel-proxy";
 
 pub fn create_api_router(state: SharedState) -> Router {
     let api = Router::new()
@@ -262,6 +264,7 @@ pub fn create_api_router(state: SharedState) -> Router {
         .route("/cron/jobs/:id/runs", get(cron_handlers::cron_runs))
         .fallback(|| async { ApiError::NotFound("Endpoint") })
         .layer(middleware::from_fn(csrf_guard))
+        .layer(middleware::from_fn_with_state(state.clone(), real_client_address))
         .layer(DefaultBodyLimit::max(256 * 1024))
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,
@@ -270,6 +273,42 @@ pub fn create_api_router(state: SharedState) -> Router {
         .with_state(state);
 
     Router::new().nest("/api", api)
+}
+
+/// The real client behind the panel's own nginx site, if this request came through it.
+///
+/// Without this every login would appear to come from 127.0.0.1: one attacker would lock out
+/// everybody, fail2ban couldn't ban anyone and the audit log would lose its addresses. Being on
+/// loopback proves nothing, because site users can connect to the panel from this machine, and
+/// believing `X-Real-IP` from them would let them dodge the login limiter by changing it on
+/// every try. So nginx also sends a secret from a config file only root can read.
+pub(crate) fn forwarded_client(peer: IpAddr, headers: &HeaderMap, secret: &str) -> Option<IpAddr> {
+    if !peer.is_loopback() || secret.is_empty() {
+        return None;
+    }
+    let given = headers.get(PROXY_HEADER)?.as_bytes();
+    let same = given.len() == secret.len()
+        && given
+            .iter()
+            .zip(secret.as_bytes())
+            .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+            == 0;
+    if !same {
+        return None;
+    }
+    headers.get("x-real-ip")?.to_str().ok()?.trim().parse().ok()
+}
+
+/// Everything after this sees the real client address in `ConnectInfo`.
+async fn real_client_address(State(state): State<SharedState>, mut req: Request, next: Next) -> Response {
+    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
+    if let Some(peer) = peer {
+        if let Some(ip) = forwarded_client(peer.ip(), req.headers(), &state.proxy_secret) {
+            req.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::new(ip, peer.port())));
+        }
+    }
+    next.run(req).await
 }
 
 /// CSRF protection for cookie-authenticated, state-changing requests. Browsers can't

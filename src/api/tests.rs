@@ -67,6 +67,7 @@ fn harness() -> Harness {
         pool: pool.clone(),
         config,
         jwt_secret: b"test-secret-test-secret-test-secret!!".to_vec(),
+        proxy_secret: "test-proxy-secret".into(),
         limiter: LoginLimiter::default(),
         metrics: Arc::new(Mutex::new(MetricsCollector::default())),
         tls: Mutex::new(None),
@@ -649,4 +650,41 @@ async fn admin_sees_all_sites_and_missing_sites_are_404() {
         let (s, _, _) = h.call("GET", path, Some(&cookie), None, false).await;
         assert_eq!(s, StatusCode::OK, "{path}");
     }
+}
+
+#[test]
+fn a_forwarded_address_needs_loopback_and_the_secret() {
+    use axum::http::HeaderMap;
+    let secret = "test-proxy-secret";
+    let headers = |s: &str, ip: &str| {
+        let mut h = HeaderMap::new();
+        h.insert("x-cloudpanel-proxy", s.parse().unwrap());
+        h.insert("x-real-ip", ip.parse().unwrap());
+        h
+    };
+    let local = "127.0.0.1".parse().unwrap();
+    let client: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+
+    let good = headers(secret, "203.0.113.9");
+    assert_eq!(super::forwarded_client(local, &good, secret), Some(client));
+    assert_eq!(
+        super::forwarded_client("::1".parse().unwrap(), &good, secret),
+        Some(client)
+    );
+    // From the outside, even the right secret proves nothing.
+    assert_eq!(super::forwarded_client(client, &good, secret), None);
+    // Local processes such as site users' apps don't have the secret.
+    assert_eq!(
+        super::forwarded_client(local, &headers("guess", "203.0.113.9"), secret),
+        None
+    );
+    assert_eq!(super::forwarded_client(local, &headers("", "203.0.113.9"), ""), None);
+    let mut no_secret = HeaderMap::new();
+    no_secret.insert("x-real-ip", "203.0.113.9".parse().unwrap());
+    assert_eq!(super::forwarded_client(local, &no_secret, secret), None);
+    // A bad address falls back to the connection's own.
+    assert_eq!(
+        super::forwarded_client(local, &headers(secret, "not-an-ip"), secret),
+        None
+    );
 }

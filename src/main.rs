@@ -113,6 +113,21 @@ fn read_password(given: Option<String>) -> AnyResult<String> {
 }
 
 /// JWT signing key: `CLOUDPANEL_JWT_SECRET` or a random key persisted in the data dir.
+/// The secret nginx sends to vouch for a client address. Letters and digits only, because it
+/// is written into an nginx config.
+fn load_proxy_secret(config: &Config) -> AnyResult<String> {
+    let path = config.data_dir.join("proxy.secret");
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        let s = s.trim();
+        if s.len() >= 32 && s.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Ok(s.to_string());
+        }
+    }
+    let secret = random_password(48);
+    fsutil::write_atomic(&path, secret.as_bytes(), 0o600)?;
+    Ok(secret)
+}
+
 fn load_jwt_secret(config: &Config) -> AnyResult<Vec<u8>> {
     if let Ok(s) = std::env::var("CLOUDPANEL_JWT_SECRET") {
         if s.len() < 32 {
@@ -297,6 +312,8 @@ async fn main() -> AnyResult<()> {
     let stored_tls = services::panel_cert::load(&*pool.get()?);
     let tls_paths = services::panel_cert::effective_paths(&config, stored_tls.as_ref());
     let tls = tls_paths.is_some();
+    let proxy_secret = load_proxy_secret(&config)?;
+    services::panel_cert::sync_vhost(&config, &*pool.get()?, tls, &proxy_secret);
     let addr: SocketAddr = config
         .bind_addr
         .parse()
@@ -306,6 +323,7 @@ async fn main() -> AnyResult<()> {
         pool,
         config: config.clone(),
         jwt_secret,
+        proxy_secret,
         limiter: LoginLimiter::default(),
         metrics: Arc::new(Mutex::new(MetricsCollector::default())),
         tls: Mutex::new(None),

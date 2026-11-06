@@ -1,10 +1,13 @@
 //! A real (Let's Encrypt) certificate for the panel itself, hot-reloaded into the
 //! running TLS listener.
 
+use super::nginx::{NginxService, PanelVhost};
 use crate::config::Config;
 use crate::db;
+use crate::db::models::Site;
 use crate::state::SharedState;
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 pub const SETTING: &str = "panel_tls";
@@ -33,6 +36,71 @@ pub fn effective_paths(config: &Config, stored: Option<&PanelTls>) -> Option<(Pa
     match (&config.tls_cert, &config.tls_key) {
         (Some(c), Some(k)) => Some((c.clone(), k.clone())),
         _ => None,
+    }
+}
+
+/// Where nginx reaches the panel. None when the bind address can't be understood.
+pub fn upstream(config: &Config, tls: bool) -> Option<String> {
+    let addr: SocketAddr = config.bind_addr.parse().ok()?;
+    let scheme = if tls { "https" } else { "http" };
+    let port = addr.port();
+    Some(match addr.ip() {
+        ip if ip.is_unspecified() && ip.is_ipv6() => format!("{scheme}://[::1]:{port}"),
+        ip if ip.is_unspecified() => format!("{scheme}://127.0.0.1:{port}"),
+        IpAddr::V6(ip) => format!("{scheme}://[{ip}]:{port}"),
+        IpAddr::V4(ip) => format!("{scheme}://{ip}:{port}"),
+    })
+}
+
+/// A site already answering on this hostname, if any. nginx would pick one of the two
+/// server blocks at random, so they can't share it.
+pub fn site_on_hostname(sites: &[Site], hostname: &str) -> Option<String> {
+    sites
+        .iter()
+        .find(|s| s.server_names().iter().any(|n| n == hostname))
+        .map(|s| s.domain.clone())
+}
+
+/// Serve the panel's hostname on port 443 through nginx. Certificates renew in place, and
+/// certbot's hook reloads nginx afterwards.
+pub fn apply_vhost(config: &Config, stored: &PanelTls, tls: bool, secret: &str) -> Result<(), String> {
+    let upstream = upstream(config, tls).ok_or("The panel's bind address could not be read")?;
+    NginxService::apply_panel_vhost(
+        config,
+        &PanelVhost {
+            hostname: stored.hostname.clone(),
+            cert: stored.cert.clone(),
+            key: stored.key.clone(),
+            upstream,
+            secret: secret.to_string(),
+        },
+    )
+}
+
+/// At startup, set up the nginx site for a hostname configured before this feature existed,
+/// so upgrading is enough. Failing here must not stop the panel, which is still on its own
+/// port and is how anyone would fix the problem.
+pub fn sync_vhost(config: &Config, conn: &rusqlite::Connection, tls: bool, secret: &str) {
+    let Some(stored) = load(conn) else {
+        return;
+    };
+    if !(Path::new(&stored.cert).exists() && Path::new(&stored.key).exists()) {
+        tracing::warn!(
+            "panel certificate for {} is missing; not serving it on port 443",
+            stored.hostname
+        );
+        return;
+    }
+    let sites = db::list_sites(conn).unwrap_or_default();
+    if let Some(site) = site_on_hostname(&sites, &stored.hostname) {
+        tracing::warn!(
+            "not serving the panel on {} through nginx: the site {site} answers on that name",
+            stored.hostname
+        );
+        return;
+    }
+    if let Err(e) = apply_vhost(config, &stored, tls, secret) {
+        tracing::warn!("could not serve the panel on {} through nginx: {e}", stored.hostname);
     }
 }
 
@@ -100,4 +168,35 @@ fn local_ips() -> Vec<std::net::IpAddr> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::nginx::test_site;
+
+    #[test]
+    fn upstream_follows_the_bind_address_and_scheme() {
+        let mut c = Config::from_env();
+        c.bind_addr = "0.0.0.0:8443".into();
+        assert_eq!(upstream(&c, true).unwrap(), "https://127.0.0.1:8443");
+        assert_eq!(upstream(&c, false).unwrap(), "http://127.0.0.1:8443");
+        c.bind_addr = "10.0.0.5:9000".into();
+        assert_eq!(upstream(&c, true).unwrap(), "https://10.0.0.5:9000");
+        c.bind_addr = "[::]:8443".into();
+        assert_eq!(upstream(&c, true).unwrap(), "https://[::1]:8443");
+        c.bind_addr = "not an address".into();
+        assert!(upstream(&c, true).is_none());
+    }
+
+    #[test]
+    fn finds_sites_answering_on_the_hostname() {
+        let mut s = test_site("static");
+        s.domain = "example.com".into();
+        s.include_www = true;
+        let sites = vec![s];
+        assert_eq!(site_on_hostname(&sites, "example.com").unwrap(), "example.com");
+        assert_eq!(site_on_hostname(&sites, "www.example.com").unwrap(), "example.com");
+        assert!(site_on_hostname(&sites, "cpanel.example.com").is_none());
+    }
 }

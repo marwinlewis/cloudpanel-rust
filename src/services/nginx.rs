@@ -9,6 +9,18 @@ use tracing::{info, warn};
 
 pub struct NginxService;
 
+/// File name of the panel's own nginx site. It can't collide with a site: domains have a dot.
+const PANEL_VHOST: &str = "cloudpanel-panel";
+
+/// What the panel's own nginx site needs. All values come from the panel itself.
+pub struct PanelVhost {
+    pub hostname: String,
+    pub cert: String,
+    pub key: String,
+    pub upstream: String,
+    pub secret: String,
+}
+
 const SECURITY_HEADERS: &str = r#"    add_header X-Content-Type-Options "nosniff" always;
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;"#;
@@ -307,24 +319,27 @@ server {{
     /// Write the vhost, validate it with `nginx -t` and reload. On a failed test the
     /// previous config is restored so a bad change can never take nginx down.
     pub fn write_and_apply(config: &Config, site: &Site) -> Result<(), String> {
+        Self::install_vhost(config, &site.domain, &Self::generate_config(config, site), 0o644)
+    }
+
+    fn install_vhost(config: &Config, name: &str, content: &str, mode: u32) -> Result<(), String> {
         fs::create_dir_all(&config.nginx_sites_available)
             .map_err(|e| format!("Failed to create sites-available: {e}"))?;
         fs::create_dir_all(&config.nginx_sites_enabled).map_err(|e| format!("Failed to create sites-enabled: {e}"))?;
         let _ = fs::create_dir_all(&config.nginx_log_dir);
         Self::ensure_upgrade_map(config)?;
 
-        let (available, enabled) = Self::paths(config, &site.domain);
+        let (available, enabled) = Self::paths(config, name);
         let previous = fs::read(&available).ok();
         let was_enabled = enabled.symlink_metadata().is_ok();
 
-        write_atomic(&available, Self::generate_config(config, site).as_bytes(), 0o644)
-            .map_err(|e| format!("Failed to write nginx config: {e}"))?;
+        write_atomic(&available, content.as_bytes(), mode).map_err(|e| format!("Failed to write nginx config: {e}"))?;
         Self::link(&available, &enabled)?;
 
         if let Err(e) = Self::test() {
             match previous {
                 Some(prev) => {
-                    let _ = write_atomic(&available, &prev, 0o644);
+                    let _ = write_atomic(&available, &prev, mode);
                     if was_enabled {
                         let _ = Self::link(&available, &enabled);
                     } else {
@@ -336,13 +351,99 @@ server {{
                     let _ = fs::remove_file(&available);
                 }
             }
-            warn!("nginx rejected config for {}: {e}", site.domain);
+            warn!("nginx rejected config for {name}: {e}");
             return Err(e);
         }
 
         Self::reload()?;
-        info!("Applied nginx configuration for {}", site.domain);
+        info!("Applied nginx configuration for {name}");
         Ok(())
+    }
+
+    /// The nginx site that serves the panel's own hostname on port 443, so it doesn't need
+    /// `:8443` in the URL. `secret` proves to the panel that a request came through here (see
+    /// `api::forwarded_client`), so the file must stay unreadable to site users.
+    pub fn render_panel_vhost(config: &Config, tls: &PanelVhost) -> String {
+        let PanelVhost {
+            hostname,
+            cert,
+            key,
+            upstream,
+            secret,
+        } = tls;
+        format!(
+            r#"# Managed by CloudPanel - changes will be overwritten
+server {{
+    listen 80;
+    listen [::]:80;
+    server_name {hostname};
+
+    location /.well-known/acme-challenge/ {{
+        root /var/www/html;
+    }}
+
+    location / {{
+        return 301 https://{hostname}$request_uri;
+    }}
+}}
+
+server {{
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name {hostname};
+
+    ssl_certificate {cert};
+    ssl_certificate_key {key};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:cloudpanel_ssl:10m;
+    ssl_session_timeout 1d;
+
+    access_log {log}/{hostname}.access.log;
+    error_log {log}/{hostname}.error.log;
+
+    # The panel enforces its own limits, and backups and uploads can be large.
+    client_max_body_size 0;
+
+    location / {{
+        proxy_pass {upstream};
+        proxy_http_version 1.1;
+        proxy_ssl_verify off;
+        proxy_set_header Host $host;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-CloudPanel-Proxy "{secret}";
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }}
+}}
+"#,
+            log = config.nginx_log_dir.display(),
+        )
+    }
+
+    /// Bring the panel's nginx site in line. It stays untouched when nothing changed, so a
+    /// panel restart doesn't reload nginx for no reason.
+    pub fn apply_panel_vhost(config: &Config, tls: &PanelVhost) -> Result<(), String> {
+        let content = Self::render_panel_vhost(config, tls);
+        let (available, enabled) = Self::paths(config, PANEL_VHOST);
+        let current = fs::read_to_string(&available).ok();
+        if current.as_deref() == Some(content.as_str()) && enabled.symlink_metadata().is_ok() {
+            return Ok(());
+        }
+        Self::install_vhost(config, PANEL_VHOST, &content, 0o600)
+    }
+
+    pub fn remove_panel_vhost(config: &Config) -> Result<(), String> {
+        if Self::paths(config, PANEL_VHOST).0.symlink_metadata().is_err() {
+            return Ok(());
+        }
+        Self::remove_site(config, PANEL_VHOST)
     }
 
     pub fn remove_site(config: &Config, domain: &str) -> Result<(), String> {
@@ -510,6 +611,30 @@ mod tests {
         assert!(c.contains("acme-challenge"));
         assert!(!c.contains("listen 443"));
         assert_eq!(c.matches("proxy_pass").count(), 1);
+    }
+
+    #[test]
+    fn panel_vhost_forwards_to_the_panel_and_vouches_for_the_client() {
+        let c = NginxService::render_panel_vhost(
+            &cfg(),
+            &PanelVhost {
+                hostname: "cpanel.example.com".into(),
+                cert: "/etc/letsencrypt/live/cpanel.example.com/fullchain.pem".into(),
+                key: "/etc/letsencrypt/live/cpanel.example.com/privkey.pem".into(),
+                upstream: "https://127.0.0.1:8443".into(),
+                secret: "s3cret".into(),
+            },
+        );
+        assert!(c.contains("listen 443 ssl http2;"));
+        assert!(c.contains("server_name cpanel.example.com;"));
+        assert!(c.contains("ssl_certificate /etc/letsencrypt/live/cpanel.example.com/fullchain.pem;"));
+        assert!(c.contains("proxy_pass https://127.0.0.1:8443;"));
+        assert!(c.contains("proxy_set_header Host $host;"));
+        assert!(c.contains("proxy_set_header X-Real-IP $remote_addr;"));
+        assert!(c.contains("proxy_set_header X-CloudPanel-Proxy \"s3cret\";"));
+        // Port 80 can still validate certificate renewals.
+        assert!(c.contains("acme-challenge"));
+        assert!(c.contains("return 301 https://cpanel.example.com$request_uri;"));
     }
 
     #[test]

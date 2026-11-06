@@ -10,6 +10,8 @@ pub struct AppState {
     pub pool: DbPool,
     pub config: Config,
     pub jwt_secret: Vec<u8>,
+    /// Sent by the panel's nginx site, to vouch for the client address it forwards.
+    pub proxy_secret: String,
     pub limiter: LoginLimiter,
     pub metrics: Arc<Mutex<MetricsCollector>>,
     /// Live TLS config of the panel listener, for hot-reloading its certificate.

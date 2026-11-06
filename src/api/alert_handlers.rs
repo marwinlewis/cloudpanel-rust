@@ -6,7 +6,7 @@ use crate::auth::AdminUser;
 use crate::db;
 use crate::services::alerts::{self, AlertRules, ChannelConfig};
 use crate::services::panel_cert::{self, PanelTls};
-use crate::services::SslService;
+use crate::services::{NginxService, SslService};
 use crate::state::{blocking, SharedState};
 use crate::validate;
 use axum::{
@@ -151,6 +151,7 @@ pub async fn get_panel_cert(_admin: AdminUser, State(state): State<SharedState>)
         .and_then(|(c, _)| SslService::cert_info(&c.to_string_lossy()));
     let tls_live = state.tls.lock().unwrap_or_else(|e| e.into_inner()).is_some();
     Ok(Json(json!({
+        "url": stored.as_ref().map(|s| format!("https://{}", s.hostname)),
         "hostname": stored.as_ref().map(|s| s.hostname.clone()),
         "managed": stored.is_some(),
         "tls": tls_live,
@@ -174,6 +175,15 @@ pub async fn issue_panel_cert(
 ) -> ApiResult<impl IntoResponse> {
     let host = validate::domain(&p.hostname).map_err(ApiError::BadRequest)?;
     let email = validate::email(&p.email).map_err(ApiError::BadRequest)?;
+    let h = host.clone();
+    let taken = state
+        .db(move |conn| Ok(panel_cert::site_on_hostname(&db::list_sites(conn)?, &h)))
+        .await?;
+    if let Some(site) = taken {
+        return Err(ApiError::Conflict(format!(
+            "The site {site} already answers on {host}. Use a different hostname for the panel."
+        )));
+    }
     if !p.skip_dns_check {
         panel_cert::resolves_here(&host).await.map_err(ApiError::BadRequest)?;
     }
@@ -190,20 +200,31 @@ pub async fn issue_panel_cert(
         cert,
         key,
     };
+    let saved = stored.clone();
+    let name = host.clone();
     state
         .db(move |conn| {
-            db::set_json(conn, panel_cert::SETTING, &stored)?;
-            audit::record(conn, &admin.0, "panel.certificate", Some(&host), None);
+            db::set_json(conn, panel_cert::SETTING, &saved)?;
+            audit::record(conn, &admin.0, "panel.certificate", Some(&name), None);
             Ok(())
         })
         .await?;
-    Ok(Json(json!({
-        "message": if live {
-            "Certificate installed. Reload the page using the new hostname."
-        } else {
-            "Certificate issued. Restart CloudPanel to serve it (the panel currently runs without TLS)."
+    // The certificate is good by now, so a problem here is a warning and not a failure.
+    let config = state.config.clone();
+    let secret = state.proxy_secret.clone();
+    let tls_on = state.tls.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    let vhost = blocking(move || Ok(panel_cert::apply_vhost(&config, &stored, tls_on, &secret))).await?;
+    let message = match (live, vhost) {
+        (true, Ok(())) => format!("Certificate installed. The panel is now at https://{host}"),
+        (false, Ok(())) => format!(
+            "Certificate issued and https://{host} is set up. Restart CloudPanel to serve the certificate on its own port too."
+        ),
+        (_, Err(e)) => {
+            tracing::warn!("could not serve the panel on {host} through nginx: {e}");
+            format!("Certificate installed, but nginx could not serve https://{host}, so use the panel's own port for now: {e}")
         }
-    })))
+    };
+    Ok(Json(json!({ "message": message })))
 }
 
 pub async fn remove_panel_cert(admin: AdminUser, State(state): State<SharedState>) -> ApiResult<impl IntoResponse> {
@@ -217,6 +238,8 @@ pub async fn remove_panel_cert(admin: AdminUser, State(state): State<SharedState
     if let (Some(c), Some(k)) = (state.config.tls_cert.clone(), state.config.tls_key.clone()) {
         let _ = panel_cert::reload(&state, &c, &k).await;
     }
+    let config = state.config.clone();
+    blocking(move || NginxService::remove_panel_vhost(&config).map_err(ApiError::Unprocessable)).await?;
     Ok(Json(
         json!({ "message": "The panel is back on its default certificate" }),
     ))

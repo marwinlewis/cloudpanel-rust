@@ -402,7 +402,93 @@ EOF
   check "a www site is refused when the naked site handles it" '[ "$(code POST /sites "{\"domain\":\"www.taken.test.local\",\"site_type\":\"static\"}")" = 409 ]'
   check "nginx config is valid after all of that" 'nginx -t -q 2>/dev/null'
 
+  panel_hostname
   summary
+}
+
+# Real Let's Encrypt can't run here, so a stored self-signed certificate stands in for one. A
+# restart then takes the same path as upgrading a server that already has a panel hostname.
+panel_hostname() {
+  echo "== The panel's own hostname on port 443"
+  PH=panel.test.local
+  VHOST=/etc/nginx/sites-available/cloudpanel-panel.conf
+  mkdir -p /etc/cloudpanel/tls
+  openssl req -x509 -newkey rsa:2048 -nodes -days 2 -keyout /etc/cloudpanel/tls/e2e.key -out /etc/cloudpanel/tls/e2e.crt \
+    -subj "/CN=$PH" -addext "subjectAltName=DNS:$PH" 2>/dev/null
+  python3 - <<'EOF'
+import json, sqlite3
+c = sqlite3.connect("/var/lib/cloudpanel/cloudpanel.db")
+c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('panel_tls', ?)", (json.dumps(
+    {"hostname": "panel.test.local", "cert": "/etc/cloudpanel/tls/e2e.crt", "key": "/etc/cloudpanel/tls/e2e.key"}),))
+c.commit()
+EOF
+  systemctl restart cloudpanel
+  checkr "upgrading creates the nginx site" '[ -f $VHOST ] && [ -L /etc/nginx/sites-enabled/cloudpanel-panel.conf ]'
+  check "the site holding the secret is root-only" '[ "$(stat -c %a $VHOST)" = 600 ] && [ "$(stat -c %U $VHOST)" = root ]'
+  check "the secret file is root-only" '[ "$(stat -c %a /var/lib/cloudpanel/proxy.secret)" = 600 ]'
+  check "nginx config is valid" 'nginx -t -q 2>/dev/null'
+  MTIME=$(stat -c %Y $VHOST)
+  ph() { curl -sk -m 10 --resolve "$PH:443:127.0.0.1" --resolve "$PH:80:127.0.0.1" "$@"; }
+  checkr "the panel answers at https://hostname" '[ "$(ph -o /dev/null -w "%{http_code}" https://$PH/)" = 200 ]'
+  check "port 443 serves the panel certificate" 'echo | openssl s_client -connect 127.0.0.1:443 -servername $PH 2>/dev/null | openssl x509 -noout -subject | grep -q $PH'
+  check "port 80 redirects to https" '[ "$(ph -o /dev/null -w "%{redirect_url}" "http://$PH/a?b=1")" = "https://$PH/a?b=1" ]'
+  check "renewals can still validate on port 80" 'mkdir -p /var/www/html/.well-known/acme-challenge && echo tok > /var/www/html/.well-known/acme-challenge/p && [ "$(ph http://$PH/.well-known/acme-challenge/p)" = tok ]'
+
+  J2=/var/tmp/proxied.jar
+  rm -f $J2
+  pxy() { # method path [json] [extra curl args]
+    local m=$1 p=$2 d=${3:-}
+    shift
+    shift
+    [ $# -gt 0 ] && shift
+    ph -b $J2 -c $J2 -X "$m" -H 'X-Requested-With: cloudpanel' -H 'Content-Type: application/json' -H "Origin: https://$PH" ${d:+-d "$d"} "$@" "https://$PH/api$p"
+  }
+  PW=$(cat /var/lib/cloudpanel/initial_admin_password)
+  check "signing in works through nginx" 'pxy POST /auth/login "{\"username\":\"admin\",\"password\":\"$PW\"}" | grep -q admin'
+  check "the session cookie is marked Secure" 'pxy POST /auth/login "{\"username\":\"admin\",\"password\":\"$PW\"}" -o /dev/null -D - | grep -i "^set-cookie" | grep -q Secure'
+  check "a signed-in change passes the CSRF check through nginx" 'pxy POST /sites/$PRE/app/restart | grep -q active_state'
+  check "a request from another site is still refused" '[ "$(ph -o /dev/null -w "%{http_code}" -b $J2 -X POST -H "X-Requested-With: cloudpanel" -H "Origin: https://evil.example" https://$PH/api/sites/$PRE/app/restart)" = 400 ]'
+  check "large uploads aren't capped by nginx" 'grep -q "client_max_body_size 0" $VHOST'
+
+  echo "== The client address behind nginx"
+  AUTH=/var/log/cloudpanel/auth.log
+  failed() { # curl args: one failed login
+    curl -sk -m 10 -o /dev/null -X POST -H 'X-Requested-With: cloudpanel' -H 'Content-Type: application/json' \
+      -d '{"username":"e2e-probe","password":"wrong"}' "$@"
+  }
+  : >$AUTH
+  failed --interface 127.0.0.2 --resolve "$PH:443:127.0.0.1" "https://$PH/api/auth/login"
+  checkr "a client behind nginx is logged with its own address" 'grep -q "from 127.0.0.2 " $AUTH'
+  check "and not as the proxy" '! grep -q "from 127.0.0.1 " $AUTH'
+  : >$AUTH
+  failed -H 'X-Real-IP: 203.0.113.9' https://127.0.0.1:8443/api/auth/login
+  checkr "X-Real-IP is ignored without the secret" 'grep -q "from 127.0.0.1 " $AUTH && ! grep -q 203.0.113.9 $AUTH'
+  : >$AUTH
+  failed -H 'X-Real-IP: 203.0.113.9' -H 'X-CloudPanel-Proxy: guessed' https://127.0.0.1:8443/api/auth/login
+  checkr "a wrong secret changes nothing" 'grep -q "from 127.0.0.1 " $AUTH && ! grep -q 203.0.113.9 $AUTH'
+  : >$AUTH
+  failed -H 'X-Real-IP: 203.0.113.9' --resolve "$PH:443:127.0.0.1" --interface 127.0.0.3 "https://$PH/api/auth/login"
+  checkr "a client can't fake its address through nginx" 'grep -q "from 127.0.0.3 " $AUTH && ! grep -q 203.0.113.9 $AUTH'
+  check "a site user can't read the secret" '! runuser -u src-test -- cat $VHOST 2>/dev/null && ! runuser -u src-test -- cat /var/lib/cloudpanel/proxy.secret 2>/dev/null'
+  for _ in 1 2 3 4 5 6; do failed --interface 127.0.0.4 --resolve "$PH:443:127.0.0.1" "https://$PH/api/auth/login"; done
+  check "one client's failures lock out that client" '[ "$(curl -sk -m 10 -o /dev/null -w "%{http_code}" --interface 127.0.0.4 --resolve "$PH:443:127.0.0.1" -X POST -H "X-Requested-With: cloudpanel" -H "Content-Type: application/json" -d "{\"username\":\"e2e-probe\",\"password\":\"wrong\"}" "https://$PH/api/auth/login")" = 429 ]'
+  check "and nobody else" 'pxy POST /auth/login "{\"username\":\"admin\",\"password\":\"$PW\"}" | grep -q admin'
+
+  echo "== Hostname conflicts and removal"
+  check "a site can't take the panel's hostname" '[ "$(code POST /sites "{\"domain\":\"$PH\",\"site_type\":\"static\"}")" = 409 ]'
+  check "the panel can't take a site's hostname" '[ "$(code POST /settings/panel-cert "{\"hostname\":\"src.test.local\",\"email\":\"e2e@example.com\",\"skip_dns_check\":true}")" = 409 ]'
+  check "or the www of one" '[ "$(call GET /sites | j "[x for x in d if x[\"domain\"]==\"src.test.local\"][0][\"include_www\"]")" = True ] && [ "$(code POST /settings/panel-cert "{\"hostname\":\"www.src.test.local\",\"email\":\"e2e@example.com\",\"skip_dns_check\":true}")" = 409 ]'
+  check "the panel reports its address" '[ "$(call GET /settings/panel-cert | j "d[\"url\"]")" = "https://$PH" ]'
+  systemctl restart cloudpanel
+  retry '[ "$(curl -sk -o /dev/null -w "%{http_code}" https://127.0.0.1:8443/)" = 200 ]'
+  check "restarting leaves an unchanged site alone" '[ "$(stat -c %Y $VHOST)" = "$MTIME" ]'
+  R=$(call DELETE /settings/panel-cert)
+  check "switching back removes the nginx site" '[ ! -e $VHOST ] && [ ! -L /etc/nginx/sites-enabled/cloudpanel-panel.conf ]'
+  check "nginx config is valid after removal" 'nginx -t -q 2>/dev/null'
+  rm -f /etc/cloudpanel/tls/e2e.crt /etc/cloudpanel/tls/e2e.key
+  # Back on the panel's default certificate for whatever runs next.
+  systemctl restart cloudpanel
+  retry '[ "$(curl -sk -o /dev/null -w "%{http_code}" https://127.0.0.1:8443/)" = 200 ]'
 }
 
 after_reboot() {

@@ -59,6 +59,12 @@ pub fn provision(config: &Config, conn: &Connection, input: SiteInput) -> ApiRes
     if existing.iter().any(|s| s.domain == domain) {
         return Err(ApiError::Conflict(format!("{domain} already exists")));
     }
+    let panel_hostname = super::panel_cert::load(conn).map(|p| p.hostname);
+    if panel_hostname.as_deref() == Some(domain.as_str()) {
+        return Err(ApiError::Conflict(format!(
+            "{domain} is the control panel's own hostname"
+        )));
+    }
     // www belongs to the naked domain's site unless a separate site already claims it.
     if let Some(naked) = domain.strip_prefix("www.") {
         if existing.iter().any(|s| s.domain == naked && s.include_www) {
@@ -67,7 +73,10 @@ pub fn provision(config: &Config, conn: &Connection, input: SiteInput) -> ApiRes
             )));
         }
     }
-    let www_available = !domain.starts_with("www.") && !existing.iter().any(|s| s.domain == format!("www.{domain}"));
+    let www_name = format!("www.{domain}");
+    let www_available = !domain.starts_with("www.")
+        && !existing.iter().any(|s| s.domain == www_name)
+        && panel_hostname.as_deref() != Some(www_name.as_str());
     let include_www = input.include_www && www_available;
     let www_redirect = include_www && input.www_redirect;
 
