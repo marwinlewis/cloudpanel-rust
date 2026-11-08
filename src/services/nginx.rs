@@ -573,6 +573,11 @@ server {{
     }
 
     pub fn test() -> Result<(), String> {
+        // Tests write vhosts to a temp dir the host's nginx never reads, so its verdict says nothing
+        // about them. It also can't be asked without root where nginx and systemd are installed.
+        if cfg!(test) {
+            return Ok(());
+        }
         // Outside the sandbox: CE's nginx build writes under /usr/share/nginx while it tests its
         // config, which is read-only in here, so the test would fail on a server migrated from CE.
         match run_host_simple("nginx", &["-t", "-q"]) {
@@ -586,6 +591,10 @@ server {{
     }
 
     pub fn reload() -> Result<(), String> {
+        // A test must never reload the nginx of the machine it runs on. See `test`.
+        if cfg!(test) {
+            return Ok(());
+        }
         match run("systemctl", &["reload", "nginx"]) {
             CmdOutcome::Ok(_) => return Ok(()),
             CmdOutcome::Failed(e) => warn!("systemctl reload nginx failed: {e}"),
