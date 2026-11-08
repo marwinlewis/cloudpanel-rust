@@ -6,6 +6,10 @@ A lightweight, self-contained server control panel written in Rust. One static b
 - **Small footprint**: Tokio + Axum + embedded SQLite.
 - **Secure defaults**: HTTPS out of the box, Argon2id passwords, optional TOTP 2FA, role-based access, an audit log, strict input validation and a strict Content-Security-Policy.
 
+![The Overview page, with CPU, memory, disk and network cards, system details, storage and top processes](docs/screenshots/overview.png)
+
+More in [Screenshots](#screenshots).
+
 ## Install on a VPS
 
 Supported: **Debian 11 / 12 / 13** and **Ubuntu 22.04 / 24.04** on amd64 or arm64, on a fresh server with root access.
@@ -106,6 +110,20 @@ sudo cloudpanel user-disable-2fa --username admin
 - **Events**: audit log of sign-ins and every change, with filters and CSV export (kept 90 days).
 - **Alerts**: email (SMTP), Slack, Discord or JSON webhooks for high disk/CPU/memory, expiring certificates, stopped services or apps, failed backups and security events.
 - **Panel certificate**: issue a Let's Encrypt certificate for the panel hostname. It is hot-reloaded and renewed automatically.
+
+## Screenshots
+
+Taken from a real install on a Debian 13 test container, with demo sites and data.
+
+| | |
+| :--- | :--- |
+| **Sites**<br>[![Sites list with type, target and HTTPS status](docs/screenshots/sites.png)](docs/screenshots/sites.png) | **Dark mode**<br>[![Sites list in the dark theme](docs/screenshots/sites-dark.png)](docs/screenshots/sites-dark.png) |
+| **Application**<br>[![PM2 process settings and status for a Node.js site](docs/screenshots/site-application.png)](docs/screenshots/site-application.png) | **File manager**<br>[![File manager in a site's folder](docs/screenshots/site-files.png)](docs/screenshots/site-files.png) |
+| **Databases**<br>[![MariaDB and SQLite databases of a site](docs/screenshots/site-databases.png)](docs/screenshots/site-databases.png) | **Backups**<br>[![Backup schedule and a finished backup](docs/screenshots/site-backups.png)](docs/screenshots/site-backups.png) |
+| **Services**<br>[![System services and site apps with status and memory](docs/screenshots/services.png)](docs/screenshots/services.png) | **Updates**<br>[![Panel release notice and pending package updates](docs/screenshots/updates.png)](docs/screenshots/updates.png) |
+| **Firewall**<br>[![UFW rules and a blocked IP](docs/screenshots/firewall.png)](docs/screenshots/firewall.png) | **Security**<br>[![fail2ban jails and settings](docs/screenshots/security.png)](docs/screenshots/security.png) |
+| **Cron jobs**<br>[![Cron jobs with schedule, user and last run](docs/screenshots/cron.png)](docs/screenshots/cron.png) | **Containers**<br>[![Docker containers with ports, usage and status](docs/screenshots/containers.png)](docs/screenshots/containers.png) |
+| **Events**<br>[![Audit log of sign-ins and changes](docs/screenshots/events.png)](docs/screenshots/events.png) | |
 
 ## Security model
 
