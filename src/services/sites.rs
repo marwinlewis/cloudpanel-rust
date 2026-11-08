@@ -43,7 +43,24 @@ pub fn provision(config: &Config, conn: &Connection, input: SiteInput) -> ApiRes
         _ => None,
     };
 
-    let target_port = if site_type == SiteType::Static {
+    // PHP is chosen when installing the panel. Check before anything is created.
+    let php_version = if site_type == SiteType::Php {
+        if !config.php_enabled {
+            return Err(ApiError::BadRequest(
+                "PHP isn't enabled on this server. Re-run the installer with --with-php to add it.".into(),
+            ));
+        }
+        Some(
+            super::php::installed_versions()
+                .into_iter()
+                .next()
+                .ok_or_else(|| ApiError::Unprocessable("PHP-FPM is not installed on this server".into()))?,
+        )
+    } else {
+        None
+    };
+
+    let target_port = if site_type.has_document_root() {
         None
     } else {
         let port = validate::port(input.target_port).map_err(ApiError::BadRequest)?;
@@ -116,7 +133,7 @@ pub fn provision(config: &Config, conn: &Connection, input: SiteInput) -> ApiRes
         ("cloudpanel".to_string(), None)
     };
 
-    let document_root = if site_type == SiteType::Static {
+    let document_root = if site_type.has_document_root() {
         Some(static_root(
             config,
             &domain,
@@ -142,6 +159,7 @@ pub fn provision(config: &Config, conn: &Connection, input: SiteInput) -> ApiRes
         home_dir: home_dir.as_deref(),
         app_command: app_command.as_deref(),
         app_manager,
+        php_version: php_version.as_deref(),
     };
     let id = db::create_site(conn, &new).map_err(|e| {
         if db::is_unique_violation(&e) {
@@ -155,7 +173,15 @@ pub fn provision(config: &Config, conn: &Connection, input: SiteInput) -> ApiRes
     }
     let mut site = db::find_site_by_id(conn, id)?.ok_or(ApiError::NotFound("Site"))?;
 
-    if let Err(e) = NginxService::write_and_apply(config, &site) {
+    // The pool goes first: nginx must not point at a socket that nothing is listening on yet.
+    let applied = if site_type == SiteType::Php {
+        super::php::apply(&site)
+    } else {
+        Ok(())
+    }
+    .and_then(|()| NginxService::write_and_apply(config, &site));
+    if let Err(e) = applied {
+        let _ = super::php::remove(&site);
         db::delete_site(conn, id)?;
         if home.is_some() {
             let _ = sysusers::delete_user(&system_user, true);
@@ -192,6 +218,9 @@ pub fn deprovision(config: &Config, conn: &Connection, site: &Site, delete_files
         warnings.push(format!("nginx: {e}"));
     }
     apps::remove(config, site);
+    if let Err(e) = super::php::remove(site) {
+        warnings.push(format!("php: {e}"));
+    }
     // Databases go with the files; when files are kept, the databases are kept too
     // (but no longer listed in the panel).
     for d in db::list_databases(conn, Some(site.id))? {

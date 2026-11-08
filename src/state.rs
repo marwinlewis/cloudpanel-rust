@@ -2,9 +2,10 @@ use crate::api::error::{ApiError, ApiResult};
 use crate::auth::LoginLimiter;
 use crate::config::Config;
 use crate::db::DbPool;
+use crate::services::cloudflare::Ranges;
 use crate::services::MetricsCollector;
 use rusqlite::Connection;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 pub struct AppState {
     pub pool: DbPool,
@@ -12,6 +13,10 @@ pub struct AppState {
     pub jwt_secret: Vec<u8>,
     /// Sent by the panel's nginx site, to vouch for the client address it forwards.
     pub proxy_secret: String,
+    /// Where Cloudflare connects from: the only peers that may name a client themselves.
+    pub cloudflare: RwLock<Ranges>,
+    /// The panel is listening on loopback only, so its own port is closed to the outside.
+    pub direct_closed: bool,
     pub limiter: LoginLimiter,
     pub metrics: Arc<Mutex<MetricsCollector>>,
     /// Live TLS config of the panel listener, for hot-reloading its certificate.
@@ -21,6 +26,11 @@ pub struct AppState {
 pub type SharedState = Arc<AppState>;
 
 impl AppState {
+    /// Is this one of the addresses Cloudflare connects from?
+    pub fn is_cloudflare(&self, ip: std::net::IpAddr) -> bool {
+        self.cloudflare.read().unwrap_or_else(|e| e.into_inner()).contains(ip)
+    }
+
     /// Run a database closure on the blocking thread pool.
     pub async fn db<T, F>(&self, f: F) -> ApiResult<T>
     where

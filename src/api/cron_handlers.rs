@@ -70,10 +70,15 @@ fn visible(conn: &Connection, user: &AuthUser) -> ApiResult<Vec<crate::db::model
     if user.is_admin() {
         return Ok(all);
     }
-    let mine = db::user_site_ids(conn, user.id)?;
+    // Only what runs as one of their sites' users. An admin can link a job that runs as anyone to a
+    // site, and being able to run it and read its output would be running commands as that user.
+    let mine = db::list_sites_for_user(conn, user.id)?;
     Ok(all
         .into_iter()
-        .filter(|j| j.site_id.is_some_and(|s| mine.contains(&s)))
+        .filter(|j| {
+            mine.iter()
+                .any(|site| Some(site.id) == j.site_id && site.system_user == j.user)
+        })
         .collect())
 }
 

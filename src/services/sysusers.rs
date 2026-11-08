@@ -229,18 +229,23 @@ pub fn chown_recursive(path: &Path, user: &str, group: &str) -> Result<(), Strin
 }
 
 /// Chown a single path (no recursion, no symlink following).
-pub fn chown_one(path: &Path, user: &str) -> Result<(), String> {
+/// A user's uid and primary gid. None where there are no such accounts (Windows development).
+pub fn ids(user: &str) -> Result<Option<(u32, u32)>, String> {
     if cfg!(windows) {
-        return Ok(());
+        return Ok(None);
     }
-    let p = path.to_string_lossy();
-    run_with(
-        "chown",
-        &["--no-dereference", &format!("{user}:"), "--", &p],
-        &CmdOpts::default(),
-    )
-    .into_result("chown", "chown is not installed")
-    .map(|_| ())
+    let passwd = fs::read_to_string("/etc/passwd").map_err(|e| format!("Cannot read /etc/passwd: {e}"))?;
+    for line in passwd.lines() {
+        let mut f = line.split(':');
+        if f.next() == Some(user) {
+            let uid = f.nth(1).and_then(|v| v.parse().ok());
+            let gid = f.next().and_then(|v| v.parse().ok());
+            if let (Some(u), Some(g)) = (uid, gid) {
+                return Ok(Some((u, g)));
+            }
+        }
+    }
+    Err(format!("System user '{user}' does not exist"))
 }
 
 fn keys_dir(config: &Config) -> PathBuf {

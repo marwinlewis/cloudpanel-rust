@@ -274,7 +274,8 @@ pub fn grant_site(conn: &Connection, user_id: i64, site_id: i64) -> rusqlite::Re
 const SITE_COLS: &str = "id, domain, site_type, target_port, document_root, system_user, include_www, ssl_enabled, \
                          ssl_auto_renew, ssl_cert_path, ssl_key_path, is_active, app_command, app_workdir, app_env, \
                          app_enabled, home_dir, websocket, max_body_mb, custom_directives, basic_auth_enabled, \
-                         basic_auth_allow, created_at, updated_at, app_manager, app_pm2, www_redirect";
+                         basic_auth_allow, created_at, updated_at, app_manager, app_pm2, www_redirect, php_version, \
+                         vhost_managed";
 
 fn site_from_row(row: &Row) -> rusqlite::Result<Site> {
     Ok(Site {
@@ -305,6 +306,8 @@ fn site_from_row(row: &Row) -> rusqlite::Result<Site> {
         app_manager: row.get(24)?,
         app_pm2: row.get(25)?,
         www_redirect: row.get(26)?,
+        php_version: row.get(27)?,
+        vhost_managed: row.get(28)?,
     })
 }
 
@@ -342,6 +345,7 @@ pub struct NewSite<'a> {
     pub home_dir: Option<&'a str>,
     pub app_command: Option<&'a str>,
     pub app_manager: &'a str,
+    pub php_version: Option<&'a str>,
 }
 
 pub fn create_site(conn: &Connection, s: &NewSite) -> rusqlite::Result<i64> {
@@ -349,8 +353,8 @@ pub fn create_site(conn: &Connection, s: &NewSite) -> rusqlite::Result<i64> {
     conn.execute(
         "INSERT INTO sites (domain, site_type, target_port, document_root, system_user, include_www,
                             ssl_enabled, ssl_auto_renew, is_active, home_dir, app_command, created_at, updated_at,
-                            www_redirect, app_manager)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 1, 1, ?7, ?8, ?9, ?9, ?10, ?11)",
+                            www_redirect, app_manager, php_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 1, 1, ?7, ?8, ?9, ?9, ?10, ?11, ?12)",
         params![
             s.domain,
             s.site_type,
@@ -362,7 +366,8 @@ pub fn create_site(conn: &Connection, s: &NewSite) -> rusqlite::Result<i64> {
             s.app_command,
             now,
             s.www_redirect,
-            s.app_manager
+            s.app_manager,
+            s.php_version
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -586,6 +591,15 @@ pub fn firewall_rule_exists(conn: &Connection, r: &NewRule) -> rusqlite::Result<
              AND action = ?4 AND source IS ?5)",
         params![r.port, r.port_end, r.protocol, r.action, r.source],
         |r| r.get(0),
+    )
+}
+
+/// Forget a rule with the same match as `r` but this `action`.
+pub fn delete_firewall_rule_with_action(conn: &Connection, r: &NewRule, action: &str) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM firewall_rules WHERE port IS ?1 AND port_end IS ?2 AND protocol = ?3
+             AND action = ?4 AND source IS ?5",
+        params![r.port, r.port_end, r.protocol, action, r.source],
     )
 }
 
@@ -848,6 +862,10 @@ pub fn list_jobs(conn: &Connection, limit: i64) -> rusqlite::Result<Vec<Job>> {
     let mut stmt = conn.prepare(&format!("SELECT {JOB_COLS} FROM jobs ORDER BY id DESC LIMIT ?1"))?;
     let rows = stmt.query_map(params![limit], job_from_row)?;
     rows.collect()
+}
+
+pub fn running_job_count(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM jobs WHERE status = 'running'", [], |r| r.get(0))
 }
 
 /// Jobs left "running" by a previous process can never finish; mark them failed.

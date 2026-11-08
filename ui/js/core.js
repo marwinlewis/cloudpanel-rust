@@ -329,7 +329,7 @@ export function setActions(...nodes) { $('#page-actions').replaceChildren(...nod
 // ---------- Shared app state ----------
 
 export const state = { user: null, cleanup: null };
-export const hooks = { unauthorized: () => {}, showLogin: () => {}, refreshUser: async () => {} };
+export const hooks = { unauthorized: () => {}, showLogin: () => {}, refreshUser: async () => {}, refreshPanelUpdate: async () => {} };
 export const isAdmin = () => !!(state.user && state.user.role === 'admin');
 
 export function setHost(name) {

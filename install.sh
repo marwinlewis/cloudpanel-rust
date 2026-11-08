@@ -20,6 +20,10 @@
 #   --with-mongodb     Install MongoDB Community from the official mongodb.org repository
 #   --with-sqlite      Enable SQLite site databases (installs the sqlite3 CLI)
 #   --databases LIST   Same as the three flags above, e.g. --databases mariadb,sqlite
+#   --with-php         Enable PHP sites (installs PHP-FPM; asked interactively if not given)
+#   --no-php           Don't enable PHP sites, and don't ask
+#   --no-upgrade       Never upgrade packages that are already installed. Used when migrating,
+#                      as upgrading nginx or PHP would restart what serves the sites.
 #   --no-fail2ban      Don't install fail2ban
 #   --port N           Port for the panel (default: 8443)
 #   --swap-size GB     Create a permanent swap file of this size (0 = no; asked on low-RAM servers)
@@ -43,6 +47,9 @@ WITH_MARIADB=0
 WITH_MONGODB=0
 WITH_SQLITE=0
 DB_CHOSEN=0
+WITH_PHP=0
+PHP_CHOSEN=0
+NO_UPGRADE=0
 NO_FAIL2BAN=0
 NO_FIREWALL=0
 FORCE=0
@@ -99,6 +106,9 @@ CloudPanel installer (Debian 11/12/13, Ubuntu 22.04/24.04)
   --with-mongodb     Install MongoDB Community (mongodb.org repository)
   --with-sqlite      Enable SQLite site databases
   --databases LIST   Comma-separated: mariadb,mongodb,sqlite (asked interactively if omitted)
+  --with-php         Enable PHP sites (installs PHP-FPM; asked interactively if omitted)
+  --no-php           Don't enable PHP sites, and don't ask
+  --no-upgrade       Never upgrade packages that are already installed
   --no-fail2ban      Don't install fail2ban
   --port N           Port for the panel (default: 8443)
   --swap-size GB     Create a permanent swap file of this size (0 = no; asked on low-RAM servers)
@@ -136,6 +146,9 @@ parse_args() {
       --with-mongodb) WITH_MONGODB=1; DB_CHOSEN=1 ;;
       --with-sqlite) WITH_SQLITE=1; DB_CHOSEN=1 ;;
       --databases) set_databases "${2:?--databases needs a value}"; shift ;;
+      --with-php) WITH_PHP=1; PHP_CHOSEN=1 ;;
+      --no-php) WITH_PHP=0; PHP_CHOSEN=1 ;;
+      --no-upgrade) NO_UPGRADE=1 ;;
       --no-fail2ban) NO_FAIL2BAN=1 ;;
       --no-firewall) NO_FIREWALL=1 ;;
       --port) PORT="${2:?--port needs a value}"; PORT_SET=1; shift ;;
@@ -206,7 +219,11 @@ EOF
 }
 
 apt_install() {
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+  local extra=()
+  if [ "$NO_UPGRADE" -eq 1 ]; then
+    extra=(--no-upgrade)
+  fi
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "${extra[@]}" \
     -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"
 }
 
@@ -294,6 +311,48 @@ choose_databases() {
   done
   set_databases "${list#,}"
   [ -n "${list#,}" ] || set_databases none
+}
+
+# Ask whether to enable PHP sites when no flag was given. Re-running keeps the earlier answer.
+choose_php() {
+  if [ "$PHP_CHOSEN" -eq 1 ]; then
+    return
+  fi
+  if [ -f "$ENV_FILE" ] && grep -q '^CLOUDPANEL_PHP=' "$ENV_FILE"; then
+    if grep -q '^CLOUDPANEL_PHP=1' "$ENV_FILE"; then
+      WITH_PHP=1
+    fi
+    PHP_CHOSEN=1
+    return
+  fi
+  local answer=""
+  if { exec 3</dev/tty; } 2>/dev/null; then
+    printf '\n%sEnable PHP sites (WordPress, Laravel, ...)?%s This installs PHP-FPM. [y/N]: ' "$C_BOLD" "$C_RST"
+    read -r answer <&3 || answer=""
+    exec 3<&-
+  fi
+  case "$answer" in
+    [yY]*) WITH_PHP=1 ;;
+  esac
+  PHP_CHOSEN=1
+}
+
+# Debian and Ubuntu's own PHP. A server migrated from CloudPanel CE already has several versions.
+install_php() {
+  local d
+  for d in /etc/php/*/fpm; do
+    if [ -d "$d" ]; then
+      info "PHP-FPM is already installed"
+      return
+    fi
+  done
+  log "Installing PHP-FPM"
+  apt_install php-fpm php-cli php-mysql php-curl php-gd php-mbstring php-xml php-zip php-intl
+  local unit
+  unit=$(systemctl list-unit-files --no-legend 'php*-fpm.service' | awk 'NR==1 {print $1}')
+  if [ -n "$unit" ]; then
+    systemctl enable --now "$unit" >/dev/null 2>&1 || warn "Could not start $unit"
+  fi
 }
 
 db_engines_csv() {
@@ -651,6 +710,11 @@ EOF
   else
     printf 'CLOUDPANEL_DB_ENGINES=%s\n' "$engines" >> "$ENV_FILE"
   fi
+  if grep -q '^CLOUDPANEL_PHP=' "$ENV_FILE"; then
+    sed -i "s|^CLOUDPANEL_PHP=.*|CLOUDPANEL_PHP=${WITH_PHP}|" "$ENV_FILE"
+  else
+    printf 'CLOUDPANEL_PHP=%s\n' "$WITH_PHP" >> "$ENV_FILE"
+  fi
   chmod 600 "$ENV_FILE"
 
   PUBLIC_IP=$(detect_public_ip)
@@ -705,7 +769,7 @@ RestrictRealtime=yes
 LockPersonality=yes
 ReadWritePaths=-/etc/nginx -/etc/cron.d -/etc/letsencrypt -/etc/ufw -/etc/cloudpanel -/etc/fail2ban
 ReadWritePaths=-/etc/systemd/system -/etc/ssh/sshd_config.d -/etc/ssh/cloudpanel_keys -/home -/var/www -/var/backups/cloudpanel
-ReadWritePaths=-/var/log/cloudpanel -/var/lib/cloudpanel
+ReadWritePaths=-/var/log/cloudpanel -/var/lib/cloudpanel -/etc/php
 
 [Install]
 WantedBy=multi-user.target
@@ -780,8 +844,8 @@ uninstall() {
   systemctl daemon-reload
   if [ "$PURGE" -eq 1 ]; then
     rm -rf "$DATA_DIR" "$CONF_DIR"
-    rm -f /etc/cron.d/cloudpanel /etc/nginx/conf.d/cloudpanel-upgrade-map.conf
-    rm -f /etc/ssh/sshd_config.d/cloudpanel.conf /etc/fail2ban/jail.d/cloudpanel.conf /etc/fail2ban/filter.d/cloudpanel.conf
+    rm -f /etc/cron.d/cloudpanel /etc/nginx/conf.d/cloudpanel-upgrade-map.conf /etc/nginx/sites-enabled/cloudpanel-upgrade-map.conf
+    rm -f /etc/ssh/sshd_config.d/cloudpanel.conf /etc/fail2ban/jail.d/cloudpanel.conf /etc/fail2ban/filter.d/cloudpanel.conf /etc/fail2ban/action.d/cloudpanel.conf
     rm -f /etc/letsencrypt/renewal-hooks/deploy/cloudpanel-reload-nginx
     info "Site users, app services (cloudpanel-app-*) and backups in /var/backups/cloudpanel were left in place"
     info "Removed data, configuration and cron jobs"
@@ -802,8 +866,12 @@ main() {
   detect_os
   setup_swap
   choose_databases
+  choose_php
   install_packages
   install_databases
+  if [ "$WITH_PHP" -eq 1 ]; then
+    install_php
+  fi
   if [ "$NO_NODEJS" -eq 0 ]; then
     install_nodejs
   fi

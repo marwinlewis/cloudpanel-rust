@@ -155,29 +155,34 @@ pub fn path_for(site: &Site) -> Option<PathBuf> {
 
 /// Read the site's `.env`, or None if it doesn't exist.
 ///
-/// The panel runs as root and the site user controls this path, so the file must be a
-/// regular file. The descriptor is compared with the path afterwards, so swapping in a link
-/// (say, to `/etc/shadow`) between the check and the open can't leak another file.
+/// The panel runs as root and the site user controls this path, so the file must be a regular file
+/// inside the site's home, and neither a link there nor one swapped in for a folder on the way to
+/// it (say, to another site's working folder) can leak another file.
 pub fn read_site(site: &Site) -> Result<Option<String>, String> {
     let Some(path) = path_for(site) else {
         return Ok(None);
     };
-    let meta = match fs::symlink_metadata(&path) {
-        Ok(m) => m,
+    let home = site.home_dir.as_deref().unwrap_or_default();
+    let confined = crate::fsutil::Confined::open(Path::new(home)).map_err(|e| format!("Cannot read .env: {e}"))?;
+    let rel = path
+        .strip_prefix(home)
+        .map_err(|_| "The working directory must be inside the site's home".to_string())?;
+    let not_a_file = || ".env must be a regular file, not a link or folder".to_string();
+    let at = match confined.pin(rel, false) {
+        Ok(at) => at,
+        // A folder on the way that doesn't exist yet is the same as no file.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("Cannot read .env: {e}")),
     };
-    if !meta.file_type().is_file() {
-        return Err(".env must be a regular file, not a link or folder".into());
+    match at.lstat().map_err(|e| format!("Cannot read .env: {e}"))? {
+        None => return Ok(None),
+        Some(m) if !m.file_type().is_file() => return Err(not_a_file()),
+        Some(m) if m.len() > MAX_ENV_BYTES => {
+            return Err(format!(".env is too large (max {} KB)", MAX_ENV_BYTES / 1024))
+        }
+        Some(_) => {}
     }
-    if meta.len() > MAX_ENV_BYTES {
-        return Err(format!(".env is too large (max {} KB)", MAX_ENV_BYTES / 1024));
-    }
-    let mut file = fs::File::open(&path).map_err(|e| format!("Cannot read .env: {e}"))?;
-    let opened = file.metadata().map_err(|e| format!("Cannot read .env: {e}"))?;
-    if !same_file(&meta, &opened) {
-        return Err(".env changed while it was being read".into());
-    }
+    let mut file = crate::fsutil::open_regular(at.path()).map_err(|_| not_a_file())?;
     let mut bytes = Vec::new();
     file.by_ref()
         .take(MAX_ENV_BYTES + 1)
@@ -194,16 +199,6 @@ pub fn read_site(site: &Site) -> Result<Option<String>, String> {
         .map_err(|_| ".env is not UTF-8 text".to_string())
 }
 
-#[cfg(unix)]
-fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    a.dev() == b.dev() && a.ino() == b.ino()
-}
-#[cfg(not(unix))]
-fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
-    a.len() == b.len()
-}
-
 /// Write the site's `.env`. A new file is created owner and group only, before any content
 /// goes in; an existing file keeps its mode.
 pub fn write_site(site: &Site, content: &str) -> Result<(), String> {
@@ -213,7 +208,7 @@ pub fn write_site(site: &Site, content: &str) -> Result<(), String> {
     let path = path_for(site).ok_or("This site has no home directory")?;
     let home = site.home_dir.as_deref().ok_or("This site has no home directory")?;
     let dir = path.parent().ok_or("Invalid working directory")?;
-    if !dir.is_dir() {
+    if !dir.is_dir() && dir.symlink_metadata().is_err() {
         return Err(format!(
             "The working directory {} does not exist yet; create it or upload your app first",
             dir.display()
@@ -224,6 +219,8 @@ pub fn write_site(site: &Site, content: &str) -> Result<(), String> {
     if rel.is_empty() {
         return Err("The working directory must be inside the site's home".into());
     }
+    // Before anything looks at the file, in case a folder on the way is a link out of the home.
+    sfs.resolve(&rel)?;
     match fs::symlink_metadata(&path) {
         Ok(m) if !m.file_type().is_file() => return Err(".env must be a regular file, not a link or folder".into()),
         Ok(_) => {}

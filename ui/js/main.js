@@ -17,8 +17,25 @@ function buildNav() {
   }
 }
 
+// Marks Services in the sidebar when a new CloudPanel version is out. Looked up on each page
+// change, so a session left open hears about it too; this only reads what the server stored.
+async function refreshPanelUpdate() {
+  if (!isAdmin()) return;
+  let p;
+  try { p = await api('/system/panel-update'); } catch { return; }
+  const link = document.querySelector('.nav a[data-route="services"]');
+  if (!link) return;
+  link.querySelector('.nav-update')?.remove();
+  if (!p.update_available) return;
+  const badge = h('span', { class: 'badge accent nav-update', title: `CloudPanel v${p.latest} is available`, text: 'Update' });
+  badge.addEventListener('click', (e) => { e.preventDefault(); location.hash = '#/services/updates'; });
+  link.append(badge);
+}
+hooks.refreshPanelUpdate = refreshPanelUpdate;
+
 function route() {
   if (!state.user) return;
+  refreshPanelUpdate();
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
   const home = isAdmin() ? 'overview' : 'sites';
   const name = parts[0] || home;

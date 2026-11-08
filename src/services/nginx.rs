@@ -1,4 +1,4 @@
-use super::cmd::{run, CmdOutcome};
+use super::cmd::{run, run_host_simple, CmdOutcome};
 use super::ssl::SslService;
 use crate::config::Config;
 use crate::db::models::{BasicAuthUser, Site};
@@ -19,6 +19,8 @@ pub struct PanelVhost {
     pub key: String,
     pub upstream: String,
     pub secret: String,
+    /// Cloudflare's address ranges, whose connections may name the client.
+    pub real_ip_from: Vec<String>,
 }
 
 const SECURITY_HEADERS: &str = r#"    add_header X-Content-Type-Options "nosniff" always;
@@ -34,6 +36,12 @@ const MAINTENANCE_PAGE: &str = "<!doctype html><meta charset=utf-8><title>Mainte
 <body style=\"font-family:system-ui;display:grid;place-items:center;height:100vh;margin:0\">\
 <p>This site is temporarily unavailable.</p>";
 
+/// nginx runs as a user that's in every site's group, so it can read what those users can't. A link
+/// in one site pointing at another's file would be served unless it has to be the same owner's.
+const SYMLINK_RULE: &str = "disable_symlinks if_not_owner;";
+
+const SYSTEM_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+
 impl NginxService {
     pub fn htpasswd_path(config: &Config, domain: &str) -> PathBuf {
         config.etc_dir.join("htpasswd").join(domain)
@@ -42,6 +50,9 @@ impl NginxService {
     fn location_body(site: &Site) -> String {
         if site.site_type == "static" {
             return "        try_files $uri $uri/ /index.html;".to_string();
+        }
+        if site.site_type == "php" {
+            return "        try_files $uri $uri/ /index.php?$args;".to_string();
         }
         let port = site.target_port.unwrap_or(3000);
         let ws = if site.websocket {
@@ -117,12 +128,32 @@ impl NginxService {
 
         if site.site_type == "static" {
             let root = site.document_root.as_deref().unwrap_or("/var/www/html");
-            out.push_str(&format!("    root {root};\n    index index.html index.htm;\n\n"));
+            out.push_str(&format!(
+                "    root {root};\n    index index.html index.htm;\n    {SYMLINK_RULE}\n\n"
+            ));
+        }
+        if site.site_type == "php" {
+            let root = site.document_root.as_deref().unwrap_or("/var/www/html");
+            out.push_str(&format!(
+                "    root {root};\n    index index.php index.html index.htm;\n    {SYMLINK_RULE}\n\n"
+            ));
         }
         out.push_str("    location / {\n");
         out.push_str(&Self::auth_block(config, site));
         out.push_str(&Self::location_body(site));
         out.push_str("\n    }\n\n    location ~ /\\.(?!well-known) {\n        deny all;\n    }\n");
+        if site.site_type == "php" {
+            // `try_files $uri =404` stops nginx handing a non-PHP upload to PHP as a script.
+            out.push_str(&format!(
+                "\n    location ~ \\.php$ {{\n{auth}        try_files $uri =404;\n        \
+                 include fastcgi_params;\n        \
+                 fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;\n        \
+                 fastcgi_index index.php;\n        fastcgi_read_timeout 300s;\n        \
+                 fastcgi_pass unix:{socket};\n    }}\n",
+                auth = Self::auth_block(config, site),
+                socket = super::php::socket_path(domain),
+            ));
+        }
 
         let custom = site.custom_directives.trim();
         if !custom.is_empty() {
@@ -292,12 +323,31 @@ server {{
         )
     }
 
+    /// Where the shared map has to live for nginx to load it. Debian's `nginx.conf` includes
+    /// `conf.d`, but CloudPanel CE's only includes `sites-enabled/*.conf`, so on a server migrated
+    /// from CE a map in `conf.d` would never load and every vhost using it would fail `nginx -t`.
+    fn upgrade_map_path(config: &Config, nginx_conf: Option<&str>) -> Option<PathBuf> {
+        let root = config.nginx_sites_available.parent()?;
+        let includes_conf_d = nginx_conf.map_or(true, |text| {
+            text.lines()
+                .map(str::trim_start)
+                .any(|l| l.starts_with("include") && l.contains("conf.d/"))
+        });
+        Some(if includes_conf_d {
+            root.join("conf.d").join(UPGRADE_MAP_FILE)
+        } else {
+            config.nginx_sites_enabled.join(UPGRADE_MAP_FILE)
+        })
+    }
+
     fn ensure_upgrade_map(config: &Config) -> Result<(), String> {
-        // conf.d sits next to sites-available on Debian/Ubuntu.
-        let Some(root) = config.nginx_sites_available.parent() else {
+        let nginx_conf = config
+            .nginx_sites_available
+            .parent()
+            .and_then(|root| fs::read_to_string(root.join("nginx.conf")).ok());
+        let Some(path) = Self::upgrade_map_path(config, nginx_conf.as_deref()) else {
             return Ok(());
         };
-        let path = root.join("conf.d").join(UPGRADE_MAP_FILE);
         if path.exists() {
             return Ok(());
         }
@@ -319,7 +369,22 @@ server {{
     /// Write the vhost, validate it with `nginx -t` and reload. On a failed test the
     /// previous config is restored so a bad change can never take nginx down.
     pub fn write_and_apply(config: &Config, site: &Site) -> Result<(), String> {
+        Self::check_vhost_managed(site)?;
         Self::install_vhost(config, &site.domain, &Self::generate_config(config, site), 0o644)
+    }
+
+    /// An imported site's vhost is kept exactly as it is. [`Self::write_and_apply`] enforces this,
+    /// and whatever has side effects on the way there (certbot reloads nginx, for one) should call
+    /// this first, so that nothing has happened by the time the change is refused.
+    pub fn check_vhost_managed(site: &Site) -> Result<(), String> {
+        if site.vhost_managed {
+            return Ok(());
+        }
+        Err(format!(
+            "The nginx config of {domain} was imported from CloudPanel CE and is kept exactly as it is, so this \
+             change can't be applied from the panel. Edit /etc/nginx/sites-enabled/{domain}.conf on the server.",
+            domain = site.domain
+        ))
     }
 
     fn install_vhost(config: &Config, name: &str, content: &str, mode: u32) -> Result<(), String> {
@@ -330,7 +395,9 @@ server {{
         Self::ensure_upgrade_map(config)?;
 
         let (available, enabled) = Self::paths(config, name);
-        let previous = fs::read(&available).ok();
+        // CE keeps vhosts as plain files in sites-enabled, with nothing in sites-available. Without
+        // reading that copy too, a rejected config would delete the site's only vhost below.
+        let previous = fs::read(&available).or_else(|_| fs::read(&enabled)).ok();
         let was_enabled = enabled.symlink_metadata().is_ok();
 
         write_atomic(&available, content.as_bytes(), mode).map_err(|e| format!("Failed to write nginx config: {e}"))?;
@@ -370,7 +437,12 @@ server {{
             key,
             upstream,
             secret,
+            real_ip_from,
         } = tls;
+        let real_ip_from: String = real_ip_from
+            .iter()
+            .map(|cidr| format!("    set_real_ip_from {cidr};\n"))
+            .collect();
         format!(
             r#"# Managed by CloudPanel - changes will be overwritten
 server {{
@@ -405,10 +477,17 @@ server {{
     # The panel enforces its own limits, and backups and uploads can be large.
     client_max_body_size 0;
 
+    # Cloudflare's addresses, kept current by the panel. Only a connection from one of these can
+    # name the client. Anyone else's CF-Connecting-IP is ignored and $remote_addr stays theirs.
+{real_ip_from}    real_ip_header CF-Connecting-IP;
+
     location / {{
         proxy_pass {upstream};
         proxy_http_version 1.1;
-        proxy_ssl_verify off;
+        proxy_ssl_verify on;
+        proxy_ssl_verify_depth 4;
+        proxy_ssl_trusted_certificate {trust};
+        proxy_ssl_name {hostname};
         proxy_set_header Host $host;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
@@ -424,12 +503,37 @@ server {{
 }}
 "#,
             log = config.nginx_log_dir.display(),
+            trust = Self::panel_trust_path(config).display(),
         )
+    }
+
+    /// What nginx will accept as the panel, on the way to it from the panel's nginx site. Its port
+    /// is one anyone on this machine can listen on while the panel is restarting, and nginx would
+    /// send them every session cookie and the secret that vouches for the client's address. They
+    /// don't have a certificate for this name, which the panel's real one is.
+    fn panel_trust_path(config: &Config) -> PathBuf {
+        config.etc_dir.join("panel-upstream-trust.pem")
+    }
+
+    /// The public CAs, for a certificate from Let's Encrypt, which then renews without this
+    /// changing, plus the panel's own, for one that is self-signed.
+    fn write_panel_trust(config: &Config, cert: &str) -> Result<(), String> {
+        let mut trust = fs::read(cert).map_err(|e| format!("Failed to read {cert}: {e}"))?;
+        trust.push(b'\n');
+        if let Ok(public) = fs::read(SYSTEM_CA_BUNDLE) {
+            trust.extend_from_slice(&public);
+        }
+        let path = Self::panel_trust_path(config);
+        if fs::read(&path).is_ok_and(|current| current == trust) {
+            return Ok(());
+        }
+        write_atomic(&path, &trust, 0o644).map_err(|e| format!("Failed to write {}: {e}", path.display()))
     }
 
     /// Bring the panel's nginx site in line. It stays untouched when nothing changed, so a
     /// panel restart doesn't reload nginx for no reason.
     pub fn apply_panel_vhost(config: &Config, tls: &PanelVhost) -> Result<(), String> {
+        Self::write_panel_trust(config, &tls.cert)?;
         let content = Self::render_panel_vhost(config, tls);
         let (available, enabled) = Self::paths(config, PANEL_VHOST);
         let current = fs::read_to_string(&available).ok();
@@ -462,11 +566,16 @@ server {{
 
     /// Current vhost file content (for the read-only vhost viewer).
     pub fn read_vhost(config: &Config, domain: &str) -> Option<String> {
-        fs::read_to_string(Self::paths(config, domain).0).ok()
+        let (available, enabled) = Self::paths(config, domain);
+        fs::read_to_string(available)
+            .or_else(|_| fs::read_to_string(enabled))
+            .ok()
     }
 
     pub fn test() -> Result<(), String> {
-        match run("nginx", &["-t", "-q"]) {
+        // Outside the sandbox: CE's nginx build writes under /usr/share/nginx while it tests its
+        // config, which is read-only in here, so the test would fail on a server migrated from CE.
+        match run_host_simple("nginx", &["-t", "-q"]) {
             CmdOutcome::Ok(_) => Ok(()),
             CmdOutcome::Failed(e) => Err(format!("nginx configuration test failed: {e}")),
             CmdOutcome::Missing => {
@@ -482,7 +591,7 @@ server {{
             CmdOutcome::Failed(e) => warn!("systemctl reload nginx failed: {e}"),
             CmdOutcome::Missing => {}
         }
-        match run("nginx", &["-s", "reload"]) {
+        match run_host_simple("nginx", &["-s", "reload"]) {
             CmdOutcome::Ok(_) => Ok(()),
             CmdOutcome::Failed(e) => Err(format!("nginx reload failed: {e}")),
             CmdOutcome::Missing => Ok(()),
@@ -521,6 +630,8 @@ pub(crate) fn test_site(site_type: &str) -> Site {
         app_manager: "systemd".into(),
         app_pm2: "{}".into(),
         www_redirect: false,
+        php_version: None,
+        vhost_managed: true,
     }
 }
 
@@ -623,6 +734,7 @@ mod tests {
                 key: "/etc/letsencrypt/live/cpanel.example.com/privkey.pem".into(),
                 upstream: "https://127.0.0.1:8443".into(),
                 secret: "s3cret".into(),
+                real_ip_from: vec!["173.245.48.0/20".into(), "2606:4700::/32".into()],
             },
         );
         assert!(c.contains("listen 443 ssl http2;"));
@@ -632,9 +744,70 @@ mod tests {
         assert!(c.contains("proxy_set_header Host $host;"));
         assert!(c.contains("proxy_set_header X-Real-IP $remote_addr;"));
         assert!(c.contains("proxy_set_header X-CloudPanel-Proxy \"s3cret\";"));
+        // Cloudflare's connections can name the client, which reaches the panel through
+        // $remote_addr. The header itself must never be copied across, or anyone could set it.
+        let https = &c[c.find("listen 443").unwrap()..];
+        assert!(https.contains("    set_real_ip_from 173.245.48.0/20;\n    set_real_ip_from 2606:4700::/32;\n"));
+        assert!(https.contains("    real_ip_header CF-Connecting-IP;\n"));
+        assert_eq!(c.matches("set_real_ip_from").count(), 2);
+        assert!(!c.contains("$http_cf_connecting_ip"));
         // Port 80 can still validate certificate renewals.
         assert!(c.contains("acme-challenge"));
         assert!(c.contains("return 301 https://cpanel.example.com$request_uri;"));
+    }
+
+    #[test]
+    fn php_config_passes_scripts_to_the_sites_own_pool() {
+        let mut s = test_site("php");
+        s.document_root = Some("/home/shop/htdocs/app.example.com".into());
+        s.php_version = Some("8.4".into());
+        let c = NginxService::generate_config(&cfg(), &s);
+        assert!(c.contains("root /home/shop/htdocs/app.example.com;"));
+        assert!(c.contains("index index.php"));
+        assert!(c.contains("try_files $uri $uri/ /index.php?$args;"));
+        assert!(c.contains("fastcgi_pass unix:/run/php/cloudpanel-app.example.com.sock;"));
+        assert!(c.contains("try_files $uri =404;"));
+        assert!(!c.contains("proxy_pass"));
+    }
+
+    #[test]
+    fn php_scripts_stay_behind_basic_auth() {
+        let mut s = test_site("php");
+        s.basic_auth_enabled = true;
+        let c = NginxService::generate_config(&cfg(), &s);
+        let php = &c[c.find("location ~ \\.php$").unwrap()..];
+        assert!(php.contains("auth_basic \"Restricted\";"));
+    }
+
+    #[test]
+    fn imported_vhost_is_never_regenerated() {
+        let mut s = test_site("nodejs");
+        s.vhost_managed = false;
+        let e = NginxService::write_and_apply(&cfg(), &s).unwrap_err();
+        assert!(e.contains("imported from CloudPanel CE"));
+    }
+
+    #[test]
+    fn upgrade_map_goes_where_nginx_will_load_it() {
+        let c = cfg();
+        let debian = "http {\n    include /etc/nginx/conf.d/*.conf;\n    include /etc/nginx/sites-enabled/*;\n}\n";
+        let ce = "http {\n    include /etc/nginx/mime.types;\n    include /etc/nginx/sites-enabled/*.conf;\n}\n";
+        let commented =
+            "http {\n    # include /etc/nginx/conf.d/*.conf;\n    include /etc/nginx/sites-enabled/*.conf;\n}\n";
+        let in_conf_d = |text| {
+            NginxService::upgrade_map_path(&c, text)
+                .unwrap()
+                .parent()
+                .unwrap()
+                .ends_with("conf.d")
+        };
+        assert!(in_conf_d(Some(debian)));
+        assert!(!in_conf_d(Some(ce)));
+        assert!(!in_conf_d(Some(commented)));
+        // Can't read nginx.conf: keep the long-standing location.
+        assert!(in_conf_d(None));
+        let path = NginxService::upgrade_map_path(&c, Some(ce)).unwrap();
+        assert!(path.to_string_lossy().ends_with(".conf"), "CE only includes *.conf");
     }
 
     #[test]

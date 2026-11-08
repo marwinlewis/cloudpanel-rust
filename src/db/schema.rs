@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS sites (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     domain TEXT NOT NULL UNIQUE,
-    site_type TEXT NOT NULL, -- 'nodejs', 'python', 'static', 'docker_proxy', 'reverse_proxy'
+    site_type TEXT NOT NULL, -- 'nodejs', 'python', 'static', 'php', 'docker_proxy', 'reverse_proxy'
     target_port INTEGER,
     document_root TEXT,
     system_user TEXT NOT NULL DEFAULT 'cloudpanel',
@@ -220,5 +220,11 @@ pub const MIGRATIONS: &[&str] = &[
     ALTER TABLE sites ADD COLUMN app_manager TEXT NOT NULL DEFAULT 'systemd';
     ALTER TABLE sites ADD COLUMN app_pm2 TEXT NOT NULL DEFAULT '{}';
     ALTER TABLE sites ADD COLUMN www_redirect BOOLEAN NOT NULL DEFAULT 0;
+    "#,
+    // 7: PHP sites, and sites imported from CloudPanel CE, whose nginx config the panel must not
+    // regenerate because it can't reproduce what CE wrote.
+    r#"
+    ALTER TABLE sites ADD COLUMN php_version TEXT;
+    ALTER TABLE sites ADD COLUMN vhost_managed BOOLEAN NOT NULL DEFAULT 1;
     "#,
 ];

@@ -5,7 +5,7 @@ use crate::authz::{require_admin, require_site, visible_sites};
 use crate::config::Config;
 use crate::db::{self, models::Site, models::SiteType};
 use crate::services::sites::{deprovision, provision, www_choice, SiteInput};
-use crate::services::{apps, pm2, runtimes, NginxService, SslService};
+use crate::services::{apps, php, pm2, runtimes, NginxService, SslService};
 use crate::state::SharedState;
 use crate::validate;
 use axum::{
@@ -53,6 +53,18 @@ pub fn apply_site(config: &Config, conn: &Connection, previous: &Site, site: &Si
 
 pub async fn get_sites(user: AuthUser, State(state): State<SharedState>) -> ApiResult<impl IntoResponse> {
     Ok(Json(state.db(move |conn| visible_sites(conn, &user)).await?))
+}
+
+/// What the "Add site" form may offer on this server.
+pub async fn site_options(_user: AuthUser, State(state): State<SharedState>) -> ApiResult<impl IntoResponse> {
+    let php_versions = if state.config.php_enabled {
+        php::installed_versions()
+    } else {
+        Vec::new()
+    };
+    Ok(Json(
+        json!({ "php_enabled": !php_versions.is_empty(), "php_versions": php_versions }),
+    ))
 }
 
 pub async fn create_new_site(
@@ -176,8 +188,11 @@ pub async fn update_site(
             let previous = require_site(conn, &user, id)?;
             let mut site = previous.clone();
             if let Some(port) = p.target_port {
-                if site.site_type == "static" {
-                    return Err(ApiError::BadRequest("Static sites have no app port".into()));
+                if site.kind().is_some_and(|k| k.has_document_root()) {
+                    return Err(ApiError::BadRequest(format!(
+                        "{} sites have no app port",
+                        if site.site_type == "php" { "PHP" } else { "Static" }
+                    )));
                 }
                 let port = validate::port(Some(port)).map_err(ApiError::BadRequest)?;
                 if Some(port) == config.panel_port() {
@@ -209,8 +224,10 @@ pub async fn update_site(
                 site.max_body_mb = mb;
             }
             if let Some(root) = p.document_root.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
-                if site.site_type != "static" {
-                    return Err(ApiError::BadRequest("Only static sites have a document root".into()));
+                if !site.kind().is_some_and(|k| k.has_document_root()) {
+                    return Err(ApiError::BadRequest(
+                        "Only static and PHP sites have a document root".into(),
+                    ));
                 }
                 let base = site
                     .home_dir
@@ -218,7 +235,17 @@ pub async fn update_site(
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| validate::absolute(&config.sites_dir));
                 let path = validate::path_within(root, &base).map_err(ApiError::BadRequest)?;
-                std::fs::create_dir_all(&path).map_err(ApiError::internal)?;
+                // Through the links in it, this has to stay inside. The site's user can set those
+                // up, and nginx can read what they can't.
+                std::fs::create_dir_all(&base).map_err(ApiError::internal)?;
+                let base = validate::absolute(&base);
+                let rel = path
+                    .strip_prefix(&base)
+                    .map_err(|_| ApiError::BadRequest("The document root must be inside the site".into()))?;
+                let owner = crate::services::sysusers::ids(&site.system_user).ok().flatten();
+                crate::fsutil::Confined::open(&base)
+                    .and_then(|home| home.mkdir_all(rel, owner))
+                    .map_err(|e| ApiError::BadRequest(format!("The document root can't be used: {e}")))?;
                 site.document_root = Some(crate::services::sites::display_path(&path));
             }
             apply_site(&config, conn, &previous, &site)?;
@@ -278,6 +305,7 @@ pub async fn setup_site_ssl(
     let (site, warning) = state
         .db(move |conn| {
             let mut site = require_site(conn, &user, id)?;
+            NginxService::check_vhost_managed(&site).map_err(ApiError::Unprocessable)?;
             // Re-validate the stored domain before it reaches certbot or the filesystem.
             let domain = validate::domain(&site.domain).map_err(ApiError::BadRequest)?;
             let mut warning = None;
@@ -511,6 +539,7 @@ pub async fn set_basic_auth(
     let site = state
         .db(move |conn| {
             let previous = require_site(conn, &user, id)?;
+            NginxService::check_vhost_managed(&previous).map_err(ApiError::Unprocessable)?;
             let users = db::list_basic_auth_users(conn, id)?;
             if p.enabled && users.is_empty() {
                 return Err(ApiError::BadRequest(
@@ -564,6 +593,8 @@ pub async fn add_basic_auth_user(
     state
         .db(move |conn| {
             let site = require_site(conn, &user, id)?;
+            // It would report success and do nothing, as nginx wouldn't be told to use the file.
+            NginxService::check_vhost_managed(&site).map_err(ApiError::Unprocessable)?;
             db::upsert_basic_auth_user(conn, id, &username, &hash)?;
             NginxService::write_htpasswd(&config, &site.domain, &db::list_basic_auth_users(conn, id)?)
                 .map_err(ApiError::internal)?;
@@ -583,6 +614,7 @@ pub async fn delete_basic_auth_user(
     state
         .db(move |conn| {
             let previous = require_site(conn, &user, id)?;
+            NginxService::check_vhost_managed(&previous).map_err(ApiError::Unprocessable)?;
             if !db::delete_basic_auth_user(conn, id, uid)? {
                 return Err(ApiError::NotFound("User"));
             }

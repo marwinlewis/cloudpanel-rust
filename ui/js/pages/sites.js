@@ -10,10 +10,13 @@ export const SITE_TYPES = {
   nodejs: { label: 'Node.js', desc: 'Next.js, Express, Nuxt', cmd: 'npm start' },
   python: { label: 'Python', desc: 'FastAPI, Django, Flask', cmd: '.venv/bin/gunicorn -b 127.0.0.1:$PORT app:app' },
   static: { label: 'Static', desc: 'HTML, Vite, SPA builds' },
+  php: { label: 'PHP', desc: 'WordPress, Laravel, any PHP app' },
   reverse_proxy: { label: 'Reverse proxy', desc: 'Any local HTTP service' },
   docker_proxy: { label: 'Docker', desc: 'Container port' },
 };
 const HAS_APP = new Set(['nodejs', 'python', 'reverse_proxy']);
+/** Site types nginx serves from a document root, so they have no app port. */
+const HAS_ROOT = new Set(['static', 'php']);
 
 export const WWW_OPTIONS = [
   ['redirect', 'Redirect www to the naked domain (recommended)'],
@@ -96,7 +99,7 @@ export function renderSites(view, params) {
           h('div', { class: 'cell-title' }, h('a', { href: `#/sites/${s.id}`, text: s.domain })),
           s.include_www && h('div', { class: 'cell-sub', text: wwwLabel(s) })),
         h('td', null, h('span', { class: 'badge', text: t.label })),
-        h('td', { class: 'hide-sm mono muted truncate', text: s.site_type === 'static' ? (s.document_root || '') : `127.0.0.1:${s.target_port}` }),
+        h('td', { class: 'hide-sm mono muted truncate', text: HAS_ROOT.has(s.site_type) ? (s.document_root || '') : `127.0.0.1:${s.target_port}` }),
         h('td', null, statusBadge(s)),
         h('td', { class: 'hide-sm muted nowrap', title: fmtDate(s.created_at), text: fmtAgo(s.created_at) }),
         h('td', { class: 'actions' }, moreButton(items)));
@@ -115,9 +118,13 @@ export function renderSites(view, params) {
   load();
 }
 
-function addSiteDialog(done) {
+async function addSiteDialog(done) {
+  // PHP is chosen when installing the panel, so only offer it where it's there. If this can't be
+  // read, the form still works for everything else.
+  const options = await api('/sites/options').catch(() => ({ php_enabled: false }));
+  const types = ['nodejs', 'python', 'static', ...(options.php_enabled ? ['php'] : []), 'reverse_proxy'];
   const typeGroup = h('div', { class: 'segmented', role: 'radiogroup', 'aria-label': 'Site type' },
-    ['nodejs', 'python', 'static', 'reverse_proxy'].map((k, i) => h('label', null,
+    types.map((k, i) => h('label', null,
       h('input', { type: 'radio', name: 'site_type', value: k, checked: i === 0 }),
       h('strong', { text: SITE_TYPES[k].label }), h('span', { text: SITE_TYPES[k].desc }))));
   const portField = field({ label: 'App port', name: 'target_port', type: 'number', placeholder: '3000', validate: 'port', hint: 'The port your app listens on at 127.0.0.1 (exposed to it as $PORT).', attrs: { min: 1, max: 65535, inputmode: 'numeric' } });
@@ -126,7 +133,7 @@ function addSiteDialog(done) {
 
   typeGroup.addEventListener('change', () => {
     const t = typeGroup.querySelector('input:checked').value;
-    portField.hidden = t === 'static';
+    portField.hidden = HAS_ROOT.has(t);
     cmdField.hidden = !HAS_APP.has(t);
     cmdField.querySelector('input').placeholder = SITE_TYPES[t].cmd || 'e.g. ./server --port $PORT';
   });
@@ -144,7 +151,7 @@ function addSiteDialog(done) {
     ],
     async onSubmit(d) {
       const body = { domain: d.domain.toLowerCase(), site_type: d.site_type, ...wwwBody(d.www) };
-      if (d.site_type !== 'static') body.target_port = Number(d.target_port);
+      if (!HAS_ROOT.has(d.site_type)) body.target_port = Number(d.target_port);
       if (d.app_command && HAS_APP.has(d.site_type)) body.app_command = d.app_command;
       if (d.system_user) body.system_user = d.system_user;
       const site = await api('/sites', { method: 'POST', body });
@@ -256,6 +263,7 @@ function tabOverview(el, { site }) {
     card({
       title: 'Site', body: kv([
         ['Domain', site.domain], site.include_www && [site.www_redirect ? 'Redirect' : 'Alias', wwwLabel(site)], ['Type', t.label],
+        site.php_version && ['PHP', site.php_version],
         site.target_port && ['App port', `127.0.0.1:${site.target_port}`],
         site.document_root && ['Document root', h('span', { class: 'mono', text: site.document_root })],
         ['Site user', h('span', { class: 'mono', text: site.system_user })],
@@ -586,17 +594,17 @@ function keysDialog(site, u, done) {
 
 function tabSsl(el, { site, reload }) {
   const cert = site.certificate;
-  const install = h('button', { class: 'btn primary' }, icon('lock'), site.ssl_enabled ? 'Replace certificate' : 'Enable HTTPS');
+  const install = h('button', { class: 'btn primary', hidden: !site.vhost_managed }, icon('lock'), site.ssl_enabled ? 'Replace certificate' : 'Enable HTTPS');
   install.addEventListener('click', () => sslDialog(site, reload));
   const renew = h('button', { class: 'btn', hidden: !site.certificate_managed }, icon('refresh'), 'Renew now');
   renew.addEventListener('click', () => withBusy(renew, async () => { await api(`/sites/${site.id}/ssl/renew`, { method: 'POST' }); toast('Certificate renewed'); reload(); }));
-  const remove = h('button', { class: 'btn danger', hidden: !site.ssl_enabled }, icon('unlock'), 'Disable HTTPS');
+  const remove = h('button', { class: 'btn danger', hidden: !site.ssl_enabled || !site.vhost_managed }, icon('unlock'), 'Disable HTTPS');
   remove.addEventListener('click', async () => {
     if (!(await confirmDialog({ title: 'Disable HTTPS?', message: 'The site will be served over plain HTTP. The certificate files are kept.', confirmText: 'Disable HTTPS', danger: true }))) return;
     await withBusy(remove, async () => { await api(`/sites/${site.id}/ssl`, { method: 'DELETE' }); toast('HTTPS disabled'); reload(); });
   });
   el.append(card({
-    title: 'HTTPS', sub: site.certificate_managed ? 'Let’s Encrypt certificates renew automatically via certbot.' : '',
+    title: 'HTTPS', sub: !site.vhost_managed ? 'Imported from CloudPanel CE. Its Let’s Encrypt certificates keep renewing through CE’s nightly job.' : site.certificate_managed ? 'Let’s Encrypt certificates renew automatically via certbot.' : '',
     body: h('div', { class: 'form' },
       cert ? kv([['Issuer', cert.issuer], ['Names', cert.names.join(', ') || cert.subject], ['Valid from', fmtDate(cert.not_before)], ['Expires', `${fmtDate(cert.not_after)} (${cert.days_left} days)`], ['Certificate', h('span', { class: 'mono small', text: site.ssl_cert_path })]])
         : h('p', { class: 'muted', text: 'No certificate is installed. Visitors connect over HTTP.' }),
@@ -663,13 +671,14 @@ function wwwCertWarning(site, reload) {
 
 function tabSettings(el, { site, reload }) {
   const general = h('form', { class: 'form', novalidate: true },
-    site.site_type !== 'static' && field({ label: 'App port', name: 'target_port', type: 'number', value: site.target_port, validate: 'port' }),
-    site.site_type === 'static' && field({ label: 'Document root', name: 'document_root', value: site.document_root || '', validate: 'optionalPath', attrs: { class: 'input mono' } }),
+    !site.vhost_managed && h('div', { class: 'alert warn' }, icon('alert'), h('div', { text: `This site was imported from CloudPanel CE. Its nginx config is kept exactly as it was, so these settings can’t be changed here. Edit /etc/nginx/sites-enabled/${site.domain}.conf on the server instead.` })),
+    !HAS_ROOT.has(site.site_type) && field({ label: 'App port', name: 'target_port', type: 'number', value: site.target_port, validate: 'port' }),
+    HAS_ROOT.has(site.site_type) && field({ label: 'Document root', name: 'document_root', value: site.document_root || '', validate: 'optionalPath', attrs: { class: 'input mono' } }),
     field({ label: 'Upload limit (MB)', name: 'max_body_mb', type: 'number', value: site.max_body_mb, hint: 'nginx client_max_body_size.', attrs: { min: 1, max: 10240 } }),
     !site.domain.startsWith('www.') && selectField({ label: `www.${site.domain}`, name: 'www', options: WWW_OPTIONS, value: wwwMode(site) }),
     wwwCertWarning(site, reload),
-    site.site_type !== 'static' && h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'websocket', checked: site.websocket }), 'WebSocket support'),
-    h('div', null, h('button', { class: 'btn primary', type: 'submit', text: 'Save' })));
+    !HAS_ROOT.has(site.site_type) && h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'websocket', checked: site.websocket }), 'WebSocket support'),
+    site.vhost_managed && h('div', null, h('button', { class: 'btn primary', type: 'submit', text: 'Save' })));
   general.addEventListener('submit', async (e) => {
     e.preventDefault();
     const f = general.elements;
@@ -702,6 +711,15 @@ function tabSettings(el, { site, reload }) {
     await api(`/sites/${site.id}/basic-auth`, { method: 'PUT', body: { enabled: authEnabled.checked, allow: allow.value.split('\n').map((x) => x.trim()).filter(Boolean) } });
     toast('Password protection saved'); reload();
   }));
+
+  // An imported site's settings live in its nginx config. Show them, but don't offer to change them.
+  if (!site.vhost_managed) {
+    general.querySelectorAll('input, select').forEach((e) => { e.disabled = true; });
+    const imported = h('pre', { class: 'logs mono tall', text: 'Loading…' });
+    api(`/sites/${site.id}/vhost`).then((r) => { imported.textContent = r.vhost; }).catch((e) => { imported.textContent = e.message; });
+    el.append(card({ title: 'General', body: general }), card({ title: 'nginx config', sub: 'As imported from CloudPanel CE.', body: imported }));
+    return;
+  }
 
   const cards = [
     card({ title: 'General', body: general }),

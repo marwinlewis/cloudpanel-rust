@@ -35,5 +35,6 @@ git ls-files -z --cached --others --exclude-standard \
         [ -n "$files" ] || { echo "no UI JavaScript files found"; exit 1; }
         for f in $files; do node --check "$f"; done
         step shellcheck install.sh
+        step shellcheck -S warning scripts/debian-e2e/security.sh
         echo; echo "All CI checks passed."
       '

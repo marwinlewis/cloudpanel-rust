@@ -44,6 +44,9 @@ Then open `https://<server-ip>:8443`. Your browser will warn about the self-sign
 | `--with-mongodb` | Install MongoDB Community (8.0; 7.0 on Debian 11; amd64 only on Debian) |
 | `--with-sqlite` | Enable SQLite site databases |
 | `--databases LIST` | Comma-separated `mariadb,mongodb,sqlite` (skips the question) |
+| `--with-php` | Enable PHP sites and install PHP-FPM (asked if you're at a terminal; off otherwise) |
+| `--no-php` | Don't enable PHP sites, and don't ask |
+| `--no-upgrade` | Never upgrade packages that are already installed |
 | `--no-fail2ban` | Don't install fail2ban |
 | `--port N` | Panel port (default `8443`) |
 | `--no-firewall` | Don't touch UFW |
@@ -57,6 +60,10 @@ Pass flags after `bash -s --`, e.g. `... | sudo bash -s -- --port 9443`.
 
 Run the same install command again. It replaces the binary, restarts the service, and keeps your data, secrets and certificate. Adding `--with-mariadb` / `--with-mongodb` / `--with-sqlite` installs and enables that engine.
 
+### Moving from CloudPanel CE
+
+`migrate-from-ce.sh` moves a server from CloudPanel CE to this panel in place, without restarting what serves its sites, and can go back at any time. See [Migrating from CloudPanel CE](docs/migrating-from-cloudpanel-ce.md).
+
 ### Forgot the admin password or lost your 2FA device?
 
 ```bash
@@ -67,7 +74,7 @@ sudo cloudpanel user-disable-2fa --username admin
 ## Features
 
 **Sites**
-- Node.js, Python, static sites, generic reverse proxies and Docker proxies, each with its own nginx vhost.
+- Node.js, Python, static sites, generic reverse proxies and Docker proxies, each with its own nginx vhost. PHP sites too, if you enable PHP when installing, each with its own PHP-FPM pool running as the site user.
 - Every site gets its own **Linux user** and home (`/home/<user>/htdocs/<domain>`). nginx reads static files through the site group.
 - **App process manager**: apps run as the site user with auto-restart, start/stop/restart, live output and a hardened systemd unit (`cloudpanel-app-<domain>`) that brings them back at boot. Node.js sites choose per site between **PM2** (the default for new sites) and plain **systemd**; other app types use systemd.
   - **PM2** adds zero-downtime reload, cluster mode, a memory limit, scheduled restarts, per-process status and log rotation, and uses `ecosystem.config.{js,cjs}` when the working directory has one. Each site user has their own daemon in `~/.pm2`, so `pm2 ls` over SSH shows what the panel shows. A daemon started by hand can be taken over.
@@ -85,7 +92,9 @@ sudo cloudpanel user-disable-2fa --username admin
 **Server**
 - **Services**: status and memory of nginx, SSH, cron, fail2ban, Docker, MariaDB/MySQL, MongoDB, UFW and site apps. Start, stop, restart and reload them, and read their journal.
 - **Updates**: check for apt updates (security updates are flagged), install them all, and see when a reboot is required. You can reboot from the panel.
-- **Firewall**: UFW port and port-range rules, optionally limited to a source IP/CIDR, and an IP block list. Rules that would block SSH or the panel for your own address are refused.
+- **CloudPanel updates**: the panel looks for a new release daily, and you can check any time under *Services → Updates*. A new version is flagged in the sidebar and sent once to your notification channels, along with the command that installs it.
+- **Firewall**: UFW port and port-range rules, optionally limited to a source IP/CIDR, and an IP block list. Rules that would block SSH or the panel for your own address are refused. The most specific rule wins whatever order you add them in: rules naming a source come first, then denies for everyone, then allows for everyone.
+- **Panel hostname**: give the panel its own hostname to open it at `https://<hostname>`. You can then close its port in *Settings → Panel certificate*, from a session on that hostname, so that it only listens on loopback. If the hostname can't be served, the port opens again on the next start; otherwise reach it with `ssh -L 8443:127.0.0.1:8443` or reopen it with `cloudpanel panel-access-open`.
 - **Security**: fail2ban jails for SSH and the panel login, with ban time, retries, an ignore list, ban/unban and live status.
 - **Cron**: create, edit, pause and run jobs now. Every run's exit code and output are recorded, and jobs can be tied to a site and run as its user.
 - **Containers**: list, start/stop/restart, logs, stats and removal. Run new containers from a form (ports are bound to 127.0.0.1 by default), manage images (pull/remove/prune), handle Docker Compose stacks, and expose a container on a domain.
@@ -103,7 +112,7 @@ sudo cloudpanel user-disable-2fa --username admin
 | Area | What CloudPanel does |
 | :--- | :--- |
 | Transport | Serves HTTPS natively (rustls). HSTS when TLS is on. The panel certificate can be swapped for Let's Encrypt without a restart. |
-| Authentication | Argon2id password hashes and constant-time handling of unknown users. Optional TOTP 2FA with single-use recovery codes. Per-IP lockout after 5 failed logins in 15 minutes, plus fail2ban on `/var/log/cloudpanel/auth.log`. |
+| Authentication | Argon2id password hashes and constant-time handling of unknown users. Optional TOTP 2FA with single-use recovery codes. Per-IP lockout after 5 failed logins in 15 minutes, plus fail2ban on `/var/log/cloudpanel/auth.log`. A ban from the panel's jail is enforced by the panel rather than the firewall, so the client is refused on the hostname and on the panel's own port, directly or through Cloudflare, while hosted sites stay reachable. A Cloudflare address is never banned. |
 | Sessions | HS256 JWT in an `HttpOnly; Secure; SameSite=Strict` cookie, 12-hour lifetime. The signing key is random per install. Changing the password or role, or choosing "Sign out everywhere", revokes all tokens. The token between the password and 2FA steps is short-lived and can never be used as a session. |
 | Authorization | Admins manage the server. Site managers can only reach assigned sites; other sites answer 404. Custom nginx directives, Docker, services, firewall and users are admin-only. |
 | CSRF | State-changing requests need a custom header and a same-origin `Origin`/`Sec-Fetch-Site`. No CORS. |
@@ -112,6 +121,7 @@ sudo cloudpanel user-disable-2fa --username admin
 | Secrets | Database and SSH passwords are never stored. S3 keys, SMTP passwords and webhook URLs are encrypted with ChaCha20-Poly1305 using a key in `/etc/cloudpanel/secret.key` (mode 600). |
 | Browser | Strict CSP (`default-src 'self'`, no inline scripts or styles), `X-Frame-Options: DENY` and `nosniff`. The UI never inserts server data as HTML; the 2FA QR code is drawn from a module matrix. |
 | Audit | Sign-ins (including failures) and every change are recorded with user, IP and time. |
+| Behind Cloudflare | On the panel's hostname and its own port, `CF-Connecting-IP` names the client only on a connection from Cloudflare's published address ranges. Anyone else's copy of the header is ignored, so servers not using Cloudflare behave the same. The ranges are fetched from Cloudflare's API daily and rejected if implausible. A built-in copy is used until the first fetch succeeds, and **Settings → Panel certificate** shows the list's age. |
 | Service | Runs as root, because it manages users, nginx, certbot, ufw, cron and systemd. It runs under systemd hardening (`NoNewPrivileges`, `ProtectSystem=full`) with write access only to the paths it manages. Tools that must rewrite `/etc/passwd` or `/usr` (`useradd`, `apt-get`) run in transient units via `systemd-run`. Site apps run as their site user with `ProtectSystem=strict`. |
 
 > **The panel is root-equivalent.** Any administrator can run commands as any user through cron jobs, containers and custom nginx directives. Use strong passwords, enable 2FA, and consider limiting the panel port to your IP: `ufw delete allow 8443/tcp && ufw allow from <your-ip> to any port 8443 proto tcp`.
@@ -130,6 +140,7 @@ Settings are read from the environment. The installer writes them to `/etc/cloud
 | `CLOUDPANEL_TLS_CERT` / `CLOUDPANEL_TLS_KEY` | unset (plain HTTP) | PEM certificate and key for the panel (a Let's Encrypt panel certificate overrides these) |
 | `CLOUDPANEL_JWT_SECRET` | generated | Override the signing key (32+ characters) |
 | `CLOUDPANEL_DB_ENGINES` | set by the installer | Enabled site database engines: `mariadb,mongodb,sqlite` |
+| `CLOUDPANEL_PHP` | set by the installer | `1` enables PHP sites |
 | `CLOUDPANEL_HOME_DIR` | `/home` | Parent of site users' homes |
 | `CLOUDPANEL_SITES_DIR` | `/var/www` | Document roots of sites created before v0.3 |
 | `CLOUDPANEL_BACKUP_DIR` | `/var/backups/cloudpanel` | Backups and database exports |
@@ -140,8 +151,11 @@ Settings are read from the environment. The installer writes them to `/etc/cloud
 | `CLOUDPANEL_NGINX_AVAILABLE` / `_ENABLED` | `/etc/nginx/sites-{available,enabled}` | nginx vhost directories |
 | `CLOUDPANEL_NGINX_LOG_DIR` | `/var/log/nginx` | Per-site access and error logs |
 | `CLOUDPANEL_FAIL2BAN_DIR` | `/etc/fail2ban` | fail2ban configuration root |
+| `CLOUDPANEL_BAN_DIR` | `/run/cloudpanel-bans` | Addresses banned from the panel, kept by fail2ban's action |
 | `CLOUDPANEL_SSHD_DIR` | `/etc/ssh/sshd_config.d` | sshd drop-in directory (SFTP-only users) |
 | `CLOUDPANEL_CRON_FILE` | `/etc/cron.d/cloudpanel` | Generated crontab |
+| `CLOUDPANEL_CLOUDFLARE_IPS_URL` | `https://api.cloudflare.com/client/v4/ips` | Where Cloudflare's address ranges are fetched from |
+| `CLOUDPANEL_RELEASE_URL` | `https://api.github.com/repos/marwinlewis/cloudpanel-rust/releases/latest` | Where the latest CloudPanel release is looked up |
 
 Scheduled backups use UTC times. Restoring a **panel** backup is manual: stop the service, extract the archive and put `cloudpanel.db`, `/etc/cloudpanel`, the vhosts and the cron file back in place.
 
@@ -154,6 +168,7 @@ cloudpanel user-reset-password --username admin     # prompts for password, sign
 cloudpanel user-disable-2fa --username admin        # turn off 2FA (lost device)
 cloudpanel site-add --domain api.example.com --site-type nodejs --port 3000 [--no-www | --www-alias]
 cloudpanel site-list
+cloudpanel panel-access-open                        # reopen the panel's port after closing it in Settings
 cloudpanel cron-run <id>                            # used by /etc/cron.d/cloudpanel
 ```
 
@@ -184,7 +199,7 @@ On Windows and in local development, system tools (nginx, ufw, certbot, systemct
 
 ### Releasing
 
-Push a tag such as `v0.3.0`. The release workflow builds static musl binaries for x86_64 and aarch64, publishes them with `.sha256` checksums, and the installer picks them up automatically.
+Push a tag such as `v0.3.0`. The release workflow builds static musl binaries for x86_64 and aarch64, publishes them with `.sha256` checksums, and the installer picks them up automatically. The binaries take their version from the tag, so `Cargo.toml` doesn't need bumping for a release to report the right one and for panels to stop offering it once it is installed. Builds from source report the version in `Cargo.toml`.
 
 ## License
 

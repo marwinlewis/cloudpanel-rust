@@ -1,6 +1,6 @@
 //! File manager endpoints, confined to the site's home directory.
 
-use crate::api::download::{file_response, receive_upload};
+use crate::api::download::{open_file_response, receive_upload};
 use crate::api::error::{ApiError, ApiResult};
 use crate::audit;
 use crate::auth::AuthUser;
@@ -158,12 +158,8 @@ pub async fn download(
 ) -> ApiResult<axum::response::Response> {
     let (_, sfs) = site_fs(&state, &user, id).await?;
     let path = q.path.clone();
-    let (file, _) = crate::state::blocking(move || ufs(sfs.download_path(&path))).await?;
-    let name = file
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "download".into());
-    file_response(file, &name).await
+    let (file, name, _) = crate::state::blocking(move || ufs(sfs.download_path(&path))).await?;
+    open_file_response(tokio::fs::File::from_std(file), &name).await
 }
 
 pub async fn upload(
@@ -180,11 +176,13 @@ pub async fn upload(
     let overwrite = up.fields.get("overwrite").is_some_and(|v| v == "true");
     let name = up.file_name.clone();
     let tmp = up.temp_path.clone();
+    let written = up.written;
     let rel = crate::state::blocking(move || {
         let target = ufs(sfs.upload_target(&dir, &name, overwrite))?;
-        std::fs::rename(&tmp, &target).map_err(ApiError::internal)?;
-        ufs(sfs.finish_upload(&target))?;
-        Ok(sfs.rel(&target))
+        ufs(sfs.install_upload(&tmp, written, &target))?;
+        Ok(format!("{}/{name}", dir.trim_matches('/'))
+            .trim_start_matches('/')
+            .to_string())
     })
     .await;
     drop(up);

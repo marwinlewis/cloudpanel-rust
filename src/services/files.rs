@@ -1,11 +1,12 @@
 //! File manager confined to a site's home directory.
 //!
-//! Every client path is relative to the site home. It is normalized lexically (no `..`,
-//! no absolute paths), then the canonical form of the deepest existing ancestor is checked
-//! to still be inside the canonical home, so symlinks cannot be used to escape.
+//! Every client path is relative to the site home. It is normalized lexically (no `..`, no
+//! absolute paths), and every operation then works through [`Confined`], so neither a link nor a
+//! folder swapped for a link at the wrong moment can take the panel, as root, out of the home.
 
 use super::cmd::{run_with, CmdOpts};
 use super::sysusers;
+use crate::fsutil::{Confined, Pinned};
 use serde::Serialize;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -14,7 +15,7 @@ pub const MAX_EDIT_BYTES: u64 = 2 * 1024 * 1024;
 
 pub struct SiteFs {
     root: PathBuf,
-    canon_root: PathBuf,
+    confined: Confined,
     user: String,
 }
 
@@ -31,8 +32,12 @@ pub struct Entry {
 fn io_err(e: std::io::Error) -> String {
     match e.kind() {
         std::io::ErrorKind::NotFound => "No such file or directory".into(),
+        std::io::ErrorKind::PermissionDenied if e.to_string() == crate::fsutil::ESCAPED => {
+            crate::fsutil::ESCAPED.into()
+        }
         std::io::ErrorKind::PermissionDenied => "Permission denied".into(),
         std::io::ErrorKind::AlreadyExists => "A file with that name already exists".into(),
+        std::io::ErrorKind::InvalidInput => "Not a file".into(),
         _ => e.to_string(),
     }
 }
@@ -56,41 +61,54 @@ fn mode_of(meta: &fs::Metadata) -> u32 {
 impl SiteFs {
     pub fn new(home: &str, user: &str) -> Result<Self, String> {
         let root = PathBuf::from(home);
-        let canon_root = fs::canonicalize(&root).map_err(|e| format!("Site home is not accessible: {e}"))?;
+        let confined = Confined::open(&root).map_err(|e| format!("Site home is not accessible: {e}"))?;
         Ok(SiteFs {
             root,
-            canon_root,
+            confined,
             user: user.to_string(),
         })
     }
 
-    /// Normalize a client path ("htdocs/a.com/index.html", "/", "") to an absolute path.
-    pub fn resolve(&self, rel: &str) -> Result<PathBuf, String> {
+    /// A client path ("htdocs/a.com/index.html", "/", "") in terms of the home, with nothing in it
+    /// that climbs up.
+    fn clean(rel: &str) -> Result<PathBuf, String> {
         if rel.contains('\0') || rel.len() > 4096 {
             return Err("Invalid path".into());
         }
-        let mut out = self.root.clone();
+        let mut out = PathBuf::new();
         for comp in Path::new(rel.trim_start_matches(['/', '\\'])).components() {
             match comp {
                 Component::Normal(c) => out.push(c),
                 Component::CurDir => {}
-                _ => return Err("Path must stay inside the site directory".into()),
-            }
-        }
-        // Check the deepest existing ancestor after resolving symlinks.
-        let mut probe = out.clone();
-        loop {
-            if let Ok(canon) = fs::canonicalize(&probe) {
-                if !canon.starts_with(&self.canon_root) {
-                    return Err("Path must stay inside the site directory".into());
-                }
-                break;
-            }
-            if !probe.pop() {
-                return Err("Invalid path".into());
+                _ => return Err(crate::fsutil::ESCAPED.into()),
             }
         }
         Ok(out)
+    }
+
+    /// Normalize a client path to an absolute one, checking that it leads somewhere inside the home.
+    /// For paths handed to a command running as the site's user, who can't do more with them than
+    /// that user could anyway. As root, use [`Self::pin`], as this can change straight afterwards.
+    pub fn resolve(&self, rel: &str) -> Result<PathBuf, String> {
+        let clean = Self::clean(rel)?;
+        // The deepest part that exists has to be inside. What's below it doesn't exist yet.
+        let mut probe = clean.clone();
+        loop {
+            match self.confined.pin(&probe, true) {
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && probe.pop() => {}
+                Err(e) => return Err(io_err(e)),
+            }
+        }
+        Ok(self.root.join(clean))
+    }
+
+    fn pin(&self, rel: &str, follow_last: bool) -> Result<Pinned, String> {
+        self.confined.pin(&Self::clean(rel)?, follow_last).map_err(io_err)
+    }
+
+    fn owner(&self) -> Result<Option<(u32, u32)>, String> {
+        sysusers::ids(&self.user)
     }
 
     /// Path shown to the client, relative to the home.
@@ -100,14 +118,10 @@ impl SiteFs {
             .unwrap_or_default()
     }
 
-    fn is_root(&self, p: &Path) -> bool {
-        p == self.root
-    }
-
     pub fn list(&self, rel: &str) -> Result<Vec<Entry>, String> {
-        let dir = self.resolve(rel)?;
+        let dir = self.confined.pin_dir(&Self::clean(rel)?).map_err(io_err)?;
         let mut out = Vec::new();
-        for ent in fs::read_dir(&dir).map_err(io_err)? {
+        for ent in fs::read_dir(dir.path()).map_err(io_err)? {
             let ent = ent.map_err(io_err)?;
             let meta = match ent.path().symlink_metadata() {
                 Ok(m) => m,
@@ -142,15 +156,16 @@ impl SiteFs {
     }
 
     pub fn read_text(&self, rel: &str) -> Result<String, String> {
-        let p = self.resolve(rel)?;
-        let meta = fs::metadata(&p).map_err(io_err)?;
-        if !meta.is_file() {
-            return Err("Not a file".into());
-        }
-        if meta.len() > MAX_EDIT_BYTES {
+        use std::io::Read;
+        let file = self.confined.open_file(&Self::clean(rel)?, true).map_err(io_err)?;
+        if file.metadata().map_err(io_err)?.len() > MAX_EDIT_BYTES {
             return Err("File is too large to edit here (max 2 MB); download it instead".into());
         }
-        let bytes = fs::read(&p).map_err(io_err)?;
+        let mut bytes = Vec::new();
+        file.take(MAX_EDIT_BYTES + 1).read_to_end(&mut bytes).map_err(io_err)?;
+        if bytes.len() as u64 > MAX_EDIT_BYTES {
+            return Err("File is too large to edit here (max 2 MB); download it instead".into());
+        }
         if bytes.contains(&0) {
             return Err("This looks like a binary file; download it instead".into());
         }
@@ -161,110 +176,150 @@ impl SiteFs {
         if content.len() as u64 > MAX_EDIT_BYTES {
             return Err("Content is too large (max 2 MB)".into());
         }
-        let p = self.resolve(rel)?;
-        if self.is_root(&p) || p.is_dir() {
+        let clean = Self::clean(rel)?;
+        let at = match self.confined.pin(&clean, true) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Saving a new file makes the folders it needs.
+                if let Some(parent) = clean.parent() {
+                    self.confined.mkdir_all(parent, self.owner()?).map_err(io_err)?;
+                }
+                self.confined.pin(&clean, true).map_err(io_err)?
+            }
+            other => other.map_err(io_err)?,
+        };
+        if at.leaf().is_none() {
             return Err("Not a file".into());
         }
-        let existed = p.exists();
-        let mode = fs::metadata(&p).map(|m| mode_of(&m)).unwrap_or(0o644);
-        crate::fsutil::write_atomic(&p, content.as_bytes(), mode).map_err(io_err)?;
-        let _ = existed;
-        sysusers::chown_one(&p, &self.user)
+        let mode = match at.lstat().map_err(io_err)? {
+            Some(m) if m.is_dir() => return Err("Not a file".into()),
+            Some(m) if !m.is_file() => return Err("Not a file".into()),
+            Some(m) => mode_of(&m),
+            None => 0o644,
+        };
+        crate::fsutil::write_atomic(at.path(), content.as_bytes(), mode).map_err(io_err)?;
+        crate::fsutil::lchown(at.path(), self.owner()?).map_err(io_err)
     }
 
     pub fn mkdir(&self, rel: &str) -> Result<(), String> {
-        let p = self.resolve(rel)?;
-        if p.exists() {
+        let clean = Self::clean(rel)?;
+        if clean.as_os_str().is_empty() {
             return Err("A file with that name already exists".into());
         }
-        fs::create_dir_all(&p).map_err(io_err)?;
-        sysusers::chown_one(&p, &self.user)
+        match self.confined.pin(&clean, false) {
+            Ok(at) if at.lstat().map_err(io_err)?.is_some() => {
+                return Err("A file with that name already exists".into());
+            }
+            Ok(_) => {}
+            // Folders on the way that aren't there yet get made too.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err(e)),
+        }
+        self.confined.mkdir_all(&clean, self.owner()?).map_err(io_err)
     }
 
     pub fn create_file(&self, rel: &str) -> Result<(), String> {
-        let p = self.resolve(rel)?;
-        fs::OpenOptions::new()
+        let at = self.pin(rel, false)?;
+        if at.leaf().is_none() {
+            return Err("A file with that name already exists".into());
+        }
+        let file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&p)
+            .open(at.path())
             .map_err(io_err)?;
-        sysusers::chown_one(&p, &self.user)
+        crate::fsutil::fchown(&file, self.owner()?).map_err(io_err)
     }
 
     pub fn rename(&self, from: &str, to: &str) -> Result<(), String> {
-        let a = self.resolve(from)?;
-        let b = self.resolve(to)?;
-        if self.is_root(&a) || self.is_root(&b) {
+        let (a_clean, b_clean) = (Self::clean(from)?, Self::clean(to)?);
+        let a = self.confined.pin(&a_clean, false).map_err(io_err)?;
+        let b = self.confined.pin(&b_clean, false).map_err(io_err)?;
+        if a.leaf().is_none() || b.leaf().is_none() {
             return Err("Cannot move the site directory itself".into());
         }
-        if b.exists() {
+        if b.lstat().map_err(io_err)?.is_some() {
             return Err("The destination already exists".into());
         }
-        if b.starts_with(&a) {
+        if b_clean.starts_with(&a_clean) {
             return Err("Cannot move a folder into itself".into());
         }
-        fs::rename(&a, &b).map_err(io_err)
+        fs::rename(a.path(), b.path()).map_err(io_err)
     }
 
     pub fn delete(&self, rel: &str) -> Result<(), String> {
-        let p = self.resolve(rel)?;
-        if self.is_root(&p) {
+        let at = self.pin(rel, false)?;
+        if at.leaf().is_none() {
             return Err("Cannot delete the site directory".into());
         }
-        let meta = p.symlink_metadata().map_err(io_err)?;
-        if meta.is_dir() && !meta.file_type().is_symlink() {
-            fs::remove_dir_all(&p).map_err(io_err)
+        let meta = at.lstat().map_err(io_err)?.ok_or("No such file or directory")?;
+        if meta.is_dir() {
+            fs::remove_dir_all(at.path()).map_err(io_err)
         } else {
-            fs::remove_file(&p).map_err(io_err)
+            fs::remove_file(at.path()).map_err(io_err)
         }
     }
 
     pub fn chmod(&self, rel: &str, mode: u32) -> Result<(), String> {
-        let p = self.resolve(rel)?;
         if mode & 0o7000 != 0 {
             return Err("setuid, setgid and sticky bits are not allowed".into());
         }
-        let meta = p.symlink_metadata().map_err(io_err)?;
+        let at = self.pin(rel, false)?;
+        let meta = at.lstat().map_err(io_err)?.ok_or("No such file or directory")?;
         if meta.file_type().is_symlink() {
             return Err("Cannot change the mode of a symlink".into());
         }
-        crate::fsutil::set_mode(&p, mode).map_err(io_err)
+        if meta.is_dir() {
+            let dir = self.confined.pin_dir(&Self::clean(rel)?).map_err(io_err)?;
+            return crate::fsutil::set_mode(dir.path(), mode).map_err(io_err);
+        }
+        let file = crate::fsutil::open_regular(at.path()).map_err(io_err)?;
+        crate::fsutil::fchmod(&file, mode).map_err(io_err)
     }
 
-    /// Path for a new uploaded file in `dir` (must not exist unless `overwrite`).
-    pub fn upload_target(&self, dir: &str, name: &str, overwrite: bool) -> Result<PathBuf, String> {
+    /// Where a new uploaded file in `dir` goes (must not exist unless `overwrite`). The folder is
+    /// held, so this stays that folder however long the caller takes.
+    pub fn upload_target(&self, dir: &str, name: &str, overwrite: bool) -> Result<Pinned, String> {
         let name = crate::validate::file_name(name)?;
-        let d = self.resolve(dir)?;
-        if !d.is_dir() {
-            return Err("Upload folder does not exist".into());
+        let folder = Self::clean(dir)?;
+        let at = self.confined.pin_dir(&folder).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => "Upload folder does not exist".to_string(),
+            _ => io_err(e),
+        })?;
+        let target = self.confined.pin(&folder.join(&name), false).map_err(io_err)?;
+        drop(at);
+        match target.lstat().map_err(io_err)? {
+            Some(m) if m.file_type().is_symlink() => Err("Refusing to overwrite a symlink".into()),
+            Some(m) if m.is_dir() => Err("A folder with that name already exists".into()),
+            Some(_) if !overwrite => Err("A file with that name already exists".into()),
+            _ => Ok(target),
         }
-        let p = d.join(name);
-        if p.exists() && !overwrite {
-            return Err("A file with that name already exists".into());
-        }
-        if p.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err("Refusing to overwrite a symlink".into());
-        }
-        Ok(p)
     }
 
-    pub fn finish_upload(&self, path: &Path) -> Result<(), String> {
-        let _ = crate::fsutil::set_mode(path, 0o644);
-        sysusers::chown_one(path, &self.user)
+    /// Put an uploaded temp file in its place, belonging to the site's user. The temp file sits in
+    /// the home while it arrives, so it may well not be what the panel wrote any more: it must
+    /// still be the same file, `written`, and only the open file is ever changed.
+    pub fn install_upload(&self, temp: &Path, written: (u64, u64), target: &Pinned) -> Result<(), String> {
+        let name = temp.file_name().ok_or("Invalid upload")?;
+        let at = self.confined.pin(Path::new(name), false).map_err(io_err)?;
+        let file = crate::fsutil::open_regular(at.path()).map_err(io_err)?;
+        if crate::fsutil::identity(&file.metadata().map_err(io_err)?) != written {
+            return Err("The upload was changed while it was being received".into());
+        }
+        crate::fsutil::fchmod(&file, 0o644).map_err(io_err)?;
+        crate::fsutil::fchown(&file, self.owner()?).map_err(io_err)?;
+        fs::rename(at.path(), target.path()).map_err(io_err)
     }
 
-    /// Path for downloading: must be a regular file inside the home.
-    pub fn download_path(&self, rel: &str) -> Result<(PathBuf, u64), String> {
-        let p = self.resolve(rel)?;
-        let canon = fs::canonicalize(&p).map_err(io_err)?;
-        if !canon.starts_with(&self.canon_root) {
-            return Err("Path must stay inside the site directory".into());
-        }
-        let meta = fs::metadata(&canon).map_err(io_err)?;
-        if !meta.is_file() {
-            return Err("Not a file".into());
-        }
-        Ok((canon, meta.len()))
+    /// Open a regular file inside the home for downloading: the open file, its name and its size.
+    pub fn download_path(&self, rel: &str) -> Result<(fs::File, String, u64), String> {
+        let clean = Self::clean(rel)?;
+        let file = self.confined.open_file(&clean, true).map_err(io_err)?;
+        let len = file.metadata().map_err(io_err)?.len();
+        let name = clean
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "download".into());
+        Ok((file, name, len))
     }
 
     fn opts(&self, cwd: &Path) -> CmdOpts {

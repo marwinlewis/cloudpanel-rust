@@ -4,8 +4,8 @@ use crate::api::error::{ApiError, ApiResult};
 use crate::audit;
 use crate::auth::AdminUser;
 use crate::db;
-use crate::services::apps;
 use crate::services::system::{self, Action, Upgradable};
+use crate::services::{apps, panel_update};
 use crate::state::{blocking, SharedState};
 use crate::validate;
 use axum::{
@@ -137,6 +137,14 @@ pub async fn upgrade_all(admin: AdminUser, State(state): State<SharedState>) -> 
     Ok(Json(json!({ "job_id": job_id })))
 }
 
+pub async fn get_panel_update(_admin: AdminUser, State(state): State<SharedState>) -> ApiResult<impl IntoResponse> {
+    Ok(Json(state.db(|conn| Ok(panel_update::status(conn)?)).await?))
+}
+
+pub async fn check_panel_update(_admin: AdminUser, State(state): State<SharedState>) -> ApiResult<impl IntoResponse> {
+    Ok(Json(panel_update::check(&state).await?))
+}
+
 pub async fn reboot(admin: AdminUser, State(state): State<SharedState>) -> ApiResult<impl IntoResponse> {
     state
         .db(move |conn| {
@@ -160,6 +168,7 @@ pub async fn system_info(_admin: AdminUser, State(state): State<SharedState>) ->
     let cache: UpdateCache = state.db(|conn| Ok(db::get_json(conn, UPDATES_SETTING)?)).await?;
     let (v4, v6) = blocking(|| Ok(system::public_ips())).await?;
     let reboot = blocking(|| Ok(system::reboot_required())).await?;
+    let panel = state.db(|conn| Ok(panel_update::status(conn)?)).await?;
     Ok(Json(json!({
         "public_ipv4": v4,
         "public_ipv6": v6,
@@ -167,6 +176,8 @@ pub async fn system_info(_admin: AdminUser, State(state): State<SharedState>) ->
         "security_updates": cache.packages.iter().filter(|p| p.security).count(),
         "updates_checked_at": cache.checked_at,
         "reboot_required": reboot,
-        "panel_version": env!("CARGO_PKG_VERSION"),
+        "panel_version": panel["current"],
+        "panel_latest": panel["latest"],
+        "panel_update_available": panel["update_available"],
     })))
 }

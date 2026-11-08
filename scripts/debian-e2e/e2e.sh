@@ -71,8 +71,18 @@ login() {
   retry '[ "$(call GET /auth/me | j "d[\"username\"]")" = admin ]' || bad "login"
 }
 
+f2b_settings() { # panel-jail-enabled maxretry -> HTTP status
+  code PUT /fail2ban "{\"sshd\":true,\"panel\":$1,\"maxretry\":$2,\"findtime_minutes\":10,\"bantime_minutes\":60,\"ignoreip\":[]}"
+}
+
 before_reboot() {
   login
+  echo "== fail2ban after installing"
+  checkr "fail2ban is running" '[ "$(systemctl is-active fail2ban)" = active ]'
+  checkr "with the panel's jail" 'fail2ban-client status cloudpanel | grep -q "Currently banned"'
+  # The checks up to panel_bans fail a lot of logins from addresses fail2ban would ban.
+  check "the jail can be turned off for now" '[ "$(f2b_settings false 5)" = 200 ]'
+
   echo "== PM2: new Node.js site, prebuilt layout like a real deploy"
   R=$(call POST /sites '{"domain":"pre.test.local","site_type":"nodejs","target_port":3101}')
   PRE=$(echo "$R" | j 'd.get("id","")')
@@ -403,7 +413,106 @@ EOF
   check "nginx config is valid after all of that" 'nginx -t -q 2>/dev/null'
 
   panel_hostname
+  panel_port_closed
   summary
+}
+
+# Everything here also runs the panel's real restart, so its session cookie has to survive it.
+panel_port_closed() {
+  echo "== Closing the panel's own port"
+  PH=panel.test.local
+  IP=$(hostname -i | cut -d' ' -f1)
+  mkdir -p /etc/cloudpanel/tls
+  openssl req -x509 -newkey rsa:2048 -nodes -days 2 -keyout /etc/cloudpanel/tls/e2e.key -out /etc/cloudpanel/tls/e2e.crt \
+    -subj "/CN=$PH" -addext "subjectAltName=DNS:$PH" 2>/dev/null
+  python3 - <<'EOF'
+import json, sqlite3
+c = sqlite3.connect("/var/lib/cloudpanel/cloudpanel.db")
+c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('panel_tls', ?)", (json.dumps(
+    {"hostname": "panel.test.local", "cert": "/etc/cloudpanel/tls/e2e.crt", "key": "/etc/cloudpanel/tls/e2e.key"}),))
+c.commit()
+EOF
+  systemctl restart cloudpanel
+  retry '[ "$(curl -sk -o /dev/null -w "%{http_code}" https://127.0.0.1:8443/)" = 200 ]'
+  ph() { curl -sk -m 10 --resolve "$PH:443:127.0.0.1" "$@"; }
+  J3=/var/tmp/closing.jar
+  rm -f $J3
+  pxy3() { # method path [json]
+    ph -b $J3 -c $J3 -X "$1" -H 'X-Requested-With: cloudpanel' -H 'Content-Type: application/json' -H "Origin: https://$PH" ${3:+-d "$3"} "https://$PH/api$2"
+  }
+  PW=$(cat /var/lib/cloudpanel/initial_admin_password)
+  pxy3 POST /auth/login "{\"username\":\"admin\",\"password\":\"$PW\"}" >/dev/null
+  check "the port starts open" '[ "$(call GET /settings/panel-cert | j "d[\"direct\"][\"closed\"]")" = False ]'
+  check "the panel knows a session on the port isn't using the hostname" '[ "$(call GET /settings/panel-cert | j "d[\"direct\"][\"on_hostname\"]")" = False ]'
+  check "and a session on the hostname is" '[ "$(pxy3 GET /settings/panel-cert | j "d[\"direct\"][\"on_hostname\"]")" = True ]'
+  check "closing from the port itself is refused" '[ "$(code PUT /settings/panel-access "{\"open\":false}")" = 400 ]'
+  # curl matches stored cookies against the Host header, so this session is sent by hand.
+  COOKIE=$(awk 'NF>=7 {print $6"="$7}' $JAR | tail -1)
+  check "a faked proxy header doesn't count" '[ "$(curl -sk -o /dev/null -w "%{http_code}" -H "Cookie: $COOKIE" -X PUT -H "X-Requested-With: cloudpanel" -H "Content-Type: application/json" -H "Host: $PH" -H "X-CloudPanel-Proxy: guessed" -d "{\"open\":false}" https://127.0.0.1:8443/api/settings/panel-access)" = 400 ]'
+  check "and that left it open" '[ -z "$(python3 -c "import sqlite3;print(sqlite3.connect(\"/var/lib/cloudpanel/cloudpanel.db\").execute(\"select value from settings where key=\x27panel_direct_closed\x27\").fetchone() or \"\")")" ]'
+  check "the firewall guard explains what to do instead" 'call POST /firewall/rules "{\"port\":8443,\"protocol\":\"tcp\",\"action\":\"deny\"}" | grep -q "Panel certificate"'
+  check "the port answers from outside loopback before closing" '[ "$(curl -sk -m 5 -o /dev/null -w "%{http_code}" https://$IP:8443/)" = 200 ]'
+
+  R=$(pxy3 PUT /settings/panel-access '{"open":false}')
+  check "closing from the hostname works ($R)" 'echo "$R" | grep -q restarting'
+  checkr "the panel comes back listening on loopback only" '[ "$(ss -ltnH "sport = :8443" | awk "{print \$4}")" = "127.0.0.1:8443" ]'
+  check "the port no longer answers from outside loopback" '! curl -sk -m 5 -o /dev/null https://$IP:8443/'
+  checkr "the hostname still works, with the same session" '[ "$(pxy3 GET /settings/panel-cert | j "d[\"direct\"][\"closed\"]")" = True ]'
+  check "an SSH tunnel's route still works" '[ "$(curl -sk -m 5 -o /dev/null -w "%{http_code}" https://127.0.0.1:8443/)" = 200 ]'
+  check "the hostname can't be removed while it's the only way in" '[ "$(pxy3 DELETE /settings/panel-cert | j "\"Reopen\" in d[\"error\"]")" = True ]'
+  check "a firewall rule on the closed port is accepted" 'call POST /firewall/rules "{\"port\":8443,\"protocol\":\"tcp\",\"action\":\"deny\"}" | grep -q "\"port\":8443"'
+  check "and SSH is still protected" 'call POST /firewall/rules "{\"port\":22,\"protocol\":\"tcp\",\"action\":\"deny\"}" | grep -q "block SSH"'
+  RID=$(call GET /firewall/rules | j '[r["id"] for r in d if r["port"]==8443][0]')
+  call DELETE "/firewall/rules/$RID" >/dev/null
+  # Stays closed for the reboot, which after_reboot checks.
+}
+
+panel_port_after_reboot() {
+  PH=panel.test.local
+  IP=$(hostname -i | cut -d' ' -f1)
+  ph() { curl -sk -m 10 --resolve "$PH:443:127.0.0.1" "$@"; }
+  echo "== The closed port after a reboot"
+  check "the port is still closed" '[ "$(ss -ltnH "sport = :8443" | awk "{print \$4}")" = "127.0.0.1:8443" ]'
+  checkr "the hostname still works" '[ "$(ph -o /dev/null -w "%{http_code}" https://$PH/)" = 200 ]'
+  check "the panel won't report a fallback" '[ "$(call GET /settings/panel-cert | j "d[\"direct\"][\"fell_back\"]")" = False ]'
+
+  echo "== It fails open if the hostname can't be served"
+  mv /etc/cloudpanel/tls/e2e.crt /etc/cloudpanel/tls/e2e.crt.off
+  systemctl restart cloudpanel
+  checkr "a missing certificate opens the port again" 'ss -ltnH "sport = :8443" | grep -q "0.0.0.0:8443"'
+  checkr "so the panel can still be reached" '[ "$(curl -sk -m 5 -o /dev/null -w "%{http_code}" https://$IP:8443/)" = 200 ]'
+  check "and it says so" '[ "$(call GET /settings/panel-cert | j "d[\"direct\"][\"fell_back\"]")" = True ]'
+  mv /etc/cloudpanel/tls/e2e.crt.off /etc/cloudpanel/tls/e2e.crt
+  systemctl restart cloudpanel
+  checkr "fixing it closes the port again" '[ "$(ss -ltnH "sport = :8443" | awk "{print \$4}")" = "127.0.0.1:8443" ]'
+  retry '[ "$(ph -o /dev/null -w "%{http_code}" https://$PH/)" = 200 ]'
+
+  echo "== Getting back in from the command line"
+  /usr/local/bin/cloudpanel panel-access-open >/var/tmp/open.out 2>&1
+  check "the command reports it ($(cut -c1-60 /var/tmp/open.out))" 'grep -q "opening again" /var/tmp/open.out'
+  checkr "the port is open again" 'ss -ltnH "sport = :8443" | grep -q "0.0.0.0:8443"'
+  checkr "the panel answers there" '[ "$(curl -sk -m 5 -o /dev/null -w "%{http_code}" https://$IP:8443/)" = 200 ]'
+  check "and it no longer reports closed" '[ "$(call GET /settings/panel-cert | j "d[\"direct\"][\"closed\"]")" = False ]'
+
+  echo "== Closing and reopening from the panel"
+  J3=/var/tmp/closing.jar
+  rm -f $J3
+  pxy3() { ph -b $J3 -c $J3 -X "$1" -H 'X-Requested-With: cloudpanel' -H 'Content-Type: application/json' -H "Origin: https://$PH" ${3:+-d "$3"} "https://$PH/api$2"; }
+  PW=$(cat /var/lib/cloudpanel/initial_admin_password)
+  pxy3 POST /auth/login "{\"username\":\"admin\",\"password\":\"$PW\"}" >/dev/null
+  pxy3 PUT /settings/panel-access '{"open":false}' >/dev/null
+  checkr "closed again" '[ "$(ss -ltnH "sport = :8443" | awk "{print \$4}")" = "127.0.0.1:8443" ]'
+  retry '[ "$(pxy3 GET /settings/panel-cert | j "d[\"direct\"][\"closed\"]")" = True ]'
+  pxy3 PUT /settings/panel-access '{"open":true}' >/dev/null
+  checkr "the Open button's route reopens it" 'ss -ltnH "sport = :8443" | grep -q "0.0.0.0:8443"'
+  retry '[ "$(curl -sk -m 5 -o /dev/null -w "%{http_code}" https://$IP:8443/)" = 200 ]'
+  R=$(call DELETE /settings/panel-cert)
+  check "the hostname can be removed once it's open" '[ ! -e /etc/nginx/sites-available/cloudpanel-panel.conf ]'
+  rm -f /etc/cloudpanel/tls/e2e.crt /etc/cloudpanel/tls/e2e.key
+  # This test restarts far faster than anyone would, which trips systemd's start limit.
+  systemctl reset-failed cloudpanel
+  systemctl restart cloudpanel
+  retry '[ "$(curl -sk -o /dev/null -w "%{http_code}" https://127.0.0.1:8443/)" = 200 ]'
 }
 
 # Real Let's Encrypt can't run here, so a stored self-signed certificate stands in for one. A
@@ -427,7 +536,6 @@ EOF
   check "the site holding the secret is root-only" '[ "$(stat -c %a $VHOST)" = 600 ] && [ "$(stat -c %U $VHOST)" = root ]'
   check "the secret file is root-only" '[ "$(stat -c %a /var/lib/cloudpanel/proxy.secret)" = 600 ]'
   check "nginx config is valid" 'nginx -t -q 2>/dev/null'
-  MTIME=$(stat -c %Y $VHOST)
   ph() { curl -sk -m 10 --resolve "$PH:443:127.0.0.1" --resolve "$PH:80:127.0.0.1" "$@"; }
   checkr "the panel answers at https://hostname" '[ "$(ph -o /dev/null -w "%{http_code}" https://$PH/)" = 200 ]'
   check "port 443 serves the panel certificate" 'echo | openssl s_client -connect 127.0.0.1:443 -servername $PH 2>/dev/null | openssl x509 -noout -subject | grep -q $PH'
@@ -474,11 +582,131 @@ EOF
   check "one client's failures lock out that client" '[ "$(curl -sk -m 10 -o /dev/null -w "%{http_code}" --interface 127.0.0.4 --resolve "$PH:443:127.0.0.1" -X POST -H "X-Requested-With: cloudpanel" -H "Content-Type: application/json" -d "{\"username\":\"e2e-probe\",\"password\":\"wrong\"}" "https://$PH/api/auth/login")" = 429 ]'
   check "and nobody else" 'pxy POST /auth/login "{\"username\":\"admin\",\"password\":\"$PW\"}" | grep -q admin'
 
+  # Behind Cloudflare. A connection really comes from these addresses when they are on this
+  # machine, and is not in any way marked as a test.
+  EDGE=173.245.48.1
+  EDGE6=2606:4700::1
+  OTHER=198.51.100.7
+  ip addr add $EDGE/32 dev lo
+  ip addr add $OTHER/32 dev lo
+  sysctl -qw net.ipv6.conf.lo.disable_ipv6=0
+  ip -6 addr add $EDGE6/128 dev lo
+  via_nginx() { # source-address [curl args]: one failed login on port 443
+    local src=$1
+    shift
+    case $src in *:*) failed --interface "$src" --resolve "$PH:443:[$src]" "$@" "https://$PH/api/auth/login" ;;
+      *) failed --interface "$src" --resolve "$PH:443:$src" "$@" "https://$PH/api/auth/login" ;; esac
+  }
+  via_port() { # source-address [curl args]: one failed login on the panel's own port
+    local src=$1
+    shift
+    failed --interface "$src" "$@" "https://$src:8443/api/auth/login"
+  }
+  logged() { grep -q "from $1 " $AUTH; }
+
+  check "the nginx site trusts Cloudflare's IPv4 ranges" 'grep -q "set_real_ip_from 173.245.48.0/20;" $VHOST'
+  check "and its IPv6 ranges" 'grep -q "set_real_ip_from 2606:4700::/32;" $VHOST'
+  check "and reads CF-Connecting-IP" 'grep -q "real_ip_header CF-Connecting-IP;" $VHOST'
+  check "nginx accepts that" 'nginx -t -q 2>/dev/null'
+  : >$AUTH
+  via_nginx $EDGE -H 'CF-Connecting-IP: 203.0.113.50'
+  checkr "a visitor through Cloudflare is logged with their own address" 'logged 203.0.113.50'
+  check "and not as Cloudflare's" '! logged $EDGE'
+  : >$AUTH
+  via_nginx $EDGE6 -H 'CF-Connecting-IP: 2001:db8::50'
+  checkr "the same for IPv6 on both sides" 'logged 2001:db8::50 && ! logged $EDGE6'
+  : >$AUTH
+  via_nginx $EDGE -H 'CF-Connecting-IP: 203.0.113.51' -H 'X-Real-IP: 203.0.113.99' -H 'X-CloudPanel-Proxy: guessed'
+  checkr "a visitor can't override that with other headers" 'logged 203.0.113.51 && ! logged 203.0.113.99'
+  : >$AUTH
+  via_nginx $OTHER -H 'CF-Connecting-IP: 203.0.113.9'
+  checkr "a forged CF-Connecting-IP through nginx is ignored" 'logged $OTHER && ! logged 203.0.113.9'
+  : >$AUTH
+  via_nginx 127.0.0.3 -H 'CF-Connecting-IP: 203.0.113.9'
+  checkr "also from this machine" 'logged 127.0.0.3 && ! logged 203.0.113.9'
+  : >$AUTH
+  via_port $EDGE -H 'CF-Connecting-IP: 203.0.113.52'
+  checkr "a visitor through Cloudflare on the panel's own port is logged too" 'logged 203.0.113.52 && ! logged $EDGE'
+  : >$AUTH
+  via_port $OTHER -H 'CF-Connecting-IP: 203.0.113.9'
+  checkr "a forged CF-Connecting-IP on the panel's own port is ignored" 'logged $OTHER && ! logged 203.0.113.9'
+  : >$AUTH
+  failed -H 'CF-Connecting-IP: 203.0.113.9' https://127.0.0.1:8443/api/auth/login
+  checkr "also from this machine" 'logged 127.0.0.1 && ! logged 203.0.113.9'
+
+  attempt() { via_nginx "$@" -w '%{http_code}'; }
+  for _ in 1 2 3 4 5 6; do via_nginx $EDGE -H 'CF-Connecting-IP: 203.0.113.60'; done
+  check "a visitor's failures through Cloudflare lock out that visitor" '[ "$(attempt $EDGE -H "CF-Connecting-IP: 203.0.113.60")" = 429 ]'
+  check "and not everybody on the same Cloudflare address" '[ "$(attempt $EDGE -H "CF-Connecting-IP: 203.0.113.61")" = 401 ]'
+  for i in 1 2 3 4 5 6; do via_nginx $OTHER -H "CF-Connecting-IP: 203.0.113.$i"; done
+  check "changing a forged address on every try doesn't dodge the lockout" '[ "$(attempt $OTHER -H "CF-Connecting-IP: 203.0.113.7")" = 429 ]'
+
+  restart_panel() {
+    systemctl restart cloudpanel
+    retry '[ "$(curl -sk -o /dev/null -w "%{http_code}" https://127.0.0.1:8443/)" = 200 ]'
+  }
+  cf_status() { call GET /settings/panel-cert | j "d[\"cloudflare\"][\"$1\"]"; }
+  checkr "the panel fetched Cloudflare's current list" '[ "$(cf_status built_in)" = False ] && [ "$(cf_status stale)" = False ]'
+
+  # A list served from here shows what a change at Cloudflare does.
+  API_DIR=/var/tmp/cf-api
+  mkdir -p $API_DIR
+  serve_list() { printf '{"success":true,"result":{"ipv4_cidrs":[%s],"ipv6_cidrs":[%s]}}' "$1" "$2" >$API_DIR/ips; }
+  serve_list '"198.51.100.0/24"' '"2001:db8::/32"'
+  python3 -m http.server --bind 127.0.0.1 --directory $API_DIR 18081 >/dev/null 2>&1 &
+  API_PID=$!
+  retry 'curl -s -o /dev/null http://127.0.0.1:18081/ips'
+  mkdir -p /etc/systemd/system/cloudpanel.service.d
+  printf '[Service]\nEnvironment=CLOUDPANEL_CLOUDFLARE_IPS_URL=http://127.0.0.1:18081/ips\n' \
+    >/etc/systemd/system/cloudpanel.service.d/e2e-cloudflare.conf
+  systemctl daemon-reload
+  restart_panel
+  checkr "a new list reaches nginx" 'grep -q "set_real_ip_from 198.51.100.0/24;" $VHOST'
+  check "and replaces the old one" '! grep -q "173.245.48.0/20" $VHOST'
+  check "nginx accepts it" 'nginx -t -q 2>/dev/null'
+  checkr "nginx trusts a new Cloudflare address" ': >$AUTH; via_nginx $OTHER -H "CF-Connecting-IP: 203.0.113.70"; logged 203.0.113.70'
+  checkr "and no longer an old one" ': >$AUTH; via_nginx $EDGE -H "CF-Connecting-IP: 203.0.113.9"; logged $EDGE && ! logged 203.0.113.9'
+  checkr "the panel's own port follows" ': >$AUTH; via_port $OTHER -H "CF-Connecting-IP: 203.0.113.71"; logged 203.0.113.71'
+  checkr "in both directions" ': >$AUTH; via_port $EDGE -H "CF-Connecting-IP: 203.0.113.9"; logged $EDGE && ! logged 203.0.113.9'
+
+  LISTED=$(stat -c %Y $VHOST)
+  panel_warned() { journalctl -u cloudpanel --since "$SINCE" --no-pager | grep -q "could not refresh Cloudflare"; }
+  serve_list '"0.0.0.0/0"' '"::/0"'
+  SINCE=$(date '+%F %T')
+  sleep 1
+  restart_panel
+  checkr "a list trusting everyone is refused, with a warning" 'panel_warned'
+  check "nginx doesn't get it" '! grep -q "0.0.0.0/0" $VHOST && [ "$(stat -c %Y $VHOST)" = "$LISTED" ]'
+  : >$AUTH
+  failed -H 'CF-Connecting-IP: 203.0.113.9' https://127.0.0.1:8443/api/auth/login
+  checkr "and the panel doesn't believe it" 'logged 127.0.0.1 && ! logged 203.0.113.9'
+  kill $API_PID
+  wait $API_PID 2>/dev/null
+  SINCE=$(date '+%F %T')
+  sleep 1
+  restart_panel
+  checkr "being unable to reach the list gives a warning" 'panel_warned'
+  check "and keeps the last good one" 'grep -q "set_real_ip_from 198.51.100.0/24;" $VHOST && [ "$(stat -c %Y $VHOST)" = "$LISTED" ]'
+
+  # Back to the real list, without these addresses.
+  rm -f /etc/systemd/system/cloudpanel.service.d/e2e-cloudflare.conf
+  rmdir /etc/systemd/system/cloudpanel.service.d 2>/dev/null
+  systemctl daemon-reload
+  ip addr del $EDGE/32 dev lo
+  ip addr del $OTHER/32 dev lo
+  ip -6 addr del $EDGE6/128 dev lo
+  restart_panel
+  checkr "the panel returns to Cloudflare's list" 'grep -q "set_real_ip_from 173.245.48.0/20;" $VHOST && ! grep -q "198.51.100.0/24" $VHOST'
+  check "nginx accepts it" 'nginx -t -q 2>/dev/null'
+
+  panel_bans
+
   echo "== Hostname conflicts and removal"
   check "a site can't take the panel's hostname" '[ "$(code POST /sites "{\"domain\":\"$PH\",\"site_type\":\"static\"}")" = 409 ]'
   check "the panel can't take a site's hostname" '[ "$(code POST /settings/panel-cert "{\"hostname\":\"src.test.local\",\"email\":\"e2e@example.com\",\"skip_dns_check\":true}")" = 409 ]'
   check "or the www of one" '[ "$(call GET /sites | j "[x for x in d if x[\"domain\"]==\"src.test.local\"][0][\"include_www\"]")" = True ] && [ "$(code POST /settings/panel-cert "{\"hostname\":\"www.src.test.local\",\"email\":\"e2e@example.com\",\"skip_dns_check\":true}")" = 409 ]'
   check "the panel reports its address" '[ "$(call GET /settings/panel-cert | j "d[\"url\"]")" = "https://$PH" ]'
+  MTIME=$(stat -c %Y $VHOST)
   systemctl restart cloudpanel
   retry '[ "$(curl -sk -o /dev/null -w "%{http_code}" https://127.0.0.1:8443/)" = 200 ]'
   check "restarting leaves an unchanged site alone" '[ "$(stat -c %Y $VHOST)" = "$MTIME" ]'
@@ -489,6 +717,144 @@ EOF
   # Back on the panel's default certificate for whatever runs next.
   systemctl restart cloudpanel
   retry '[ "$(curl -sk -o /dev/null -w "%{http_code}" https://127.0.0.1:8443/)" = 200 ]'
+}
+
+# Real fail2ban, fed by real failed logins, on the routes panel_hostname set up. Those functions
+# are still defined here, because it calls this.
+panel_bans() {
+  echo "== fail2ban bans stop a client on every route"
+  BANS=/run/cloudpanel-bans
+  JAIL=/etc/fail2ban/jail.d/cloudpanel.conf
+  ip addr add $EDGE/32 dev lo
+  ip addr add $OTHER/32 dev lo
+  ip -6 addr add $EDGE6/128 dev lo
+  : >$AUTH
+  on_443() { via_nginx "$@" -w '%{http_code}'; }
+  on_port() { via_port "$@" -w '%{http_code}'; }
+  cf() { echo "CF-Connecting-IP: $1"; }
+  in_jail() { fail2ban-client status cloudpanel 2>/dev/null | grep 'Banned IP list' | grep -qwF -- "$1"; }
+  api_ban() { code POST /fail2ban/ban "{\"jail\":\"cloudpanel\",\"ip\":\"$1\"}"; }
+  api_unban() { code POST /fail2ban/unban "{\"jail\":\"cloudpanel\",\"ip\":\"$1\"}"; }
+
+  check "the jail goes back on, banning after 3 failures" '[ "$(f2b_settings true 3)" = 200 ]'
+  checkr "it is running" 'fail2ban-client status cloudpanel >/dev/null 2>&1'
+  check "it uses the panel's action" 'grep -q "^action = cloudpanel$" $JAIL && [ -f /etc/fail2ban/action.d/cloudpanel.conf ]'
+  check "and doesn't name a port for a firewall to close" '! sed -n "/^\[cloudpanel\]/,\$p" $JAIL | grep -q "^port"'
+  check "fail2ban accepts that" 'fail2ban-client -t >/dev/null 2>&1'
+
+  VISITOR=203.0.113.80
+  check "a visitor through Cloudflare isn't refused to begin with" '[ "$(on_443 $EDGE -H "$(cf $VISITOR)")" = 401 ]'
+  via_nginx $EDGE -H "$(cf $VISITOR)"
+  via_port $EDGE -H "$(cf $VISITOR)"
+  checkr "their failures on both ports get them banned" 'in_jail $VISITOR && [ -e $BANS/$VISITOR ]'
+  check "they are refused on 443 through Cloudflare" '[ "$(on_443 $EDGE -H "$(cf $VISITOR)")" = 403 ]'
+  check "and on the panel's own port through Cloudflare" '[ "$(on_port $EDGE -H "$(cf $VISITOR)")" = 403 ]'
+  check "and through another Cloudflare address" '[ "$(on_443 $EDGE6 -H "$(cf $VISITOR)")" = 403 ]'
+  check "the right password doesn't help" '[ "$(curl -sk -m 10 -o /dev/null -w "%{http_code}" --interface $EDGE --resolve "$PH:443:$EDGE" -H "$(cf $VISITOR)" -X POST -H "X-Requested-With: cloudpanel" -H "Content-Type: application/json" -d "{\"username\":\"admin\",\"password\":\"$PW\"}" https://$PH/api/auth/login)" = 403 ]'
+  check "they get no pages either" '[ "$(curl -sk -m 10 -o /dev/null -w "%{http_code}" --interface $EDGE --resolve "$PH:443:$EDGE" -H "$(cf $VISITOR)" https://$PH/)" = 403 ]'
+  check "the Cloudflare address itself isn't banned" '! in_jail $EDGE && [ ! -e $BANS/$EDGE ]'
+  check "another visitor on that address carries on, on 443" '[ "$(on_443 $EDGE -H "$(cf 203.0.113.82)")" = 401 ]'
+  check "and on the panel's own port" '[ "$(on_port $EDGE -H "$(cf 203.0.113.82)")" = 401 ]'
+  check "hosted sites aren't part of it" '[ "$(curl -s -m 5 -o /dev/null -w "%{http_code}" --interface $OTHER -H "Host: pre.test.local" http://127.0.0.1/)" = 200 ]'
+
+  # fail2ban ignores this machine's own addresses, which is what stands in for a client here.
+  fail2ban-client set cloudpanel ignoreself false >/dev/null
+  check "a client connecting directly isn't refused to begin with" '[ "$(on_port $OTHER)" = 401 ]'
+  via_port $OTHER
+  via_nginx $OTHER
+  checkr "its failures get it banned" 'in_jail $OTHER && [ -e $BANS/$OTHER ]'
+  check "it is refused on 443" '[ "$(on_443 $OTHER)" = 403 ]'
+  check "and on the panel's own port" '[ "$(on_port $OTHER)" = 403 ]'
+  check "a forged CF-Connecting-IP doesn't get it past 443" '[ "$(on_443 $OTHER -H "$(cf 203.0.113.83)")" = 403 ]'
+  check "or past the panel's own port" '[ "$(on_port $OTHER -H "$(cf 203.0.113.83)")" = 403 ]'
+  check "a forged X-Real-IP doesn't either" '[ "$(on_443 $OTHER -H "X-Real-IP: 203.0.113.83")" = 403 ] && [ "$(on_port $OTHER -H "X-Real-IP: 203.0.113.83")" = 403 ]'
+  check "going through Cloudflare instead doesn't help on 443" '[ "$(on_443 $EDGE -H "$(cf $OTHER)")" = 403 ]'
+  check "or on the panel's own port" '[ "$(on_port $EDGE -H "$(cf $OTHER)")" = 403 ]'
+  check "and nobody gets refused by forging a banned address" '[ "$(curl -sk -m 10 -o /dev/null -w "%{http_code}" -H "CF-Connecting-IP: $OTHER" -H "X-Real-IP: $OTHER" https://127.0.0.1:8443/api/auth/me)" = 401 ]'
+
+  V6=2001:db8::80
+  for _ in 1 2 3; do via_port $EDGE -H "$(cf $V6)"; done
+  checkr "an IPv6 visitor gets banned" 'in_jail $V6 && [ -e $BANS/$V6 ]'
+  check "and refused on 443 through either family" '[ "$(on_443 $EDGE -H "$(cf $V6)")" = 403 ] && [ "$(on_443 $EDGE6 -H "$(cf $V6)")" = 403 ]'
+  check "and on the panel's own port" '[ "$(on_port $EDGE -H "$(cf $V6)")" = 403 ]'
+
+  echo "== A ban can't reach a Cloudflare address"
+  : >$AUTH
+  via_nginx $EDGE
+  via_port $EDGE
+  check "failures that name no visitor aren't blamed on the edge" '! logged $EDGE'
+  check "the panel won't ban one when asked" '[ "$(api_ban $EDGE)" = 400 ]'
+  fail2ban-client set cloudpanel banip $EDGE >/dev/null
+  checkr "even if fail2ban is told to" '[ -e $BANS/$EDGE ]'
+  check "its visitors aren't refused on 443" '[ "$(on_443 $EDGE -H "$(cf 203.0.113.84)")" = 401 ]'
+  check "or on the panel's own port" '[ "$(on_port $EDGE -H "$(cf 203.0.113.84)")" = 401 ]'
+  fail2ban-client set cloudpanel unbanip $EDGE >/dev/null
+  check "no firewall rules came of any of this" '! { nft list ruleset 2>/dev/null; iptables-save 2>/dev/null; } | grep -q f2b-cloudpanel'
+
+  echo "== Bans end, and last as long as they should"
+  check "lifting a ban in the panel works" '[ "$(api_unban $VISITOR)" = 200 ]'
+  checkr "straight away, on 443" '[ ! -e $BANS/$VISITOR ] && [ "$(on_443 $EDGE -H "$(cf $VISITOR)")" = 401 ]'
+  check "and on the panel's own port" '[ "$(on_port $EDGE -H "$(cf $VISITOR)")" = 401 ]'
+  # A jail's ban time also applies to the bans it already has, so nothing else is banned meanwhile.
+  fail2ban-client set cloudpanel bantime 3 >/dev/null
+  fail2ban-client set cloudpanel banip 203.0.113.86 >/dev/null
+  checkr "a ban takes effect" '[ -e $BANS/203.0.113.86 ]'
+  checkr "and runs out by itself" '[ ! -e $BANS/203.0.113.86 ] && [ "$(on_443 $EDGE -H "$(cf 203.0.113.86)")" = 401 ]'
+  fail2ban-client set cloudpanel bantime 3600 >/dev/null
+  check "a ban made in the panel counts straight away" '[ "$(api_ban 203.0.113.85)" = 200 ] && [ "$(on_443 $EDGE -H "$(cf 203.0.113.85)")" = 403 ]'
+
+  fail2ban-client reload >/dev/null
+  checkr "reloading fail2ban keeps bans" 'in_jail 203.0.113.85 && [ "$(on_443 $EDGE -H "$(cf 203.0.113.85)")" = 403 ]'
+  touch $BANS/203.0.113.87
+  systemctl restart fail2ban
+  checkr "and so does restarting it" 'in_jail 203.0.113.85 && [ "$(on_443 $EDGE -H "$(cf 203.0.113.85)")" = 403 ]'
+  check "which also clears anything that ended while it wasn't running" '[ ! -e $BANS/203.0.113.87 ]'
+  check "turning the jail off lets everyone back" '[ "$(f2b_settings false 3)" = 200 ] && [ "$(on_443 $EDGE -H "$(cf 203.0.113.85)")" = 401 ] && [ -z "$(ls -A $BANS)" ]'
+  check "turning it on again restores its bans" '[ "$(f2b_settings true 5)" = 200 ]'
+  checkr "from where it left off" 'in_jail 203.0.113.85 && [ "$(on_443 $EDGE -H "$(cf 203.0.113.85)")" = 403 ]'
+
+  echo "== A server whose clock isn't on UTC"
+  mkdir -p /etc/systemd/system/fail2ban.service.d
+  printf '[Service]\nEnvironment=TZ=Asia/Tokyo\n' >/etc/systemd/system/fail2ban.service.d/e2e-tz.conf
+  systemctl daemon-reload
+  systemctl restart fail2ban
+  retry 'fail2ban-client status cloudpanel >/dev/null 2>&1'
+  for _ in 1 2 3 4 5; do via_nginx $EDGE -H "$(cf 203.0.113.89)"; done
+  checkr "failures still count east of UTC" 'in_jail 203.0.113.89 && [ "$(on_443 $EDGE -H "$(cf 203.0.113.89)")" = 403 ]'
+  rm -f /etc/systemd/system/fail2ban.service.d/e2e-tz.conf
+  rmdir /etc/systemd/system/fail2ban.service.d
+  systemctl daemon-reload
+  systemctl restart fail2ban
+  retry 'fail2ban-client status cloudpanel >/dev/null 2>&1'
+
+  echo "== Upgrading from a jail that used the firewall"
+  sed -i 's/^action = cloudpanel$/port = 8443/' $JAIL
+  rm -f /etc/fail2ban/action.d/cloudpanel.conf
+  restart_panel
+  checkr "starting the panel replaces it" 'grep -q "^action = cloudpanel$" $JAIL && [ -f /etc/fail2ban/action.d/cloudpanel.conf ]'
+  checkr "with fail2ban using the new one" '[ -d $BANS ] && fail2ban-client status cloudpanel >/dev/null 2>&1 && fail2ban-client get cloudpanel actions | grep -qw cloudpanel'
+  checkr "and bans still apply" 'in_jail 203.0.113.85 && [ "$(on_443 $EDGE -H "$(cf 203.0.113.85)")" = 403 ]'
+
+  # 203.0.113.85 stays banned for the reboot, which after_reboot checks.
+  for a in $OTHER $V6; do api_unban $a >/dev/null; done
+  ip addr del $EDGE/32 dev lo
+  ip addr del $OTHER/32 dev lo
+  ip -6 addr del $EDGE6/128 dev lo
+}
+
+bans_after_reboot() {
+  echo "== fail2ban bans after a reboot"
+  local edge=173.245.48.1
+  ip addr add $edge/32 dev lo
+  visitor() { # address -> status of one failed login on 443, through Cloudflare
+    curl -sk -m 10 -o /dev/null -w '%{http_code}' -X POST -H 'X-Requested-With: cloudpanel' -H 'Content-Type: application/json' \
+      -d '{"username":"e2e-probe","password":"wrong"}' --interface $edge --resolve "panel.test.local:443:$edge" \
+      -H "CF-Connecting-IP: $1" https://panel.test.local/api/auth/login
+  }
+  checkr "fail2ban came back with the ban" 'fail2ban-client status cloudpanel | grep -qw 203.0.113.85'
+  checkr "so the client is still refused" '[ "$(visitor 203.0.113.85)" = 403 ]'
+  check "and others aren't" '[ "$(visitor 203.0.113.88)" = 401 ]'
+  ip addr del $edge/32 dev lo
 }
 
 after_reboot() {
@@ -545,6 +911,55 @@ after_reboot() {
   systemctl stop e2e-hand2 2>/dev/null
   check "panel is still healthy" '[ "$(systemctl is-active cloudpanel)" = active ]'
 
+  bans_after_reboot
+  panel_port_after_reboot
+  summary
+}
+
+# Sets up what run.sh then tries from a second container. Each case is a rule that would be
+# listed as active while doing nothing if it landed in the wrong place. Rules made with ufw
+# directly stand in for ones the panel doesn't know about, like the installer's.
+firewall_rules() {
+  login
+  echo "== Firewall rules, for run.sh to try"
+  local subnet
+  subnet="$(hostname -i | cut -d' ' -f1 | cut -d. -f1-3).0/24"
+  ufw default deny incoming >/dev/null
+  ufw allow 22/tcp >/dev/null
+  ufw allow 8443/tcp >/dev/null
+  ufw --force enable >/dev/null
+  for p in 19100 19205 19206 19300 19600 19700 19800 19900 19950 19960 20000 20100; do
+    systemd-run --quiet --unit="e2e-http-$p" python3 -m http.server "$p" --bind 0.0.0.0
+  done
+  sleep 2
+  rule() { # port protocol action [source]
+    local r
+    r=$(call POST /firewall/rules "{\"port\":\"$1\",\"protocol\":\"$2\",\"action\":\"$3\"${4:+,\"source\":\"$4\"}}")
+    if echo "$r" | grep -q '"id"'; then ok "$3 $1/$2${4:+ from $4}"; else bad "$3 $1/$2${4:+ from $4}: $r"; fi
+  }
+  # run.sh lists the result it expects for each port.
+  ufw allow 19100/tcp >/dev/null
+  rule 19100 tcp deny                 # the exact rule, which ufw would otherwise keep
+  ufw allow 19200:19210/tcp >/dev/null
+  rule 19205 tcp deny                 # one port in an allowed range; 19206 stays open
+  ufw allow 19300/tcp >/dev/null
+  rule 19300 tcp deny "$subnet"       # a network, against an open port
+  ufw allow 19600/tcp >/dev/null
+  rule 19600 any deny                 # every protocol, against a TCP allow
+  rule 19700 tcp deny
+  rule 19700 tcp allow "$subnet"      # "except my office", added after the deny
+  rule 19800 tcp allow "$subnet"
+  rule 19800 tcp deny                 # "except my office", added before the deny
+  ufw allow 19900/tcp >/dev/null
+  rule 19900 tcp deny 203.0.113.0/24  # someone else's network leaves this one open
+  ufw allow 19950/tcp >/dev/null      # the controls: allowed, and 19960 with no rule at all
+  rule 20000 tcp allow
+  rule 20000 tcp deny                 # replaces the panel's own allow
+  rule 20100 tcp deny
+  rule 20100 tcp allow                # and the other way round
+  check "the panel lists only the rule that replaced the other" '[ "$(call GET /firewall/rules | j "\",\".join(r[\"action\"] for r in d if r[\"port\"]==20000)")" = deny ]'
+  check "in both directions" '[ "$(call GET /firewall/rules | j "\",\".join(r[\"action\"] for r in d if r[\"port\"]==20100)")" = allow ]'
+  ufw status numbered | head -30
   summary
 }
 
@@ -557,6 +972,7 @@ summary() {
 case "${1:-}" in
   before-reboot) before_reboot ;;
   after-reboot) after_reboot ;;
+  firewall-rules) firewall_rules ;;
   *)
     echo "usage: $0 before-reboot|after-reboot"
     exit 2

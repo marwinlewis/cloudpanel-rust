@@ -447,12 +447,18 @@ const PREBUILT_NOTE: &str = "This looks like a prebuilt deploy: it has build out
                              files or lockfile. Its node_modules is already complete and there is nothing here to \
                              build, so restart the app after uploading a new build.";
 
+/// A file in a site's working folder, which root is reading on behalf of its user: nothing but a
+/// regular file in that folder, so a link can't show it another file and a FIFO can't hang it.
+fn read_project_file(wd: &Path, name: &str) -> std::io::Result<String> {
+    crate::fsutil::read_confined(wd, &wd.join(name), 4 * 1024 * 1024)
+}
+
 pub fn inspect_project(wd: &Path) -> ProjectInfo {
     let mut info = ProjectInfo {
         package_manager: "npm".into(),
         ..Default::default()
     };
-    let Ok(text) = fs::read_to_string(wd.join("package.json")) else {
+    let Ok(text) = read_project_file(wd, "package.json") else {
         info.note = Some(format!("No package.json in {}", wd.display()));
         return info;
     };
@@ -727,6 +733,8 @@ mod tests {
             app_manager: "systemd".into(),
             app_pm2: "{}".into(),
             www_redirect: false,
+            php_version: None,
+            vhost_managed: true,
         }
     }
 

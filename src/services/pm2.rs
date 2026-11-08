@@ -343,10 +343,14 @@ fn daemon_alive(site: &Site) -> bool {
     let Some(home) = site.home_dir.as_deref() else {
         return false;
     };
-    let Some(pid) = fs::read_to_string(format!("{home}/.pm2/pm2.pid"))
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-    else {
+    // The site's user can make this anything, including a FIFO that would hang whoever reads it.
+    let Some(pid) = crate::fsutil::read_confined(
+        std::path::Path::new(home),
+        std::path::Path::new(&format!("{home}/.pm2/pm2.pid")),
+        64,
+    )
+    .ok()
+    .and_then(|s| s.trim().parse::<u32>().ok()) else {
         return false;
     };
     // The site user controls the pid file, so ask /proc what that process really is.

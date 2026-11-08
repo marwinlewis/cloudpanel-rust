@@ -30,6 +30,11 @@ pub async fn file_response(path: PathBuf, name: &str) -> ApiResult<Response> {
     let file = tokio::fs::File::open(&path)
         .await
         .map_err(|_| ApiError::NotFound("File"))?;
+    open_file_response(file, name).await
+}
+
+/// Stream an already open file as an attachment, for one the panel opened safely itself.
+pub async fn open_file_response(file: tokio::fs::File, name: &str) -> ApiResult<Response> {
     let len = file.metadata().await.map(|m| m.len()).ok();
     let stream = tokio_util::io::ReaderStream::new(file);
     let mut res = Body::from_stream(stream).into_response();
@@ -53,7 +58,12 @@ pub struct Upload {
     pub file_name: String,
     pub temp_path: PathBuf,
     pub size: u64,
+    /// What identifies the temp file the panel wrote, as its directory may be someone else's.
+    pub written: (u64, u64),
     pub fields: std::collections::HashMap<String, String>,
+    /// Held open until this is dropped, so that while it's in use, no other file can be given the
+    /// same identity, even if the temp file's name is deleted.
+    _held: Option<tokio::fs::File>,
 }
 
 impl Drop for Upload {
@@ -88,12 +98,21 @@ pub async fn receive_upload(mut mp: Multipart, dir: &Path, max: u64) -> ApiResul
             .map(|n| n.rsplit(['/', '\\']).next().unwrap_or(n).to_string())
             .unwrap_or_else(|| "upload".into());
         let temp_path = dir.join(format!(".upload-{}", crate::auth::random_password(16)));
-        let mut out = tokio::fs::File::create(&temp_path).await.map_err(ApiError::internal)?;
+        // Only root can read it until it's in place. The directory can belong to a site's user, so
+        // a name that's already there is never reused and a link is never followed.
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut out = opts.open(&temp_path).await.map_err(ApiError::internal)?;
+        let meta = out.metadata().await.map_err(ApiError::internal)?;
         let mut up = Upload {
             file_name,
             temp_path,
             size: 0,
+            written: crate::fsutil::identity(&meta),
             fields: Default::default(),
+            _held: None,
         };
         while let Some(chunk) = field
             .chunk()
@@ -110,6 +129,7 @@ pub async fn receive_upload(mut mp: Multipart, dir: &Path, max: u64) -> ApiResul
             out.write_all(&chunk).await.map_err(ApiError::internal)?;
         }
         out.flush().await.map_err(ApiError::internal)?;
+        up._held = Some(out);
         upload = Some(up);
     }
     let mut up = upload.ok_or_else(|| ApiError::BadRequest("No file was uploaded".into()))?;

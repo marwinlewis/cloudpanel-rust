@@ -1,4 +1,4 @@
-use super::cmd::{run, CmdOutcome};
+use super::cmd::{run_host_simple, CmdOutcome};
 use crate::fsutil::{create_private_dir, write_atomic};
 use std::path::Path;
 use tracing::info;
@@ -104,7 +104,8 @@ impl SslService {
         let primary = names.first().ok_or("No domain given")?;
         info!("Requesting Let's Encrypt certificate for {}", names.join(", "));
 
-        match run("certbot", &certbot_args(names, email)) {
+        // Outside the sandbox, because its nginx plugin tests nginx's config. See `NginxService::test`.
+        match run_host_simple("certbot", &certbot_args(names, email)) {
             CmdOutcome::Ok(_) => Ok((
                 format!("/etc/letsencrypt/live/{primary}/fullchain.pem"),
                 format!("/etc/letsencrypt/live/{primary}/privkey.pem"),
@@ -153,7 +154,7 @@ impl SslService {
 
     /// Force-renew a Let's Encrypt certificate now.
     pub fn renew_letsencrypt(cert_name: &str) -> Result<(), String> {
-        match run(
+        match run_host_simple(
             "certbot",
             &[
                 "renew",

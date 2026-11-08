@@ -72,6 +72,7 @@ export function renderAlerts(view) {
       h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'services', checked: rl.services }), 'A service or site app stops running'),
       h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'backups', checked: rl.backups }), 'A backup fails'),
       h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'security', checked: rl.security }), 'Security events (new administrator, 2FA turned off)'),
+      h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'panel_updates', checked: rl.panel_updates }), 'A new CloudPanel version is released'),
       h('div', null, h('button', { class: 'btn primary', type: 'submit', text: 'Save rules' })));
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -80,7 +81,7 @@ export function renderAlerts(view) {
         const x = await api('/alerts/rules', { method: 'PUT', body: {
           disk_pct: Number(f.disk_pct.value), memory_pct: Number(f.memory_pct.value), cpu_pct: Number(f.cpu_pct.value),
           sustain_minutes: Number(f.sustain_minutes.value), cert_days: Number(f.cert_days.value),
-          services: f.services.checked, backups: f.backups.checked, security: f.security.checked,
+          services: f.services.checked, backups: f.backups.checked, security: f.security.checked, panel_updates: f.panel_updates.checked,
         } });
         toast(x.message);
       });

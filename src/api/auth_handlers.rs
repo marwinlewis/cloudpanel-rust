@@ -44,8 +44,14 @@ fn cookie_headers(state: &SharedState, token: Option<&str>) -> HeaderMap {
 }
 
 /// Append a failed attempt to `/var/log/cloudpanel/auth.log` for fail2ban.
+///
+/// Not for a Cloudflare address: that is a request that didn't name its visitor, so these failures
+/// aren't that address's, and everyone connecting through it would share the ban.
 fn log_auth_failure(state: &SharedState, ip: IpAddr, username: &str, reason: &str) {
     use std::io::Write;
+    if state.is_cloudflare(ip) {
+        return;
+    }
     let dir = &state.config.log_dir;
     let _ = std::fs::create_dir_all(dir);
     let user: String = username
@@ -67,7 +73,6 @@ fn log_auth_failure(state: &SharedState, ip: IpAddr, username: &str, reason: &st
 }
 
 async fn record_failure(state: &SharedState, ip: IpAddr, username: String, reason: &'static str) {
-    state.limiter.record_failure(ip);
     tracing::warn!("failed login ({reason}) from {ip}");
     log_auth_failure(state, ip, &username, reason);
     let ip_s = ip.to_string();
@@ -87,7 +92,6 @@ async fn record_failure(state: &SharedState, ip: IpAddr, username: String, reaso
 }
 
 async fn finish_login(state: &SharedState, user: User, ip: IpAddr, via: &'static str) -> ApiResult<impl IntoResponse> {
-    state.limiter.reset(ip);
     let (uid, name, ip_s) = (user.id, user.username.clone(), ip.to_string());
     state
         .db(move |conn| {
@@ -126,6 +130,14 @@ pub async fn login(
     }
 
     let username = payload.username.trim().to_string();
+    if let Err(wait) = state.limiter.begin_password(ip, &username) {
+        // Refused for the account rather than this address: fail2ban still has to hear about the
+        // address, or guesses spread over many addresses would never get any of them banned.
+        if state.limiter.check(ip).is_ok() {
+            log_auth_failure(&state, ip, &username, "limited");
+        }
+        return Err(ApiError::TooManyRequests(wait));
+    }
     let lookup = username.clone();
     let user = state.db(move |conn| Ok(find_user_by_username(conn, &lookup)?)).await?;
 
@@ -149,6 +161,8 @@ pub async fn login(
             return Err(ApiError::Unauthorized("Invalid username or password".into()));
         }
     };
+
+    state.limiter.password_ok(ip, &username);
 
     if user.totp_enabled {
         let token = create_mfa_token(user.id, &user.username, user.token_version, &state.jwt_secret)?;
@@ -181,12 +195,21 @@ pub async fn login_mfa(
     if user.token_version != claims.ver || !user.totp_enabled {
         return Err(expired());
     }
+    // Limited per account as well as per address: whoever is here knows the password already, and
+    // may well have more than one address to guess from. Only for a token that's real, or anyone
+    // could lock this step for anyone.
+    state
+        .limiter
+        .begin_second_step(ip, user.id)
+        .map_err(ApiError::TooManyRequests)?;
     let secret = user.totp_secret.clone().unwrap_or_default();
     let code = p.code.trim().to_string();
     if totp::verify(&secret, &user.username, &code) {
+        state.limiter.second_step_ok(ip, user.id);
         return finish_login(&state, user, ip, "password+totp").await;
     }
     if let Some(remaining) = totp::consume_recovery_code(&user.recovery_codes, &code) {
+        state.limiter.second_step_ok(ip, user.id);
         let id = user.id;
         state
             .db(move |conn| Ok(db::set_recovery_codes(conn, id, &remaining)?))

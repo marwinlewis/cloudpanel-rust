@@ -1,7 +1,7 @@
 'use strict';
 import {
-  api, card, confirmDialog, emptyState, errorState, fmtAgo, fmtBytes, h, icon, kv, moreButton, openDialog, runJob,
-  setActions, setSub, skeletonRows, table, tabStrip, toast, withBusy,
+  api, card, confirmDialog, copyButton, emptyState, errorState, fmtAgo, fmtBytes, h, hooks, icon, kv, moreButton, openDialog,
+  runJob, setActions, setSub, skeletonRows, table, tabStrip, toast, withBusy,
 } from '../core.js';
 
 function stateBadge(s) {
@@ -68,13 +68,53 @@ function renderServiceList(el) {
   load();
 }
 
-function renderUpdates(el) {
-  const holder = h('div');
+// The panel's own version, which is separate from the server's packages below it.
+function renderPanelUpdate(el) {
+  const holder = h('div', null, card({ title: 'CloudPanel', body: h('div', { class: 'skeleton' }) }));
   el.append(holder);
+  function draw(p) {
+    const check = h('button', { class: 'btn' }, icon('refresh'), 'Check for new version');
+    check.addEventListener('click', () => withBusy(check, async () => {
+      const r = await api('/system/panel-update/check', { method: 'POST' });
+      draw(r);
+      hooks.refreshPanelUpdate();
+      if (r.error) toast(`Could not check: ${r.error}`, 'error');
+      else toast(r.update_available ? `CloudPanel v${r.latest} is available` : 'CloudPanel is up to date');
+    }));
+    const latest = p.latest ? `v${p.latest}` : p.checked_at ? 'No release published' : 'Not checked yet';
+    holder.replaceChildren(card({
+      title: 'CloudPanel', sub: 'The control panel itself. Checked daily against GitHub releases.',
+      actions: check,
+      body: h('div', { class: 'form' },
+        p.update_available && h('div', { class: 'alert info' }, icon('download'), h('div', { class: 'grow form' },
+          h('div', null,
+            h('strong', { text: `CloudPanel v${p.latest} is available. ` }),
+            p.release_url && h('a', { href: p.release_url, target: '_blank', rel: 'noopener noreferrer', text: 'Release notes' })),
+          h('div', { text: 'To update, run this on the server. Your data, secrets and certificate are kept.' }),
+          h('div', { class: 'row' }, h('code', { class: 'grow wrap-anywhere', text: p.upgrade_command }), copyButton(p.upgrade_command)))),
+        p.error && h('div', { class: 'alert warn' }, icon('alert'), h('div', { text: `Could not check for a new version (${fmtAgo(p.failed_at)}): ${p.error}` })),
+        kv([
+          ['Installed', `v${p.current}`],
+          ['Latest', latest],
+          ['Last checked', p.checked_at ? fmtAgo(p.checked_at) : 'Never'],
+        ])),
+    }));
+  }
+  async function load() {
+    try { draw(await api('/system/panel-update')); } catch (e) { if (e.status !== 401) holder.replaceChildren(card({ title: 'CloudPanel', body: errorState(e.message, load) })); }
+  }
+  load();
+}
+
+function renderUpdates(el) {
+  const panel = h('div');
+  const holder = h('div', { class: 'stack' });
+  el.append(h('div', { class: 'stack' }, panel, holder));
+  renderPanelUpdate(panel);
   async function load() {
     try {
       const u = await api('/system/updates');
-      setSub(u.checked_at ? `${u.packages.length} update${u.packages.length === 1 ? '' : 's'} · checked ${fmtAgo(u.checked_at)}` : 'Not checked yet');
+      setSub(u.checked_at ? `${u.packages.length} package update${u.packages.length === 1 ? '' : 's'} · checked ${fmtAgo(u.checked_at)}` : 'Packages not checked yet');
       const check = h('button', { class: 'btn' }, icon('refresh'), 'Check for updates');
       check.addEventListener('click', async () => { try { await runJob('/system/updates/refresh', 'Checking for updates'); } catch (e) { toast(e.message, 'error'); } load(); });
       const upgrade = h('button', { class: 'btn primary', disabled: !u.packages.length }, icon('download'), 'Install all updates');

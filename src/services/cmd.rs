@@ -289,6 +289,15 @@ pub fn run_streaming(program: &str, args: &[&str], opts: &CmdOpts, on_line: &mut
     empty(code, false, timed_out)
 }
 
+/// [`run_host`] with default options, as [`run`] is to [`run_with`].
+pub fn run_host_simple(program: &str, args: &[&str]) -> CmdOutcome {
+    // Through systemd-run a missing program looks like any other failure, so check first.
+    if !which(program) {
+        return CmdOutcome::Missing;
+    }
+    run_host(program, args, &CmdOpts::default()).outcome(program)
+}
+
 /// Run a command outside the panel's systemd sandbox (for tools that rewrite files under
 /// `/etc` or `/usr`, like `useradd` or `apt-get`). Falls back to a direct call when
 /// `systemd-run` is unavailable (development).

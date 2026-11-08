@@ -35,6 +35,19 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cross
+      # The panel reports this version and compares it with the latest release's tag, so it must
+      # be the tag's: otherwise a server on the latest release would be told to update, forever.
+      - name: Set the version from the tag
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Release tags look like v1.2.3 or v1.2.3-rc1, not '$TAG'"
+            exit 1
+          fi
+          sed -i "0,/^version = .*/s//version = \"$version\"/" Cargo.toml
+          cargo update --workspace
       - name: Build
         run: cross build --release --locked --target ${{ matrix.target }}
       - name: Package

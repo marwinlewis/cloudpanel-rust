@@ -423,6 +423,21 @@ pub fn file_mode(input: &str) -> VResult<u32> {
 /// Database / database-user identifier: `^[a-z][a-z0-9_]{0,31}$`.
 pub fn db_identifier(input: &str) -> VResult<String> {
     let s = input.trim();
+    // These already exist on the server. Taking one over would hand its contents, its credentials
+    // or a way to drop it to whoever asked. `root` is the account that runs the panel's own statements.
+    const RESERVED: &[&str] = &[
+        "admin",
+        "config",
+        "local",
+        "mysql",
+        "information_schema",
+        "performance_schema",
+        "sys",
+        "root",
+    ];
+    if RESERVED.contains(&s) {
+        return Err(format!("{s} is reserved by the database server, choose another name"));
+    }
     let mut chars = s.chars();
     let ok_first = chars.next().is_some_and(|c| c.is_ascii_lowercase());
     if !ok_first || s.len() > 32 || !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {

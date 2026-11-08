@@ -17,16 +17,19 @@ pub mod system_handlers;
 pub mod user_handlers;
 
 #[cfg(test)]
+mod security_tests;
+#[cfg(test)]
 mod tests;
 
+use crate::services::{cloudflare::Ranges, fail2ban};
 use crate::state::SharedState;
 use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Request, State},
-    http::{header, HeaderMap, HeaderValue, Method},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
-    Router,
+    Json, Router,
 };
 use error::ApiError;
 use std::net::{IpAddr, SocketAddr};
@@ -36,7 +39,14 @@ pub const CSRF_HEADER: &str = "x-requested-with";
 pub const CSRF_VALUE: &str = "cloudpanel";
 const PROXY_HEADER: &str = "x-cloudpanel-proxy";
 
-pub fn create_api_router(state: SharedState) -> Router {
+/// The whole panel: the API and the web UI, behind one check of who is asking.
+pub fn create_app(state: SharedState) -> Router {
+    create_api_router(state.clone())
+        .fallback(crate::web::static_handler)
+        .layer(middleware::from_fn_with_state(state, real_client_address))
+}
+
+fn create_api_router(state: SharedState) -> Router {
     let api = Router::new()
         // Auth
         .route("/auth/login", post(auth_handlers::login))
@@ -72,6 +82,7 @@ pub fn create_api_router(state: SharedState) -> Router {
             "/sites",
             get(site_handlers::get_sites).post(site_handlers::create_new_site),
         )
+        .route("/sites/options", get(site_handlers::site_options))
         .route(
             "/sites/:id",
             get(site_handlers::get_site)
@@ -181,6 +192,8 @@ pub fn create_api_router(state: SharedState) -> Router {
         .route("/system/updates", get(service_handlers::get_updates))
         .route("/system/updates/refresh", post(service_handlers::refresh_updates))
         .route("/system/updates/upgrade", post(service_handlers::upgrade_all))
+        .route("/system/panel-update", get(service_handlers::get_panel_update))
+        .route("/system/panel-update/check", post(service_handlers::check_panel_update))
         .route("/system/reboot", post(service_handlers::reboot))
         // Docker
         .route("/docker/status", get(docker_handlers::get_docker_status))
@@ -232,6 +245,7 @@ pub fn create_api_router(state: SharedState) -> Router {
             delete(alert_handlers::delete_channel).patch(alert_handlers::set_channel_enabled),
         )
         .route("/alerts/channels/:id/test", post(alert_handlers::test_channel))
+        .route("/settings/panel-access", put(alert_handlers::set_panel_access))
         .route(
             "/settings/panel-cert",
             get(alert_handlers::get_panel_cert)
@@ -264,7 +278,6 @@ pub fn create_api_router(state: SharedState) -> Router {
         .route("/cron/jobs/:id/runs", get(cron_handlers::cron_runs))
         .fallback(|| async { ApiError::NotFound("Endpoint") })
         .layer(middleware::from_fn(csrf_guard))
-        .layer(middleware::from_fn_with_state(state.clone(), real_client_address))
         .layer(DefaultBodyLimit::max(256 * 1024))
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,
@@ -282,28 +295,72 @@ pub fn create_api_router(state: SharedState) -> Router {
 /// loopback proves nothing, because site users can connect to the panel from this machine, and
 /// believing `X-Real-IP` from them would let them dodge the login limiter by changing it on
 /// every try. So nginx also sends a secret from a config file only root can read.
-pub(crate) fn forwarded_client(peer: IpAddr, headers: &HeaderMap, secret: &str) -> Option<IpAddr> {
-    if !peer.is_loopback() || secret.is_empty() {
+///
+/// nginx resolves Cloudflare's `CF-Connecting-IP` before filling in `X-Real-IP`. Cloudflare can
+/// also proxy this port directly (8443 is one of the ports it forwards), which is the case
+/// handled here, by the same rule: only a connection from Cloudflare's own addresses counts.
+pub(crate) fn forwarded_client(peer: IpAddr, headers: &HeaderMap, secret: &str, cloudflare: &Ranges) -> Option<IpAddr> {
+    if cloudflare.contains(peer) {
+        return header_address(headers, "cf-connecting-ip");
+    }
+    if !from_panel_site(peer, headers, secret) {
         return None;
     }
-    let given = headers.get(PROXY_HEADER)?.as_bytes();
-    let same = given.len() == secret.len()
+    header_address(headers, "x-real-ip")
+}
+
+/// Did this request come through the panel's own nginx site? See [`forwarded_client`].
+pub(crate) fn from_panel_site(peer: IpAddr, headers: &HeaderMap, secret: &str) -> bool {
+    if !peer.is_loopback() || secret.is_empty() {
+        return false;
+    }
+    let Some(given) = headers.get(PROXY_HEADER).map(|v| v.as_bytes()) else {
+        return false;
+    };
+    given.len() == secret.len()
         && given
             .iter()
             .zip(secret.as_bytes())
             .fold(0u8, |diff, (a, b)| diff | (a ^ b))
-            == 0;
-    if !same {
-        return None;
-    }
-    headers.get("x-real-ip")?.to_str().ok()?.trim().parse().ok()
+            == 0
 }
 
-/// Everything after this sees the real client address in `ConnectInfo`.
+/// Marks a request that came through the panel's own nginx site.
+#[derive(Clone, Copy)]
+pub struct ViaPanelSite;
+
+fn header_address(headers: &HeaderMap, name: &str) -> Option<IpAddr> {
+    headers.get(name)?.to_str().ok()?.trim().parse().ok()
+}
+
+/// Is this client refused because of a fail2ban ban? Whatever fail2ban's list says, not for a
+/// Cloudflare address, which stands for everyone connecting through it, and not for this machine,
+/// as an SSH tunnel is how an administrator gets back in to lift a ban on themselves.
+fn refused(state: &SharedState, client: IpAddr) -> bool {
+    !client.to_canonical().is_loopback() && !state.is_cloudflare(client) && fail2ban::is_banned(&state.config, client)
+}
+
+/// Everything after this sees the real client address in `ConnectInfo`, and a banned client gets
+/// no further. Both the panel's own port and its nginx site end up here.
 async fn real_client_address(State(state): State<SharedState>, mut req: Request, next: Next) -> Response {
     let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
     if let Some(peer) = peer {
-        if let Some(ip) = forwarded_client(peer.ip(), req.headers(), &state.proxy_secret) {
+        if from_panel_site(peer.ip(), req.headers(), &state.proxy_secret) {
+            req.extensions_mut().insert(ViaPanelSite);
+        }
+        let client = {
+            let cloudflare = state.cloudflare.read().unwrap_or_else(|e| e.into_inner());
+            forwarded_client(peer.ip(), req.headers(), &state.proxy_secret, &cloudflare)
+        };
+        if refused(&state, client.unwrap_or(peer.ip())) {
+            return (
+                StatusCode::FORBIDDEN,
+                [(header::CACHE_CONTROL, "no-store")],
+                Json(serde_json::json!({ "error": "This address is blocked after too many failed sign-ins" })),
+            )
+                .into_response();
+        }
+        if let Some(ip) = client {
             req.extensions_mut()
                 .insert(ConnectInfo(SocketAddr::new(ip, peer.port())));
         }

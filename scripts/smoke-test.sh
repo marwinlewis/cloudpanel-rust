@@ -140,6 +140,7 @@ check "ssh stop refused" 'call POST /services/ssh/stop | grep -q refused'
 JID=$(call POST /system/updates/refresh | j 'd["job_id"]')
 check "apt update job" '[ "$(job $JID)" = succeeded ]'
 check "system info" 'call GET /system/info | grep -q panel_version'
+check "panel update status" 'call GET /system/panel-update | grep -q update_available'
 
 echo "== cleanup"
 call DELETE "/sites/$S?delete_files=true" >/dev/null

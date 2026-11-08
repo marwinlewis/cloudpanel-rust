@@ -1,6 +1,8 @@
 //! A real (Let's Encrypt) certificate for the panel itself, hot-reloaded into the
 //! running TLS listener.
 
+use super::cloudflare::Ranges;
+use super::firewall::{Action, FirewallService, Protocol, Rule};
 use super::nginx::{NginxService, PanelVhost};
 use crate::config::Config;
 use crate::db;
@@ -11,6 +13,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 pub const SETTING: &str = "panel_tls";
+const DIRECT_CLOSED_SETTING: &str = "panel_direct_closed";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PanelTls {
@@ -39,6 +42,83 @@ pub fn effective_paths(config: &Config, stored: Option<&PanelTls>) -> Option<(Pa
     }
 }
 
+/// Whether the admin closed the panel's own port, leaving only its hostname and SSH tunnels.
+pub fn direct_closed(conn: &rusqlite::Connection) -> bool {
+    db::get_setting(conn, DIRECT_CLOSED_SETTING).ok().flatten().as_deref() == Some("1")
+}
+
+pub fn set_direct_closed(conn: &rusqlite::Connection, closed: bool) -> rusqlite::Result<()> {
+    if closed {
+        db::set_setting(conn, DIRECT_CLOSED_SETTING, "1")
+    } else {
+        db::delete_setting(conn, DIRECT_CLOSED_SETTING)
+    }
+}
+
+/// The same port on loopback, which nginx and SSH tunnels can reach and nothing else can.
+/// Listening there works whatever the firewall's rules are, or if it is off.
+pub fn loopback_bind(bind_addr: &str) -> Option<String> {
+    let addr: SocketAddr = bind_addr.parse().ok()?;
+    let ip = if addr.is_ipv6() { "[::1]" } else { "127.0.0.1" };
+    Some(format!("{ip}:{}", addr.port()))
+}
+
+/// Make sure the firewall lets the panel's port in, in case its rule was removed by hand while
+/// the port was closed. Harmless if it is already there or the firewall is off. This replaces a
+/// deny rule on the port, so that one has to go from the panel's list as well.
+pub fn allow_in_firewall(config: &Config, conn: &rusqlite::Connection) {
+    let Some(port) = config.panel_port() else {
+        return;
+    };
+    let rule = Rule {
+        action: Action::Allow,
+        port: Some(port),
+        port_end: None,
+        protocol: Protocol::Tcp,
+        source: None,
+    };
+    if let Err(e) = FirewallService::add(&rule, Some("CloudPanel")) {
+        tracing::warn!("could not allow the panel's port in the firewall: {e}");
+        return;
+    }
+    let same_match = db::NewRule {
+        port: Some(port),
+        port_end: None,
+        protocol: rule.protocol.as_str(),
+        action: rule.action.as_str(),
+        source: None,
+        comment: None,
+    };
+    if let Err(e) = db::delete_firewall_rule_with_action(conn, &same_match, "deny") {
+        tracing::warn!("could not update the firewall rule list: {e}");
+    }
+}
+
+/// Is nginx answering on port 443? It can still be starting when the panel starts at boot.
+pub fn wait_for_nginx(attempts: u32) -> bool {
+    let addr: SocketAddr = ([127, 0, 0, 1], 443).into();
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(1)).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Restart the panel so it listens on its new address. Run from a request, this outlives the
+/// process. False when systemd isn't managing it.
+pub fn restart_panel() -> bool {
+    let r = super::cmd::run_with(
+        "systemctl",
+        &["restart", "--no-block", "cloudpanel"],
+        &super::cmd::CmdOpts::default().timeout(20),
+    );
+    r.success()
+}
+
 /// Where nginx reaches the panel. None when the bind address can't be understood.
 pub fn upstream(config: &Config, tls: bool) -> Option<String> {
     let addr: SocketAddr = config.bind_addr.parse().ok()?;
@@ -63,7 +143,13 @@ pub fn site_on_hostname(sites: &[Site], hostname: &str) -> Option<String> {
 
 /// Serve the panel's hostname on port 443 through nginx. Certificates renew in place, and
 /// certbot's hook reloads nginx afterwards.
-pub fn apply_vhost(config: &Config, stored: &PanelTls, tls: bool, secret: &str) -> Result<(), String> {
+pub fn apply_vhost(
+    config: &Config,
+    stored: &PanelTls,
+    tls: bool,
+    secret: &str,
+    cloudflare: &Ranges,
+) -> Result<(), String> {
     let upstream = upstream(config, tls).ok_or("The panel's bind address could not be read")?;
     NginxService::apply_panel_vhost(
         config,
@@ -73,23 +159,25 @@ pub fn apply_vhost(config: &Config, stored: &PanelTls, tls: bool, secret: &str) 
             key: stored.key.clone(),
             upstream,
             secret: secret.to_string(),
+            real_ip_from: cloudflare.cidrs(),
         },
     )
 }
 
-/// At startup, set up the nginx site for a hostname configured before this feature existed,
-/// so upgrading is enough. Failing here must not stop the panel, which is still on its own
-/// port and is how anyone would fix the problem.
-pub fn sync_vhost(config: &Config, conn: &rusqlite::Connection, tls: bool, secret: &str) {
+/// Bring the nginx site in line with the settings: at startup, for a hostname configured before
+/// this feature existed, so upgrading is enough, and when Cloudflare's ranges change. Failing
+/// here must not stop the panel, which is still on its own port and is how anyone would fix the
+/// problem. Returns whether the nginx site is in place.
+pub fn sync_vhost(config: &Config, conn: &rusqlite::Connection, tls: bool, secret: &str, cloudflare: &Ranges) -> bool {
     let Some(stored) = load(conn) else {
-        return;
+        return false;
     };
     if !(Path::new(&stored.cert).exists() && Path::new(&stored.key).exists()) {
         tracing::warn!(
             "panel certificate for {} is missing; not serving it on port 443",
             stored.hostname
         );
-        return;
+        return false;
     }
     let sites = db::list_sites(conn).unwrap_or_default();
     if let Some(site) = site_on_hostname(&sites, &stored.hostname) {
@@ -97,11 +185,13 @@ pub fn sync_vhost(config: &Config, conn: &rusqlite::Connection, tls: bool, secre
             "not serving the panel on {} through nginx: the site {site} answers on that name",
             stored.hostname
         );
-        return;
+        return false;
     }
-    if let Err(e) = apply_vhost(config, &stored, tls, secret) {
+    if let Err(e) = apply_vhost(config, &stored, tls, secret, cloudflare) {
         tracing::warn!("could not serve the panel on {} through nginx: {e}", stored.hostname);
+        return false;
     }
+    true
 }
 
 /// Swap the live listener's certificate. Returns false when the panel runs without TLS.
@@ -187,6 +277,14 @@ mod tests {
         assert_eq!(upstream(&c, true).unwrap(), "https://[::1]:8443");
         c.bind_addr = "not an address".into();
         assert!(upstream(&c, true).is_none());
+    }
+
+    #[test]
+    fn closing_the_port_keeps_it_and_moves_to_loopback() {
+        assert_eq!(loopback_bind("0.0.0.0:8443").unwrap(), "127.0.0.1:8443");
+        assert_eq!(loopback_bind("10.0.0.5:9000").unwrap(), "127.0.0.1:9000");
+        assert_eq!(loopback_bind("[::]:8443").unwrap(), "[::1]:8443");
+        assert!(loopback_bind("garbage").is_none());
     }
 
     #[test]

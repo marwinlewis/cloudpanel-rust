@@ -103,16 +103,24 @@ pub async fn add_rule(
     // Lockout protection.
     if rule.action == Action::Deny {
         let ssh = blocking(|| Ok(FirewallService::ssh_ports())).await?;
-        let protected: Vec<u16> = ssh.into_iter().chain(state.config.panel_port()).collect();
         let my_ip = admin.0.ip.as_deref().and_then(|i| i.parse().ok());
         let hits_me = match (&rule.source, my_ip) {
             (None, _) => true,
             (Some(src), Some(ip)) => cidr_contains(src, ip),
             (Some(_), None) => false,
         };
-        if hits_me && protected.iter().any(|p| rule.covers_port(*p)) {
+        if hits_me && ssh.iter().any(|p| rule.covers_port(*p)) {
             return Err(ApiError::BadRequest(
-                "Refusing a rule that would block SSH or the control panel for your own connection".into(),
+                "Refusing a rule that would block SSH for your own connection".into(),
+            ));
+        }
+        // Nothing outside can reach a closed panel port, so a rule there can't lock anyone out.
+        let panel = state.config.panel_port().filter(|_| !state.direct_closed);
+        if hits_me && panel.is_some_and(|p| rule.covers_port(p)) {
+            return Err(ApiError::BadRequest(
+                "Refusing a rule that would block the control panel for your own connection. To stop direct access \
+                 to the panel's port, set up a panel hostname and close the port in Settings → Panel certificate."
+                    .into(),
             ));
         }
     }
@@ -131,6 +139,8 @@ pub async fn add_rule(
                 return Err(ApiError::Conflict("That rule already exists".into()));
             }
             FirewallService::add(&rule, comment.as_deref()).map_err(ApiError::Unprocessable)?;
+            // Adding it removed a rule with the same match and the other action from ufw.
+            db::delete_firewall_rule_with_action(conn, &new, rule.action.opposite().as_str())?;
             let id = db::create_firewall_rule(conn, &new)?;
             let desc = format!("{} {}", rule.action.as_str(), rule.spec().join(" "));
             audit::record(conn, &admin.0, "firewall.add", None, Some(&desc));
@@ -235,6 +245,11 @@ async fn ban_or_unban(admin: AdminUser, state: SharedState, p: BanRequest, ban: 
     }
     if ban && admin.0.ip.as_deref() == Some(ip.as_str()) {
         return Err(ApiError::BadRequest("Refusing to ban your own IP address".into()));
+    }
+    if ban && p.jail == fail2ban::PANEL_JAIL && ip.parse::<std::net::IpAddr>().is_ok_and(|a| state.is_cloudflare(a)) {
+        return Err(ApiError::BadRequest(
+            "That is a Cloudflare address, used by many visitors. Ban the visitor's own address.".into(),
+        ));
     }
     let (jail, addr) = (p.jail.clone(), ip.clone());
     blocking(move || {

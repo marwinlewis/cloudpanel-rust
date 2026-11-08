@@ -21,9 +21,18 @@ pub struct Config {
     pub stacks_dir: PathBuf,
     pub nginx_log_dir: PathBuf,
     pub fail2ban_dir: PathBuf,
+    /// One file per address banned from the panel, kept by fail2ban's action. Under `/run`, as
+    /// fail2ban restores its bans after a reboot.
+    pub ban_dir: PathBuf,
     pub sshd_config_dir: PathBuf,
     /// Database engines selected at install time (`CLOUDPANEL_DB_ENGINES`).
     pub db_engines: Vec<String>,
+    /// PHP sites can be created, chosen at install time (`CLOUDPANEL_PHP=1`).
+    pub php_enabled: bool,
+    /// Where Cloudflare's address ranges are fetched from (`CLOUDPANEL_CLOUDFLARE_IPS_URL`).
+    pub cloudflare_ips_url: String,
+    /// Where the latest CloudPanel release is looked up (`CLOUDPANEL_RELEASE_URL`).
+    pub panel_release_url: String,
 }
 
 fn env_or(key: &str, linux_default: &str, dev_default: &str) -> String {
@@ -86,6 +95,7 @@ impl Config {
             stacks_dir: env_path("CLOUDPANEL_STACKS_DIR").unwrap_or_else(|| data_dir.join("stacks")),
             nginx_log_dir: PathBuf::from(env_or("CLOUDPANEL_NGINX_LOG_DIR", "/var/log/nginx", "./data/log/nginx")),
             fail2ban_dir: PathBuf::from(env_or("CLOUDPANEL_FAIL2BAN_DIR", "/etc/fail2ban", "./data/fail2ban")),
+            ban_dir: PathBuf::from(env_or("CLOUDPANEL_BAN_DIR", "/run/cloudpanel-bans", "./data/bans")),
             sshd_config_dir: PathBuf::from(env_or(
                 "CLOUDPANEL_SSHD_DIR",
                 "/etc/ssh/sshd_config.d",
@@ -97,6 +107,15 @@ impl Config {
                 .map(|s| s.trim().to_ascii_lowercase())
                 .filter(|s| matches!(s.as_str(), "mariadb" | "mongodb" | "sqlite"))
                 .collect(),
+            php_enabled: std::env::var("CLOUDPANEL_PHP").is_ok_and(|v| v.trim() == "1"),
+            cloudflare_ips_url: std::env::var("CLOUDPANEL_CLOUDFLARE_IPS_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| crate::services::cloudflare::DEFAULT_URL.to_string()),
+            panel_release_url: std::env::var("CLOUDPANEL_RELEASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| crate::services::panel_update::DEFAULT_URL.to_string()),
             data_dir,
         }
     }

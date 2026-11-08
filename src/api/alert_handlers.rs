@@ -1,6 +1,7 @@
 //! Alert channels and rules, plus the panel's own TLS certificate (admin only).
 
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::ViaPanelSite;
 use crate::audit;
 use crate::auth::AdminUser;
 use crate::db;
@@ -11,9 +12,9 @@ use crate::state::{blocking, SharedState};
 use crate::validate;
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
-    Json,
+    Extension, Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -143,19 +144,42 @@ pub async fn set_rules(
 
 // ---------- Panel certificate ----------
 
-pub async fn get_panel_cert(_admin: AdminUser, State(state): State<SharedState>) -> ApiResult<impl IntoResponse> {
-    let stored = state.db(|conn| Ok(panel_cert::load(conn))).await?;
+pub async fn get_panel_cert(
+    _admin: AdminUser,
+    via: Option<Extension<ViaPanelSite>>,
+    headers: HeaderMap,
+    State(state): State<SharedState>,
+) -> ApiResult<impl IntoResponse> {
+    let (stored, closed_setting) = state
+        .db(|conn| Ok((panel_cert::load(conn), panel_cert::direct_closed(conn))))
+        .await?;
+    let on_hostname = stored
+        .as_ref()
+        .is_some_and(|s| on_panel_hostname(via.is_some(), &headers, &s.hostname));
     let paths = panel_cert::effective_paths(&state.config, stored.as_ref());
     let info = paths
         .as_ref()
         .and_then(|(c, _)| SslService::cert_info(&c.to_string_lossy()));
     let tls_live = state.tls.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    let cloudflare = state
+        .cloudflare
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .status(chrono::Utc::now());
     Ok(Json(json!({
         "url": stored.as_ref().map(|s| format!("https://{}", s.hostname)),
         "hostname": stored.as_ref().map(|s| s.hostname.clone()),
         "managed": stored.is_some(),
         "tls": tls_live,
         "certificate": info,
+        "cloudflare": cloudflare,
+        "direct": {
+            "port": state.config.panel_port(),
+            "closed": state.direct_closed,
+            // Set to closed, but opened again because the hostname isn't being served.
+            "fell_back": closed_setting && !state.direct_closed,
+            "on_hostname": on_hostname,
+        },
     })))
 }
 
@@ -213,7 +237,8 @@ pub async fn issue_panel_cert(
     let config = state.config.clone();
     let secret = state.proxy_secret.clone();
     let tls_on = state.tls.lock().unwrap_or_else(|e| e.into_inner()).is_some();
-    let vhost = blocking(move || Ok(panel_cert::apply_vhost(&config, &stored, tls_on, &secret))).await?;
+    let cloudflare = state.cloudflare.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let vhost = blocking(move || Ok(panel_cert::apply_vhost(&config, &stored, tls_on, &secret, &cloudflare))).await?;
     let message = match (live, vhost) {
         (true, Ok(())) => format!("Certificate installed. The panel is now at https://{host}"),
         (false, Ok(())) => format!(
@@ -227,9 +252,81 @@ pub async fn issue_panel_cert(
     Ok(Json(json!({ "message": message })))
 }
 
+#[derive(Deserialize)]
+pub struct PanelAccessRequest {
+    /// Whether the panel's own port should accept connections from outside.
+    pub open: bool,
+}
+
+/// Did the admin reach this request by the panel's hostname, through its nginx site?
+fn on_panel_hostname(via: bool, headers: &HeaderMap, hostname: &str) -> bool {
+    via && headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|h| h.eq_ignore_ascii_case(hostname))
+}
+
+/// Open or close the panel's own port. Closing is only allowed from a session that is using the
+/// hostname: that is the proof it works from where the admin is, which a test from this server
+/// could not give. The panel has to restart to listen on its new address.
+pub async fn set_panel_access(
+    admin: AdminUser,
+    via: Option<Extension<ViaPanelSite>>,
+    headers: HeaderMap,
+    State(state): State<SharedState>,
+    Json(p): Json<PanelAccessRequest>,
+) -> ApiResult<impl IntoResponse> {
+    let via = via.is_some();
+    let config = state.config.clone();
+    state
+        .db(move |conn| {
+            if !p.open {
+                let stored = panel_cert::load(conn).ok_or_else(|| {
+                    ApiError::BadRequest("Set up a hostname for the panel before closing its port".into())
+                })?;
+                if !on_panel_hostname(via, &headers, &stored.hostname) {
+                    return Err(ApiError::BadRequest(format!(
+                        "Open the panel at https://{} and close the port from there, so it's clear the hostname works for you",
+                        stored.hostname
+                    )));
+                }
+                if db::running_job_count(conn)? > 0 {
+                    return Err(ApiError::Conflict(
+                        "A background job is running, and closing the port restarts the panel. Try again when it finishes."
+                            .into(),
+                    ));
+                }
+            }
+            panel_cert::set_direct_closed(conn, !p.open)?;
+            if p.open {
+                panel_cert::allow_in_firewall(&config, conn);
+            }
+            audit::record(
+                conn,
+                &admin.0,
+                if p.open { "panel.direct_open" } else { "panel.direct_close" },
+                None,
+                None,
+            );
+            Ok(())
+        })
+        .await?;
+    // Let this response get out before the restart.
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let _ = tokio::task::spawn_blocking(panel_cert::restart_panel).await;
+    });
+    Ok(Json(json!({ "restarting": true })))
+}
+
 pub async fn remove_panel_cert(admin: AdminUser, State(state): State<SharedState>) -> ApiResult<impl IntoResponse> {
     state
         .db(move |conn| {
+            if panel_cert::direct_closed(conn) {
+                return Err(ApiError::Conflict(
+                    "The panel's port is closed, so this hostname is the only way in. Reopen the port first.".into(),
+                ));
+            }
             db::delete_setting(conn, panel_cert::SETTING)?;
             audit::record(conn, &admin.0, "panel.certificate_remove", None, None);
             Ok(())

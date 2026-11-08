@@ -114,7 +114,7 @@ export function renderOverview(view) {
       if (sysInfo.public_ipv6) rows.push(['Public IPv6', sysInfo.public_ipv6]);
       rows.push(['Updates', sysInfo.updates_checked_at ? `${sysInfo.pending_updates} pending (${sysInfo.security_updates} security)` : 'Not checked']);
       if (sysInfo.reboot_required) rows.push(['Reboot', 'Required to finish updates']);
-      rows.push(['CloudPanel', `v${sysInfo.panel_version}`]);
+      rows.push(['CloudPanel', `v${sysInfo.panel_version}${sysInfo.panel_update_available ? ` (v${sysInfo.panel_latest} available)` : ''}`]);
     }
     info.replaceChildren(...rows.flatMap(([k, v]) => [h('dt', { text: k }), h('dd', { class: 'truncate', text: v })]));
 

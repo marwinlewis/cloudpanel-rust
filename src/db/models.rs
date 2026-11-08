@@ -29,6 +29,7 @@ pub enum SiteType {
     Nodejs,
     Python,
     Static,
+    Php,
     DockerProxy,
     ReverseProxy,
 }
@@ -39,6 +40,7 @@ impl SiteType {
             SiteType::Nodejs => "nodejs",
             SiteType::Python => "python",
             SiteType::Static => "static",
+            SiteType::Php => "php",
             SiteType::DockerProxy => "docker_proxy",
             SiteType::ReverseProxy => "reverse_proxy",
         }
@@ -49,6 +51,7 @@ impl SiteType {
             "nodejs" => Some(SiteType::Nodejs),
             "python" => Some(SiteType::Python),
             "static" => Some(SiteType::Static),
+            "php" => Some(SiteType::Php),
             "docker_proxy" => Some(SiteType::DockerProxy),
             "reverse_proxy" => Some(SiteType::ReverseProxy),
             _ => None,
@@ -58,6 +61,11 @@ impl SiteType {
     /// Site types whose process CloudPanel can supervise with a systemd unit.
     pub fn has_app(&self) -> bool {
         matches!(self, SiteType::Nodejs | SiteType::Python | SiteType::ReverseProxy)
+    }
+
+    /// Site types nginx serves from a document root, rather than proxying to a port.
+    pub fn has_document_root(&self) -> bool {
+        matches!(self, SiteType::Static | SiteType::Php)
     }
 }
 
@@ -98,6 +106,11 @@ pub struct Site {
     pub app_pm2: String,
     /// With `include_www`: send www to the naked domain instead of serving both.
     pub www_redirect: bool,
+    /// PHP sites only: the PHP-FPM version, such as `8.4`.
+    pub php_version: Option<String>,
+    /// False when the site's nginx config was imported from CloudPanel CE. The panel keeps that
+    /// file exactly as it is and refuses changes that would regenerate it.
+    pub vhost_managed: bool,
 }
 
 pub const MANAGER_SYSTEMD: &str = "systemd";

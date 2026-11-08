@@ -1,6 +1,8 @@
 pub mod alerts;
 pub mod apps;
 pub mod backups;
+pub mod ce_import;
+pub mod cloudflare;
 pub mod cmd;
 pub mod cron;
 pub mod databases;
@@ -11,6 +13,8 @@ pub mod files;
 pub mod firewall;
 pub mod nginx;
 pub mod panel_cert;
+pub mod panel_update;
+pub mod php;
 pub mod pm2;
 pub mod runtimes;
 pub mod s3;
@@ -23,3 +27,6 @@ pub mod sysusers;
 pub use nginx::NginxService;
 pub use ssl::SslService;
 pub use system_metrics::MetricsCollector;
+
+#[cfg(all(test, unix))]
+mod security_tests;

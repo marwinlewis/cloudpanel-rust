@@ -11,7 +11,13 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 pub const RULES_SETTING: &str = "alert_rules";
+/// How a new CloudPanel release's notification starts; `notify_event` routes on it.
+pub const PANEL_UPDATE_TITLE: &str = "Update available: CloudPanel";
 const REMIND_AFTER_HOURS: i64 = 6;
+
+fn on() -> bool {
+    true
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AlertRules {
@@ -24,6 +30,10 @@ pub struct AlertRules {
     pub services: bool,
     pub backups: bool,
     pub security: bool,
+    /// Defaulted because rules saved before this existed would otherwise fail to load, and be
+    /// silently replaced by the defaults.
+    #[serde(default = "on")]
+    pub panel_updates: bool,
 }
 
 impl Default for AlertRules {
@@ -37,6 +47,7 @@ impl Default for AlertRules {
             services: true,
             backups: true,
             security: true,
+            panel_updates: true,
         }
     }
 }
@@ -254,6 +265,8 @@ pub fn notify_event(config: &Config, pool: &DbPool, title: &str, body: &str) {
         .unwrap_or_default();
     let enabled = if title.starts_with("Backup") {
         rules.backups
+    } else if title.starts_with(PANEL_UPDATE_TITLE) {
+        rules.panel_updates
     } else {
         rules.security
     };
@@ -484,6 +497,17 @@ mod tests {
         assert!(r.validate().is_ok());
         r.disk_pct = 150.0;
         assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn rules_saved_before_a_new_rule_existed_keep_their_values() {
+        let r: AlertRules = serde_json::from_str(
+            r#"{"disk_pct":70,"memory_pct":80,"cpu_pct":85,"sustain_minutes":3,"cert_days":7,"services":false,"backups":false,"security":false}"#,
+        )
+        .unwrap();
+        assert_eq!(r.disk_pct, 70.0);
+        assert!(!r.security);
+        assert!(r.panel_updates);
     }
 
     #[test]

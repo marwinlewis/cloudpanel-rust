@@ -21,7 +21,7 @@ use services::sites::{provision, SiteInput};
 use services::MetricsCollector;
 use state::AppState;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tower_http::compression::CompressionLayer;
 use tracing::info;
@@ -93,8 +93,22 @@ enum Commands {
         #[arg(short, long)]
         username: String,
     },
+    /// Reopen the panel's own port after it was closed in Settings (e.g. its hostname broke)
+    PanelAccessOpen,
     /// Run a cron job by id and record its output (used by /etc/cron.d/cloudpanel)
     CronRun { id: i64 },
+    /// Import sites, databases and users from a CloudPanel CE database (used by migrate-from-ce.sh)
+    ImportCe {
+        /// A copy of CE's panel database (/home/clp/htdocs/app/data/db.sq3)
+        #[arg(long)]
+        source: std::path::PathBuf,
+        /// Check and report without saving anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Where to write the passwords of panel accounts created by the import (mode 600)
+        #[arg(long)]
+        credentials_file: Option<std::path::PathBuf>,
+    },
 }
 
 fn read_password(given: Option<String>) -> AnyResult<String> {
@@ -165,6 +179,36 @@ fn seed_admin(config: &Config, pool: &db::DbPool) -> AnyResult<()> {
         file.display()
     );
     Ok(())
+}
+
+/// One `kind: value` line per finding, which migrate-from-ce.sh shows and keeps in its report.
+fn print_import_report(r: &services::ce_import::Report, dry_run: bool) {
+    let verb = if dry_run { "would import" } else { "imported" };
+    for s in &r.sites_imported {
+        println!("{verb} site: {s}");
+    }
+    for s in &r.sites_existing {
+        println!("already imported: {s}");
+    }
+    for s in &r.php_skipped {
+        println!("php site left unmanaged: {s} (it keeps running; add --with-php to manage it)");
+    }
+    for (u, _) in &r.users_created {
+        println!("{verb} panel user: {u} (new password, CE's can't be reused; 2FA must be set up again)");
+    }
+    for u in &r.users_existing {
+        println!("panel user already exists: {u}");
+    }
+    println!(
+        "{verb}: {} database(s), {} database user(s), {} extra SSH user(s)",
+        r.databases, r.database_users, r.ssh_users
+    );
+    for n in &r.notes {
+        println!("note: {n}");
+    }
+    for p in &r.problems {
+        println!("problem: {p}");
+    }
 }
 
 async fn shutdown_signal(handle: axum_server::Handle) {
@@ -291,9 +335,56 @@ async fn main() -> AnyResult<()> {
             println!("Two-factor authentication disabled for '{username}'; their sessions were signed out.");
             return Ok(());
         }
+        Some(Commands::PanelAccessOpen) => {
+            services::panel_cert::set_direct_closed(&conn, false)?;
+            audit::record_system(&conn, None, None, "panel.direct_open", None, Some("cli"));
+            services::panel_cert::allow_in_firewall(&config, &conn);
+            if services::panel_cert::restart_panel() {
+                println!("The panel's port is opening again.");
+            } else {
+                println!("Saved. Restart CloudPanel to open the panel's port again: systemctl restart cloudpanel");
+            }
+            return Ok(());
+        }
         Some(Commands::CronRun { id }) => {
             let code = services::cron::run_job(&config, &conn, id)?;
             std::process::exit(code);
+        }
+        Some(Commands::ImportCe {
+            source,
+            dry_run,
+            credentials_file,
+        }) => {
+            // Exit codes for migrate-from-ce.sh: 0 is clean, 1 is imported but with problems to look
+            // at, and 2 is failed with nothing saved. Returning an error from `main` would exit 1.
+            let mut conn = conn;
+            // Checked first: new accounts' passwords exist only in this run, so they can't be lost.
+            if !dry_run && credentials_file.is_none() {
+                eprintln!("--credentials-file is needed to save the passwords of imported users");
+                std::process::exit(2);
+            }
+            let report = match services::ce_import::run(&config, &mut conn, &source, dry_run) {
+                Ok(report) => report,
+                Err(e) => {
+                    eprintln!("Import failed, nothing was saved: {e}");
+                    std::process::exit(2);
+                }
+            };
+            print_import_report(&report, dry_run);
+            if let (false, false, Some(file)) = (dry_run, report.users_created.is_empty(), &credentials_file) {
+                let previous = std::fs::read_to_string(file).unwrap_or_default();
+                let added: String = report
+                    .users_created
+                    .iter()
+                    .map(|(user, password)| format!("{user}\t{password}\n"))
+                    .collect();
+                if let Err(e) = fsutil::write_atomic(file, format!("{previous}{added}").as_bytes(), 0o600) {
+                    // The accounts exist, so reset their passwords with `user-reset-password`.
+                    eprintln!("Could not save the new passwords to {}: {e}", file.display());
+                    std::process::exit(1);
+                }
+            }
+            std::process::exit(i32::from(!report.problems.is_empty()));
         }
         Some(Commands::Server) | None => {}
     }
@@ -313,7 +404,23 @@ async fn main() -> AnyResult<()> {
     let tls_paths = services::panel_cert::effective_paths(&config, stored_tls.as_ref());
     let tls = tls_paths.is_some();
     let proxy_secret = load_proxy_secret(&config)?;
-    services::panel_cert::sync_vhost(&config, &*pool.get()?, tls, &proxy_secret);
+    let cloudflare = services::cloudflare::Ranges::load(&*pool.get()?);
+    let vhost_ready = services::panel_cert::sync_vhost(&config, &*pool.get()?, tls, &proxy_secret, &cloudflare);
+    // A closed port needs the hostname to work, or nobody could get in. Otherwise open it.
+    let mut direct_closed = false;
+    if services::panel_cert::direct_closed(&*pool.get()?) {
+        match services::panel_cert::loopback_bind(&config.bind_addr) {
+            Some(local) if vhost_ready && services::panel_cert::wait_for_nginx(30) => {
+                config.bind_addr = local;
+                direct_closed = true;
+                // A panel bound to one address reaches it through a different upstream now.
+                services::panel_cert::sync_vhost(&config, &*pool.get()?, tls, &proxy_secret, &cloudflare);
+            }
+            _ => tracing::warn!(
+                "the panel's port stays open for now, although it is set to closed: its hostname is not being served"
+            ),
+        }
+    }
     let addr: SocketAddr = config
         .bind_addr
         .parse()
@@ -324,14 +431,17 @@ async fn main() -> AnyResult<()> {
         config: config.clone(),
         jwt_secret,
         proxy_secret,
+        cloudflare: RwLock::new(cloudflare),
+        direct_closed,
         limiter: LoginLimiter::default(),
         metrics: Arc::new(Mutex::new(MetricsCollector::default())),
         tls: Mutex::new(None),
     });
     scheduler::start(state.clone());
+    services::cloudflare::start(state.clone());
+    services::panel_update::start(state.clone());
 
-    let app = api::create_api_router(state.clone()).fallback(web::static_handler);
-    let app = web::with_security_headers(app, tls).layer(CompressionLayer::new());
+    let app = web::with_security_headers(api::create_app(state.clone()), tls).layer(CompressionLayer::new());
     let service = app.into_make_service_with_connect_info::<SocketAddr>();
 
     let handle = axum_server::Handle::new();

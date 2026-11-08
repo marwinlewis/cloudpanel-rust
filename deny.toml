@@ -1,0 +1,50 @@
+# cargo-deny: what the dependency tree may contain. Run by CI (`cargo deny check`).
+
+[graph]
+# The panel only ships for Linux, and Windows is for local development.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[advisories]
+# Every RustSec advisory fails the build, as does a crate that's unmaintained or yanked.
+# Add an `ignore` entry only with a reason the advisory can't apply here.
+yanked = "deny"
+unmaintained = "workspace"
+ignore = [
+    # quick-xml 0.30, through rusty-s3 0.5: only parses answers from the S3 endpoint an admin set
+    # up. Remove once rusty-s3 is upgraded to a release using quick-xml >= 0.41.
+    { id = "RUSTSEC-2026-0194", reason = "S3 responses only; needs a rusty-s3 upgrade" },
+    { id = "RUSTSEC-2026-0195", reason = "S3 responses only; needs a rusty-s3 upgrade" },
+    # Unmaintained, not vulnerable. Also pulled in by axum-server. Replace with rustls-pki-types' PEM
+    # parsing when axum-server drops it.
+    { id = "RUSTSEC-2025-0134", reason = "unmaintained only; also a dependency of axum-server" },
+]
+
+[licenses]
+# Compatible with shipping a single MIT-licensed binary.
+allow = [
+    "MIT",
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    "OpenSSL",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+# Only crates.io. A git dependency would bypass the lockfile's checksums and the advisory database.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
