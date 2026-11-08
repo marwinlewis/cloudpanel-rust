@@ -332,6 +332,7 @@ fn claims(uid: i64, name: &str, ver: i64, exp_from_now: i64, purpose: Option<&st
         iat: (now - 7200) as usize,
         exp: (now + exp_from_now) as usize,
         purpose: purpose.map(str::to_string),
+        jti: String::new(),
     }
 }
 

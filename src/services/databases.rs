@@ -142,6 +142,16 @@ fn mysql_defaults() -> Option<String> {
         .then(|| format!("--defaults-extra-file={}", file.display()))
 }
 
+/// Names go into statements quoted, and run as the server's administrator. The panel's own are
+/// checked when made, but rows imported from elsewhere earlier may not have been, so this is the
+/// last check before SQL.
+fn sql_names(names: &[&str]) -> Result<(), String> {
+    for n in names {
+        crate::validate::foreign_db_name(n)?;
+    }
+    Ok(())
+}
+
 fn mysql(sql: &str) -> Result<String, String> {
     let defaults = mysql_defaults();
     let r = run_with(
@@ -351,6 +361,7 @@ fn sqlite_valid(path: &Path) -> Result<(), String> {
 pub fn create_db(config: &Config, engine: Engine, site: &Site, name: &str) -> Result<(), String> {
     match engine {
         Engine::MariaDb => {
+            sql_names(&[name])?;
             mysql(&format!(
                 "CREATE DATABASE `{name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
             ))?;
@@ -395,6 +406,7 @@ pub fn drop_db(config: &Config, engine: Engine, site: &Site, name: &str, users: 
     }
     match engine {
         Engine::MariaDb => {
+            sql_names(&[name])?;
             mysql(&format!("DROP DATABASE IF EXISTS `{name}`;"))?;
             mysql(&format!(
                 "DROP USER IF EXISTS '{}'@'localhost';",
@@ -435,6 +447,7 @@ pub fn create_user(config: &Config, engine: Engine, db: &str, user: &str, passwo
     check_password(password)?;
     match engine {
         Engine::MariaDb => {
+            sql_names(&[db, user])?;
             mysql(&format!(
                 "CREATE USER '{user}'@'localhost' IDENTIFIED BY '{password}';\n\
                  GRANT ALL PRIVILEGES ON `{db}`.* TO '{user}'@'localhost';\nFLUSH PRIVILEGES;"
@@ -478,6 +491,7 @@ fn mysql_user_hosts(user: &str) -> Result<Vec<String>, String> {
 pub fn drop_user(config: &Config, engine: Engine, db: &str, user: &str) -> Result<(), String> {
     match engine {
         Engine::MariaDb => {
+            sql_names(&[user])?;
             for host in mysql_user_hosts(user)? {
                 mysql(&format!("DROP USER IF EXISTS '{user}'@'{host}';"))?;
             }
@@ -498,6 +512,7 @@ pub fn set_password(config: &Config, engine: Engine, db: &str, user: &str, passw
     check_password(password)?;
     match engine {
         Engine::MariaDb => {
+            sql_names(&[user])?;
             for host in mysql_user_hosts(user)? {
                 mysql(&format!(
                     "ALTER USER '{user}'@'{host}' IDENTIFIED BY '{password}';\nFLUSH PRIVILEGES;"

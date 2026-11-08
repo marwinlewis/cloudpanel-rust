@@ -227,4 +227,11 @@ pub const MIGRATIONS: &[&str] = &[
     ALTER TABLE sites ADD COLUMN php_version TEXT;
     ALTER TABLE sites ADD COLUMN vhost_managed BOOLEAN NOT NULL DEFAULT 1;
     "#,
+    // 8: sessions ended by signing out, until they would have expired anyway.
+    r#"
+    CREATE TABLE revoked_tokens (
+        hash TEXT PRIMARY KEY,
+        expires_at DATETIME NOT NULL
+    );
+    "#,
 ];

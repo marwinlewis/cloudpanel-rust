@@ -422,3 +422,116 @@ async fn sql_in_a_username_is_only_a_wrong_username() {
         .unwrap()
         .is_some());
 }
+
+// ---------- Turning 2FA on and off (SEC-15) ----------
+
+/// Someone who got hold of a session mustn't be able to put the second factor on their own phone,
+/// which would lock the owner out.
+#[tokio::test]
+async fn sec15_enrolling_2fa_needs_the_password() {
+    let h = super::super::tests::harness();
+    let cookie = h.login("manager").await;
+    for body in [json!({}), json!({"password": "wrong-password"})] {
+        let (s, v, _) = h.call("POST", "/auth/2fa/setup", Some(&cookie), Some(body), true).await;
+        assert_ne!(s, StatusCode::OK, "{v}");
+        assert!(v.get("secret").is_none(), "{v}");
+    }
+    let (s, v, _) = h
+        .call(
+            "POST",
+            "/auth/2fa/setup",
+            Some(&cookie),
+            Some(json!({"password": "admin-password-1"})),
+            true,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+}
+
+async fn turn_on_2fa(h: &Harness, cookie: &str) -> (String, Option<String>) {
+    let (_, setup, _) = h
+        .call(
+            "POST",
+            "/auth/2fa/setup",
+            Some(cookie),
+            Some(json!({"password": "admin-password-1"})),
+            true,
+        )
+        .await;
+    let secret = setup["secret"].as_str().unwrap().to_string();
+    let code = totp::current_code(&secret, "manager");
+    let (s, v, set) = h
+        .call(
+            "POST",
+            "/auth/2fa/enable",
+            Some(cookie),
+            Some(json!({"code": code})),
+            true,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    (secret, set)
+}
+
+/// Enabling it again would hand out a fresh set of recovery codes without the password.
+#[tokio::test]
+async fn sec15_turning_2fa_on_twice_does_not_issue_new_recovery_codes() {
+    let h = super::super::tests::harness();
+    let cookie = h.login("manager").await;
+    let (secret, set) = turn_on_2fa(&h, &cookie).await;
+    let cookie = set.unwrap();
+    let code = totp::current_code(&secret, "manager");
+    let (s, v, _) = h
+        .call(
+            "POST",
+            "/auth/2fa/enable",
+            Some(&cookie),
+            Some(json!({"code": code})),
+            true,
+        )
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(v.get("recovery_codes").is_none(), "{v}");
+}
+
+/// Turning it on or off ends the account's other sessions and keeps the one that did it.
+#[tokio::test]
+async fn sec15_turning_2fa_on_or_off_signs_out_everywhere_else() {
+    let h = super::super::tests::harness();
+    let cookie = h.login("manager").await;
+    let elsewhere = h.login("manager").await;
+    let (_, set) = turn_on_2fa(&h, &cookie).await;
+    let cookie = set.expect("enabling 2FA should hand this browser a new session");
+    assert_eq!(me_status(&h, &elsewhere).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(me_status(&h, &cookie).await, StatusCode::OK);
+
+    let elsewhere = format!(
+        "cp_session={}",
+        crate::auth::create_jwt(
+            user_id(&h, "manager"),
+            "manager",
+            db::find_user_by_id(&h.pool.get().unwrap(), user_id(&h, "manager"))
+                .unwrap()
+                .unwrap()
+                .token_version,
+            SECRET
+        )
+        .unwrap()
+    );
+    let (s, _, set) = h
+        .call(
+            "POST",
+            "/auth/2fa/disable",
+            Some(&cookie),
+            Some(json!({"password": "admin-password-1"})),
+            true,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(me_status(&h, &elsewhere).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(me_status(&h, &set.unwrap()).await, StatusCode::OK);
+}
+
+async fn me_status(h: &Harness, cookie: &str) -> StatusCode {
+    h.call("GET", "/auth/me", Some(cookie), None, false).await.0
+}

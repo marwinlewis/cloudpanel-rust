@@ -306,7 +306,15 @@ async fn last_admin_cannot_be_demoted() {
 async fn two_factor_login_flow() {
     let h = harness();
     let cookie = h.login("admin").await;
-    let (s, setup, _) = h.call("POST", "/auth/2fa/setup", Some(&cookie), None, true).await;
+    let (s, setup, _) = h
+        .call(
+            "POST",
+            "/auth/2fa/setup",
+            Some(&cookie),
+            Some(json!({"password": "admin-password-1"})),
+            true,
+        )
+        .await;
     assert_eq!(s, StatusCode::OK);
     let secret = setup["secret"].as_str().unwrap().to_string();
     let (s, _, _) = h

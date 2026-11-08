@@ -51,13 +51,16 @@ function twoFactorCard() {
         h('div', { class: 'row wrap' }, regen, off));
     } else {
       const on = h('button', { class: 'btn primary', type: 'button' }, icon('lock'), 'Set up two-factor authentication');
-      on.addEventListener('click', () => withBusy(on, enroll));
+      on.addEventListener('click', () => formDialog({
+        title: 'Set up two-factor authentication', submitText: 'Continue',
+        content: [field({ label: 'Current password', name: 'password', type: 'password', validate: 'required', attrs: { autocomplete: 'current-password' } })],
+        async onSubmit(d) { enroll(await api('/auth/2fa/setup', { method: 'POST', body: d })); },
+      }));
       body.replaceChildren(h('p', { class: 'muted small', text: 'Require a code from an authenticator app (Google Authenticator, 1Password, Authy, …) when signing in.' }), h('div', null, on));
     }
   };
 
-  async function enroll() {
-    const s = await api('/auth/2fa/setup', { method: 'POST' });
+  function enroll(s) {
     const secret = h('code', { class: 'mono secret', text: s.secret.replace(/(.{4})/g, '$1 ').trim() });
     formDialog({
       title: 'Set up two-factor authentication', submitText: 'Verify & enable',

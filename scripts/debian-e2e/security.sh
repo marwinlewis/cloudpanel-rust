@@ -91,13 +91,16 @@ attack() {
   R=$(admin POST /sites '{"domain":"b.sec.local","site_type":"static"}')
   SB=$(echo "$R" | j 'd["id"]') UB=$(echo "$R" | j 'd["system_user"]') HB=$(echo "$R" | j 'd["home_dir"]')
   check "both sites exist ($UA, $UB)" '[ -n "$SA" ] && [ -n "$SB" ] && [ "$UA" != "$UB" ]'
+  # Another of the manager's, with an app port, and somebody else's app.
+  SD=$(admin POST /sites '{"domain":"d.sec.local","site_type":"nodejs","target_port":3998}' | j 'd["id"]')
+  admin POST /sites '{"domain":"c.sec.local","site_type":"nodejs","target_port":3999}' >/dev/null
   WA=$HA/htdocs/a.sec.local
   WB=$HB/htdocs/b.sec.local
   as "$UA" sh -c "echo a-home-page > $WA/index.html"
   as "$UB" sh -c "echo b-home-page > $WB/index.html; echo b-secret-value > $WB/secret.txt; echo B_SECRET=b-env-value > $WB/.env; chmod 640 $WB/.env"
-  R=$(admin POST /users "{\"username\":\"attacker\",\"password\":\"Attacker-Pass-123\",\"email\":\"a@example.com\",\"role\":\"site_manager\",\"site_ids\":[$SA]}")
+  R=$(admin POST /users "{\"username\":\"attacker\",\"password\":\"Attacker-Pass-123\",\"email\":\"a@example.com\",\"role\":\"site_manager\",\"site_ids\":[$SA,$SD]}")
   mgr POST /auth/login '{"username":"attacker","password":"Attacker-Pass-123"}' >/dev/null
-  check "the manager is signed in, with only their site" '[ "$(mgr GET /sites | j "[s[\"id\"] for s in d]")" = "[$SA]" ]'
+  check "the manager is signed in, with only their sites" '[ "$(mgr GET /sites | j "sorted(s[\"id\"] for s in d)")" = "[$SA, $SD]" ]'
   check "the manager can't see the other site" '[ "$(code "$MGR" GET /sites/$SB)" = 404 ]'
 
   echo "== Isolation between sites at the OS level"
@@ -200,6 +203,22 @@ attack() {
   C2=$(echo "$R" | j 'd["id"]')
   check "a manager's own job runs as the site's user" '[ "$(mgr POST /cron/jobs/$C2/run | j "d[\"output\"].strip()")" = "$UA" ]'
 
+  echo "== SEC-13: a copied session after signing out"
+  local copy=/var/tmp/sec-copy.jar
+  rm -f "$copy"
+  req "$copy" POST /auth/login '{"username":"attacker","password":"Attacker-Pass-123"}' >/dev/null
+  local stolen
+  stolen=$(awk '$6 == "cp_session" {print $7}' "$copy")
+  req "$copy" POST /auth/logout >/dev/null
+  check "a copy of the token stops working when its owner signs out" \
+    '[ "$(curl -sk -o /dev/null -w "%{http_code}" -H "Cookie: cp_session=$stolen" "$API/auth/me")" = 401 ]'
+  check "and the manager's other session keeps working" '[ "$(code "$MGR" GET /auth/me)" = 200 ]'
+
+  echo "== SEC-16: pointing a site at someone else's app"
+  check "the manager can't take another site's app port" "[ \"\$(code \"\$MGR\" PATCH /sites/$SD '{\"target_port\":3999}')\" = 400 ]"
+  check "or a system port" "[ \"\$(code \"\$MGR\" PATCH /sites/$SD '{\"target_port\":22}')\" = 400 ]"
+  check "but can move to a free one" "[ \"\$(code \"\$MGR\" PATCH /sites/$SD '{\"target_port\":3997}')\" = 200 ]"
+
   echo "== Archives"
   python3 - <<'EOF'
 import io, tarfile
@@ -264,7 +283,7 @@ mariadb_attacks() {
   # Imports run as one account per database, which is locked again afterwards.
   open_accounts() {
     mysql_q "SELECT COUNT(*) FROM mysql.global_priv WHERE User LIKE 'cp\\_owner\\_%'
-      AND COALESCE(JSON_VALUE(Priv, '\$.account_locked'), 'false') <> 'true'"
+      AND Priv NOT LIKE '%\"account_locked\":true%'"
   }
   check "the import account can't be logged in to afterwards" '[ "$(open_accounts)" = 0 ]'
 

@@ -187,6 +187,13 @@ fn import_site(config: &Config, tx: &Connection, ce: &CeSite, report: &mut Repor
         ));
         return Ok(None);
     };
+    if validate::system_user(&ce.user).is_err() {
+        report.problems.push(format!(
+            "{}: '{}' isn't a Linux user name the panel can manage, not imported",
+            ce.domain, ce.user
+        ));
+        return Ok(None);
+    }
     if !sysusers::user_exists(&ce.user) {
         report.problems.push(format!(
             "{}: Linux user '{}' doesn't exist, not imported",
@@ -257,6 +264,10 @@ fn import_databases(
         .collect::<Result<_, _>>()?;
     let mut users = ce.prepare("SELECT user_name FROM database_user WHERE database_id = ?1")?;
     for (ce_db, name) in dbs {
+        if let Err(e) = validate::foreign_db_name(&name) {
+            report.problems.push(format!("Database: {e}, not imported"));
+            continue;
+        }
         let id: i64 = match tx
             .query_row(
                 "SELECT id FROM databases WHERE engine = 'mariadb' AND name = ?1",
@@ -273,6 +284,12 @@ fn import_databases(
         };
         let names: Vec<String> = users.query_map([ce_db], |r| r.get(0))?.collect::<Result<_, _>>()?;
         for user in names {
+            if let Err(e) = validate::foreign_db_name(&user) {
+                report
+                    .problems
+                    .push(format!("Database user of {name}: {e}, not imported"));
+                continue;
+            }
             let added = tx.execute(
                 "INSERT OR IGNORE INTO database_users (database_id, username, created_at) VALUES (?1, ?2, ?3)",
                 params![id, user, Utc::now()],
@@ -293,6 +310,12 @@ fn import_ssh_users(
     let mut stmt = ce.prepare("SELECT user_name FROM ssh_user WHERE site_id = ?1")?;
     let names: Vec<String> = stmt.query_map([ce_site], |r| r.get(0))?.collect::<Result<_, _>>()?;
     for name in names {
+        if validate::system_user(&name).is_err() {
+            report.problems.push(format!(
+                "SSH user '{name}' isn't a name the panel can manage, not imported"
+            ));
+            continue;
+        }
         if !sysusers::user_exists(&name) {
             report
                 .problems

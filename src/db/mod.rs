@@ -196,6 +196,27 @@ pub fn set_user_password(conn: &Connection, username: &str, password_hash: &str)
     .optional()
 }
 
+/// A signed-out session's token, by its hash, kept until it would have expired anyway.
+pub fn revoke_token(conn: &Connection, hash: &str, expires_at: DateTime<Utc>) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO revoked_tokens (hash, expires_at) VALUES (?1, ?2)",
+        params![hash, expires_at],
+    )?;
+    Ok(())
+}
+
+pub fn is_token_revoked(conn: &Connection, hash: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM revoked_tokens WHERE hash = ?1)",
+        params![hash],
+        |r| r.get(0),
+    )
+}
+
+pub fn prune_revoked_tokens(conn: &Connection, now: DateTime<Utc>) -> rusqlite::Result<usize> {
+    conn.execute("DELETE FROM revoked_tokens WHERE expires_at < ?1", params![now])
+}
+
 pub fn bump_token_version(conn: &Connection, id: i64) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE users SET token_version = token_version + 1 WHERE id = ?1",

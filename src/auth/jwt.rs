@@ -26,6 +26,10 @@ pub struct Claims {
     /// Such tokens are never accepted as a session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<String>,
+    /// Makes every token different, even two for the same user in the same second, so that signing
+    /// out of one doesn't end the other.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub jti: String,
 }
 
 pub fn create_jwt(user_id: i64, username: &str, token_version: i64, secret: &[u8]) -> Result<String, ApiError> {
@@ -67,6 +71,7 @@ fn sign(
         iat: now.timestamp() as usize,
         exp: (now + ttl).timestamp() as usize,
         purpose: purpose.map(str::to_string),
+        jti: crate::auth::random_password(16),
     };
     encode(
         &Header::new(Algorithm::HS256),
@@ -74,6 +79,15 @@ fn sign(
         &EncodingKey::from_secret(secret),
     )
     .map_err(ApiError::internal)
+}
+
+/// What a token is remembered by once it's been signed out, rather than the token itself.
+pub fn token_hash(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 pub fn verify_jwt(token: &str, secret: &[u8]) -> Result<Claims, jsonwebtoken::errors::Error> {
@@ -94,16 +108,19 @@ pub fn session_cookie(token: Option<&str>, secure: bool) -> String {
 }
 
 fn token_from_parts(parts: &Parts) -> Option<String> {
-    if let Some(t) = parts
-        .headers
+    token_from_headers(&parts.headers)
+}
+
+/// The session token a request carries: a bearer token, or else the session cookie.
+pub fn token_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+    if let Some(t) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
     {
         return Some(t.trim().to_string());
     }
-    parts
-        .headers
+    headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
@@ -142,9 +159,12 @@ impl FromRequestParts<SharedState> for AuthUser {
         }
 
         let uid = claims.uid;
-        let user = state
-            .db(move |conn| Ok(find_user_by_id(conn, uid)?))
-            .await?
+        let hash = token_hash(&token);
+        let (user, revoked) = state
+            .db(move |conn| Ok((find_user_by_id(conn, uid)?, crate::db::is_token_revoked(conn, &hash)?)))
+            .await?;
+        let user = user
+            .filter(|_| !revoked)
             .ok_or_else(|| ApiError::Unauthorized("Session expired, please sign in again".into()))?;
 
         if user.token_version != claims.ver {

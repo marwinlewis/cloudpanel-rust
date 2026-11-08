@@ -632,3 +632,84 @@ fn sec02_the_import_account_can_only_reach_its_own_database() {
     assert!(!sql.to_uppercase().contains("SUPER"), "{sql}");
     assert!(!sql.to_uppercase().contains(" FILE"), "{sql}");
 }
+
+// ---------- Importing from CloudPanel CE (SEC-12) ----------
+
+/// Names in a CE database end up in SQL run as the server's administrator (dropping a database or
+/// its users) and in paths. Whatever made them, they're checked like the panel's own.
+#[test]
+fn sec12_names_from_a_ce_database_are_checked_before_they_are_imported() {
+    let dir = tempfile::tempdir().unwrap();
+    let ce_path = dir.path().join("db.sq3");
+    let user = current_user();
+    {
+        let ce = rusqlite::Connection::open(&ce_path).unwrap();
+        ce.execute_batch(&format!(
+            "CREATE TABLE site (id INTEGER, domain_name TEXT, type TEXT, user TEXT, reverse_proxy_url TEXT,
+                                varnish_cache INTEGER DEFAULT 0);
+             CREATE TABLE php_settings (site_id INTEGER, php_version TEXT);
+             CREATE TABLE nodejs_settings (site_id INTEGER, port INTEGER);
+             CREATE TABLE python_settings (site_id INTEGER, port INTEGER);
+             CREATE TABLE database (id INTEGER, site_id INTEGER, name TEXT);
+             CREATE TABLE database_user (database_id INTEGER, user_name TEXT);
+             CREATE TABLE ssh_user (site_id INTEGER, user_name TEXT);
+             CREATE TABLE user (id INTEGER, user_name TEXT, email TEXT, role TEXT);
+             CREATE TABLE user_sites (user_id INTEGER, site_id INTEGER);
+             INSERT INTO site VALUES (1, 'ce.example.com', 'static', '{user}', NULL, 0);
+             INSERT INTO site VALUES (2, 'bad.example.com', 'static', '../root', NULL, 0);
+             INSERT INTO database VALUES (1, 1, 'x`; DROP DATABASE mysql; --');
+             INSERT INTO database VALUES (2, 1, 'mysql');
+             INSERT INTO database VALUES (3, 1, 'Shop-Live_2');
+             INSERT INTO database_user VALUES (3, 'x''@''%''; DROP USER root; --');
+             INSERT INTO database_user VALUES (3, 'shop.user');
+             INSERT INTO ssh_user VALUES (1, 'evil; id');"
+        ))
+        .unwrap();
+    }
+    let mut config = Config::from_env();
+    config.nginx_sites_enabled = dir.path().join("enabled");
+    fs::create_dir_all(&config.nginx_sites_enabled).unwrap();
+    for domain in ["ce.example.com", "bad.example.com"] {
+        fs::write(
+            config.nginx_sites_enabled.join(format!("{domain}.conf")),
+            format!("server {{\n  server_name {domain};\n  root /home/x/htdocs;\n}}\n"),
+        )
+        .unwrap();
+    }
+    let pool = crate::db::init_db(&dir.path().join("panel.db")).unwrap();
+    let mut conn = pool.get().unwrap();
+    let report = super::ce_import::run(&config, &mut conn, &ce_path, false).unwrap();
+
+    let dbs = crate::db::list_databases(&conn, None).unwrap();
+    let names: Vec<&str> = dbs.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(names, ["Shop-Live_2"], "{:?}", report.problems);
+    assert_eq!(dbs[0].users, ["shop.user"]);
+    let sites = crate::db::list_sites(&conn).unwrap();
+    assert_eq!(sites.len(), 1, "a site with a hostile user name was imported");
+    assert!(
+        report.problems.iter().any(|p| p.contains("../root")),
+        "{:?}",
+        report.problems
+    );
+    assert!(
+        report.problems.iter().any(|p| p.contains("evil; id")),
+        "{:?}",
+        report.problems
+    );
+    assert!(report.problems.len() >= 5, "{:?}", report.problems);
+}
+
+/// For rows imported before names were checked: the last line of defence before SQL.
+#[test]
+fn sec12_a_hostile_name_already_stored_never_reaches_sql() {
+    let mut site = super::nginx::test_site("static");
+    site.home_dir = None;
+    let config = Config::from_env();
+    for (db, user) in [
+        ("x`; DROP DATABASE mysql; --", "ok"),
+        ("ok", "x'@'%'; DROP USER root; --"),
+    ] {
+        assert!(databases::drop_db(&config, Engine::MariaDb, &site, db, &[user.to_string()]).is_err());
+        assert!(databases::set_password(&config, Engine::MariaDb, db, user, "Some-Password-123").is_err());
+    }
+}

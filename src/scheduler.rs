@@ -36,4 +36,5 @@ fn retention(state: &SharedState) {
     let Ok(conn) = state.pool.get() else { return };
     let _ = crate::db::prune_events(&conn, Utc::now() - ChronoDuration::days(90));
     let _ = crate::db::prune_jobs(&conn, Utc::now() - ChronoDuration::days(14));
+    let _ = crate::db::prune_revoked_tokens(&conn, Utc::now());
 }

@@ -150,6 +150,7 @@ fn tokens_are_signed_with_the_one_algorithm_expected() {
         iat: 0,
         exp: (chrono::Utc::now().timestamp() + 3600) as usize,
         purpose: None,
+        jti: String::new(),
     };
     // Same key, stronger-looking algorithm. Still not what the panel issues.
     let hs512 = jsonwebtoken::encode(&Header::new(Algorithm::HS512), &c, &EncodingKey::from_secret(SECRET)).unwrap();
@@ -162,4 +163,66 @@ fn a_token_cannot_be_used_after_the_session_length_even_if_valid_otherwise() {
     let c = crate::auth::verify_jwt(&t, SECRET).unwrap();
     let hours = (c.exp - c.iat) / 3600;
     assert!(hours <= 12, "sessions last {hours} hours");
+}
+
+/// Signing out must end the session where it's checked, on the server. Clearing the cookie only
+/// helps the browser it's in, not whoever copied the token.
+#[tokio::test]
+async fn sec13_signing_out_ends_the_session_on_the_server() {
+    let h = super::super::tests::harness();
+    let cookie = h.login("manager").await;
+    let other = h.login("manager").await;
+    let (s, _, _) = h.call("POST", "/auth/logout", Some(&cookie), None, true).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(me(&h, &cookie).await, StatusCode::UNAUTHORIZED);
+    // Only that session: signing out of one browser leaves the others.
+    assert_eq!(me(&h, &other).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn sec13_signing_out_a_bearer_token_ends_it_too() {
+    let h = super::super::tests::harness();
+    let token = create_jwt(user_id(&h, "manager"), "manager", 0, SECRET).unwrap();
+    let with = |method: &str, path: &str| {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(format!("/api{path}"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+    };
+    assert_eq!(
+        send(&h, "127.0.0.1", with("POST", "/auth/logout"), Body::empty())
+            .await
+            .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&h, "127.0.0.1", with("GET", "/auth/me"), Body::empty())
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// Without a session, or with a made-up one, there's nothing to end, and that isn't an error.
+#[tokio::test]
+async fn signing_out_without_a_session_still_succeeds() {
+    let h = super::super::tests::harness();
+    for cookie in [None, Some("cp_session=made-up")] {
+        let (s, _, set) = h.call("POST", "/auth/logout", cookie, None, true).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(set.as_deref(), Some("cp_session="));
+    }
+}
+
+#[test]
+fn signed_out_tokens_are_forgotten_once_they_would_have_expired() {
+    let h = super::super::tests::harness();
+    let conn = h.pool.get().unwrap();
+    let past = chrono::Utc::now() - chrono::Duration::hours(1);
+    let future = chrono::Utc::now() + chrono::Duration::hours(1);
+    db::revoke_token(&conn, "old", past).unwrap();
+    db::revoke_token(&conn, "new", future).unwrap();
+    assert_eq!(db::prune_revoked_tokens(&conn, chrono::Utc::now()).unwrap(), 1);
+    assert!(!db::is_token_revoked(&conn, "old").unwrap());
+    assert!(db::is_token_revoked(&conn, "new").unwrap());
 }

@@ -408,3 +408,77 @@ async fn stored_s3_credentials_are_not_handed_back() {
     let (_, v, _) = h.call("GET", "/backups/remote", Some(&admin), None, false).await;
     assert!(!v.to_string().contains("super-secret-key-value"), "{v}");
 }
+
+// ---------- App ports (SEC-16) ----------
+
+/// nginx forwards a site's visitors to its app port. Pointed at another site's app, that skips the
+/// other site's basic auth; pointed at a low port, it reaches system services.
+#[tokio::test]
+async fn sec16_a_site_manager_cannot_point_their_site_at_another_sites_app() {
+    let h = super::super::tests::harness();
+    let mine = site_id(&h, "mine.example.com");
+    let theirs = site_id(&h, "other.example.com");
+    h.pool
+        .get()
+        .unwrap()
+        .execute("UPDATE sites SET target_port = 3456 WHERE id = ?1", [theirs])
+        .unwrap();
+    let cookie = h.login("manager").await;
+    for port in [3456, 22, 80, 443, 1023] {
+        let (s, v, _) = h
+            .call(
+                "PATCH",
+                &format!("/sites/{mine}"),
+                Some(&cookie),
+                Some(json!({"target_port": port})),
+                true,
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{port}: {v}");
+    }
+    let stored = db::find_site_by_id(&h.pool.get().unwrap(), mine).unwrap().unwrap();
+    assert_eq!(stored.target_port, Some(3000));
+}
+
+#[tokio::test]
+async fn a_site_manager_can_still_move_their_app_to_a_free_port_or_keep_its_own() {
+    let h = super::super::tests::harness();
+    let mine = site_id(&h, "mine.example.com");
+    let cookie = h.login("manager").await;
+    for port in [3000, 4000] {
+        let (s, v, _) = h
+            .call(
+                "PATCH",
+                &format!("/sites/{mine}"),
+                Some(&cookie),
+                Some(json!({"target_port": port})),
+                true,
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{port}: {v}");
+    }
+}
+
+/// Several domains in front of one container is a normal thing for an admin to set up.
+#[tokio::test]
+async fn an_admin_can_point_two_sites_at_one_port() {
+    let h = super::super::tests::harness();
+    let mine = site_id(&h, "mine.example.com");
+    let theirs = site_id(&h, "other.example.com");
+    h.pool
+        .get()
+        .unwrap()
+        .execute("UPDATE sites SET target_port = 3456 WHERE id = ?1", [theirs])
+        .unwrap();
+    let cookie = h.login("admin").await;
+    let (s, v, _) = h
+        .call(
+            "PATCH",
+            &format!("/sites/{mine}"),
+            Some(&cookie),
+            Some(json!({"target_port": 3456})),
+            true,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+}

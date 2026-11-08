@@ -233,8 +233,19 @@ pub async fn me(auth: AuthUser, State(state): State<SharedState>) -> ApiResult<i
     Ok(Json(v))
 }
 
-pub async fn logout(State(state): State<SharedState>) -> impl IntoResponse {
-    (cookie_headers(&state, None), Json(json!({ "message": "Signed out" })))
+/// Sign out. The token stops working here and now, not only in this browser: whoever might have
+/// copied it can't go on using it for the rest of its 12 hours.
+pub async fn logout(State(state): State<SharedState>, headers: HeaderMap) -> ApiResult<impl IntoResponse> {
+    if let Some(token) = crate::auth::jwt::token_from_headers(&headers) {
+        if let Ok(claims) = verify_jwt(&token, &state.jwt_secret) {
+            let hash = crate::auth::jwt::token_hash(&token);
+            let expires = chrono::DateTime::from_timestamp(claims.exp as i64, 0).unwrap_or_else(chrono::Utc::now);
+            state
+                .db(move |conn| Ok(db::revoke_token(conn, &hash, expires)?))
+                .await?;
+        }
+    }
+    Ok((cookie_headers(&state, None), Json(json!({ "message": "Signed out" }))))
 }
 
 /// Revoke every session for the current user (all devices).
@@ -334,13 +345,15 @@ pub async fn change_email(
 
 // ---------- Two-factor authentication ----------
 
-/// Start enrollment: store a pending secret and return it with a QR matrix.
-pub async fn totp_setup(auth: AuthUser, State(state): State<SharedState>) -> ApiResult<impl IntoResponse> {
+/// Start enrollment: store a pending secret and return it with a QR matrix. It needs the password,
+/// or anyone who got hold of a session could put the second factor on a phone of their own.
+pub async fn totp_setup(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Json(p): Json<PasswordConfirm>,
+) -> ApiResult<impl IntoResponse> {
     let uid = auth.id;
-    let user = state
-        .db(move |conn| Ok(find_user_by_id(conn, uid)?))
-        .await?
-        .ok_or(ApiError::NotFound("User"))?;
+    let user = check_own_password(&state, &auth, p.password).await?;
     if user.totp_enabled {
         return Err(ApiError::Conflict(
             "Two-factor authentication is already enabled".into(),
@@ -371,6 +384,12 @@ pub async fn totp_enable(
         .db(move |conn| Ok(find_user_by_id(conn, uid)?))
         .await?
         .ok_or(ApiError::NotFound("User"))?;
+    // Turning it on again would hand out new recovery codes without the password.
+    if user.totp_enabled {
+        return Err(ApiError::Conflict(
+            "Two-factor authentication is already enabled".into(),
+        ));
+    }
     let secret = user
         .totp_secret
         .clone()
@@ -381,15 +400,22 @@ pub async fn totp_enable(
         ));
     }
     let (codes, hashes) = totp::generate_recovery_codes();
-    state
+    let (name, actor) = (user.username.clone(), auth.clone());
+    let version = state
         .db(move |conn| {
             db::enable_totp(conn, uid, &hashes)?;
             // Sign out other sessions now that the account is better protected.
-            audit::record(conn, &auth, "auth.2fa_enabled", None, None);
-            Ok(())
+            bump_token_version(conn, uid)?;
+            audit::record(conn, &actor, "auth.2fa_enabled", None, None);
+            Ok(find_user_by_id(conn, uid)?.map(|u| u.token_version))
         })
-        .await?;
-    Ok(Json(json!({ "recovery_codes": codes })))
+        .await?
+        .ok_or(ApiError::NotFound("User"))?;
+    let token = create_jwt(uid, &name, version, &state.jwt_secret)?;
+    Ok((
+        cookie_headers(&state, Some(&token)),
+        Json(json!({ "recovery_codes": codes })),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -404,20 +430,29 @@ pub async fn totp_disable(
 ) -> ApiResult<impl IntoResponse> {
     check_own_password(&state, &auth, p.password).await?;
     let name = auth.username.clone();
-    state
+    let uid = auth.id;
+    // Other sessions end: if this wasn't the account's owner, the owner's devices aren't left
+    // signed in alongside whoever it was.
+    let version = state
         .db(move |conn| {
             db::disable_totp(conn, auth.id)?;
+            bump_token_version(conn, auth.id)?;
             audit::record(conn, &auth, "auth.2fa_disabled", None, None);
-            Ok(())
+            Ok(find_user_by_id(conn, auth.id)?.map(|u| u.token_version))
         })
-        .await?;
+        .await?
+        .ok_or(ApiError::NotFound("User"))?;
+    let token = create_jwt(uid, &name, version, &state.jwt_secret)?;
     crate::services::alerts::notify_event(
         &state.config,
         &state.pool,
         "Security: two-factor authentication disabled",
         &format!("'{name}' turned off two-factor authentication."),
     );
-    Ok(Json(json!({ "message": "Two-factor authentication disabled" })))
+    Ok((
+        cookie_headers(&state, Some(&token)),
+        Json(json!({ "message": "Two-factor authentication disabled. Other sessions were signed out." })),
+    ))
 }
 
 pub async fn totp_recovery_codes(
