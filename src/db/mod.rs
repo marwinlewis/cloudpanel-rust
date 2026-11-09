@@ -4,19 +4,46 @@ pub mod schema;
 use chrono::{DateTime, Utc};
 use models::*;
 use r2d2::Pool;
-use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection, OptionalExtension, Row};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-pub type DbPool = Pool<SqliteConnectionManager>;
+pub type DbPool = Pool<SqliteManager>;
+
+/// Opens the pool's connections. Every connection needs these settings, as SQLite keeps them per
+/// connection. This is all the panel needs from a pool adapter, and writing it here keeps the
+/// SQLite version from being held back by when an adapter crate catches up with rusqlite.
+#[derive(Debug)]
+pub struct SqliteManager {
+    path: PathBuf,
+}
+
+impl r2d2::ManageConnection for SqliteManager {
+    type Connection = Connection;
+    type Error = rusqlite::Error;
+
+    fn connect(&self) -> rusqlite::Result<Connection> {
+        let conn = Connection::open(&self.path)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")?;
+        Ok(conn)
+    }
+
+    fn is_valid(&self, conn: &mut Connection) -> rusqlite::Result<()> {
+        conn.execute_batch("")
+    }
+
+    fn has_broken(&self, _conn: &mut Connection) -> bool {
+        false
+    }
+}
 
 pub fn init_db(db_path: &Path) -> Result<DbPool, Box<dyn std::error::Error>> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let manager = SqliteConnectionManager::file(db_path)
-        .with_init(|c| c.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;"));
+    let manager = SqliteManager {
+        path: db_path.to_path_buf(),
+    };
     let pool = Pool::builder().max_size(8).build(manager)?;
 
     let conn = pool.get()?;
@@ -1214,6 +1241,37 @@ pub fn test_conn() -> Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_pooled_connection_gets_the_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = init_db(&dir.path().join("cp.db")).unwrap();
+        // Holding them all at once forces the pool to hand out different connections.
+        let conns: Vec<_> = (0..pool.max_size()).map(|_| pool.get().unwrap()).collect();
+        for c in &conns {
+            let fk: i64 = c.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).unwrap();
+            let busy: i64 = c.query_row("PRAGMA busy_timeout", [], |r| r.get(0)).unwrap();
+            let journal: String = c.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+            assert_eq!((fk, busy, journal.as_str()), (1, 5000, "wal"));
+        }
+    }
+
+    #[test]
+    fn deleting_a_site_cascades_through_the_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = init_db(&dir.path().join("cp.db")).unwrap();
+        let c = pool.get().unwrap();
+        c.execute(
+            "INSERT INTO sites (domain, site_type) VALUES ('a.example.com', 'static')",
+            [],
+        )
+        .unwrap();
+        let id = c.last_insert_rowid();
+        create_database(&c, id, "sqlite", "a").unwrap();
+        assert!(delete_site(&c, id).unwrap());
+        let left: i64 = c.query_row("SELECT COUNT(*) FROM databases", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0, "foreign keys must be enforced");
+    }
 
     #[test]
     fn migrations_are_idempotent() {
