@@ -168,6 +168,11 @@ fn apt_job(args: &[&str], log: &JobLog) -> Result<(), String> {
     // apt must run outside the panel's sandbox (it writes /usr and /etc).
     let mut full: Vec<&str> = vec![];
     full.extend_from_slice(args);
+    let mut downgrade_refused = false;
+    let mut on_line = |l: &str, _: bool| {
+        downgrade_refused |= l.contains("Packages were downgraded");
+        log.line(l);
+    };
     let r = if cfg!(unix) && super::cmd::which("systemd-run") {
         let mut sr: Vec<String> = vec![
             "--wait".into(),
@@ -185,18 +190,30 @@ fn apt_job(args: &[&str], log: &JobLog) -> Result<(), String> {
             "systemd-run",
             &argv,
             &CmdOpts::default().timeout(2 * 3600),
-            &mut |l, _| log.line(l),
+            &mut on_line,
         )
     } else {
-        run_streaming("apt-get", &full, &opts, &mut |l, _| log.line(l))
+        run_streaming("apt-get", &full, &opts, &mut on_line)
     };
     if r.missing {
         return Err("apt-get is not available on this system".into());
     }
     if !r.success() {
-        return Err(format!("apt-get exited with code {}", r.code.unwrap_or(-1)));
+        return Err(apt_failure(r.code.unwrap_or(-1), downgrade_refused));
     }
     Ok(())
+}
+
+/// Why apt failed. A refused downgrade needs explaining: nothing was upgraded, and the panel won't
+/// allow it, because a downgrade could undo a security update.
+fn apt_failure(code: i32, downgrade_refused: bool) -> String {
+    if downgrade_refused {
+        return "Nothing was upgraded: apt wants to replace the packages listed under DOWNGRADED with copies from \
+                another repository, and the panel doesn't allow downgrades. On a server migrated from CloudPanel \
+                CE, fix this by running: sudo bash migrate-from-ce.sh fix-apt"
+            .to_string();
+    }
+    format!("apt-get exited with code {code}")
 }
 
 pub fn refresh_updates(log: &JobLog) -> Result<Vec<Upgradable>, String> {
@@ -285,6 +302,14 @@ pub fn public_ips() -> (Option<String>, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_downgrade_is_explained() {
+        assert_eq!(apt_failure(100, false), "apt-get exited with code 100");
+        let e = apt_failure(100, true);
+        assert!(e.contains("Nothing was upgraded"));
+        assert!(e.contains("fix-apt"));
+    }
 
     #[test]
     fn parses_apt_list() {

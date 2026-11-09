@@ -92,6 +92,8 @@ Changes made in the new panel since the cutover stay in the new panel, and CE wo
 
 - **Imported sites' nginx settings are read-only in the panel.** Port, www, upload limit, certificates, password protection, custom directives and disabling the site would all regenerate the vhost, so they aren't offered. Files, databases, SSH users, logs and backups work as usual. To change a setting, edit `/etc/nginx/sites-enabled/<domain>.conf` on the server, run `nginx -t`, then `systemctl reload nginx`.
 - **Deleting an imported site really deletes it**, including its vhost, and rolling back won't bring it back.
+- **Plan OS upgrades like any other.** Unlike the migration, **Services → Updates** really does restart things: upgrading nginx, PHP-FPM, Redis or Docker restarts them, so sites can blip and containers restart. Take a snapshot first and pick a quiet time.
+- **If an upgrade fails with `Packages were downgraded`** on a server migrated before this was handled, run `sudo bash migrate-from-ce.sh fix-apt`. CE's repository has top priority and carries its own copies of a few Debian packages, so apt wants to swap them, which it treats as a downgrade. Cutover now blocks those copies itself.
 - **Keep the `cloudpanel` apt package installed.** It's held, so an upgrade can't restart CE's panel, and removing it would stop certificate renewal and rollback.
 - **Don't remove `/etc/cron.d/clp`.** It renews your certificates and takes CE's nightly database backups. Only the line restarting `clp-agent` is disabled.
 - **New sites you add are fully managed**, including PHP sites if you enabled PHP, with Let's Encrypt through certbot.

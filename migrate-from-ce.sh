@@ -15,6 +15,8 @@
 #                                             Undoes itself if a check fails.
 #   sudo bash migrate-from-ce.sh rollback     Go back to CE's panel. Works at any later time.
 #   sudo bash migrate-from-ce.sh status       Show where things stand.
+#   sudo bash migrate-from-ce.sh fix-apt      Let apt upgrades run on a server that has already cut
+#                                             over. (Cutover does this itself.)
 #
 # Options:
 #   --with-php         Manage PHP sites in the new panel. (Asked if the server has PHP sites.)
@@ -37,6 +39,8 @@ CE_PANEL_UNITS="clp-nginx clp-php-fpm clp-agent"
 NEW_BIN=/usr/local/bin/cloudpanel
 NEW_ENV=/etc/cloudpanel/cloudpanel.env
 MYSQL_ADMIN=/etc/cloudpanel/mysql-admin.cnf
+CE_APT_PIN=/etc/apt/preferences.d/00packages.cloudpanel.io.pref
+APT_PIN=/etc/apt/preferences.d/01-cloudpanel-rust.pref
 STATE_DIR=/var/lib/cloudpanel-migration
 STATE_FILE="$STATE_DIR/state"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -68,7 +72,7 @@ usage() { sed -n '2,/^$/p' "$0" | sed -e 's/^# \{0,1\}//' -e '$d'; }
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      preflight|prepare|cutover|rollback|status) COMMAND="$1" ;;
+      preflight|prepare|cutover|rollback|status|fix-apt) COMMAND="$1" ;;
       --with-php) PHP_CHOICE=1 ;;
       --no-php) PHP_CHOICE=0 ;;
       --side-port) SIDE_PORT="${2:?--side-port needs a value}"; shift ;;
@@ -457,10 +461,51 @@ disable_ce_agent_cron() {
   sed -i '/systemctl restart clp-agent/s/^/# disabled by migrate-from-ce.sh: /' "$CE_CRON"
 }
 
+# What `apt-get upgrade` would downgrade, one package per line.
+apt_downgrades() {
+  LC_ALL=C apt-get -s -q upgrade 2>/dev/null \
+    | sed -n '/will be DOWNGRADED/,/upgraded, /p' | sed -e '1d' -e '$d' | tr -s ' ' '\n' | sed '/^$/d'
+}
+
+# CE gives its repository priority 1000, the level at which apt may downgrade. It carries a few
+# packages Debian has too (sgml-base, at the same version), so apt wants to replace Debian's copy
+# with CE's. That counts as a downgrade, and `apt-get -y upgrade` then refuses to run at all.
+# Lowering the priority to 990 doesn't help, and holding the package would also stop Debian's
+# updates to it, so this blocks only CE's copy of each.
+pin_ce_downgrades() {
+  local origin pkgs p
+  [ -f "$CE_APT_PIN" ] || return 0
+  origin=$(sed -n 's/^Pin: origin //p' "$CE_APT_PIN" | head -n1)
+  [ -n "$origin" ] || return 0
+  apt-get update -q >/dev/null 2>&1 || warn "apt-get update failed, so this check may use old package lists"
+  pkgs=$(apt_downgrades)
+  if [ -f "$APT_PIN" ]; then
+    # Keep what's already blocked: blocking it is why it's no longer on the list.
+    pkgs=$(printf '%s\n%s\n' "$pkgs" "$(sed -n 's/^Package: //p' "$APT_PIN")" | sed '/^$/d' | sort -u)
+  fi
+  if [ -z "$pkgs" ]; then
+    pass "apt upgrades won't downgrade anything"
+    return 0
+  fi
+  {
+    printf '# Written by migrate-from-ce.sh. Stops apt replacing these with copies from CE, which makes\n'
+    printf '# apt-get -y upgrade refuse to run. Updates to them from Debian still install.\n'
+    for p in $pkgs; do
+      printf 'Package: %s\nPin: origin %s\nPin-Priority: -1\n\n' "$p" "$origin"
+    done
+  } > "$APT_PIN"
+  if [ -n "$(apt_downgrades)" ]; then
+    warn "apt upgrades would still downgrade: $(apt_downgrades | tr '\n' ' ')"
+  else
+    pass "apt upgrades won't downgrade anything (blocked CE's copy of: $(printf '%s ' $pkgs))"
+  fi
+}
+
 restore_ce() {
   if [ -f "$STATE_DIR/clp-cron.original" ]; then
     cp -p "$STATE_DIR/clp-cron.original" "$CE_CRON"
   fi
+  rm -f "$APT_PIN"
   apt-mark unhold cloudpanel >/dev/null 2>&1 || true
   local unit
   for unit in clp-php-fpm clp-nginx clp-agent; do
@@ -531,6 +576,9 @@ EOF
   systemctl disable --now clp-php-fpm clp-agent >/dev/null 2>&1 || true
   disable_ce_agent_cron
   set_state cutover
+  # After the state is saved: this only affects later upgrades, so it's no reason to undo anything.
+  log "Checking apt upgrades will work"
+  pin_ce_downgrades || warn "Could not check. If upgrades fail, run: sudo bash $0 fix-apt"
 
   echo
   log "Done. The new panel is on port $CE_PORT."
@@ -552,6 +600,16 @@ cmd_rollback() {
   [ "$PROBLEMS" -eq 0 ] || die "CE's panel needs attention."
   log "CE's panel is in charge again. The new panel is stopped, with its data kept."
   info "To try again: sudo bash $0 prepare, then cutover. To remove it: bash install.sh --uninstall --purge"
+}
+
+# ---------- fix-apt ----------
+
+cmd_fix_apt() {
+  [ "$(id -u)" -eq 0 ] || die "Please run as root."
+  [ -f "$CE_APT_PIN" ] || die "CE's apt settings aren't on this server, so there's nothing to fix."
+  PROBLEMS=0
+  pin_ce_downgrades
+  log "Done. This doesn't upgrade anything. Run the upgrade from Services > Updates when it suits you."
 }
 
 # ---------- status ----------
@@ -577,6 +635,7 @@ main() {
     cutover) cmd_cutover ;;
     rollback) cmd_rollback ;;
     status) cmd_status ;;
+    fix-apt) cmd_fix_apt ;;
   esac
 }
 

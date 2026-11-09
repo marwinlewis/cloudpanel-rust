@@ -255,6 +255,7 @@ test_rollback() {
   check "and won't start at boot" "! systemctl is-enabled --quiet cloudpanel"
   check "the package is no longer held" "! apt-mark showhold | grep -qx cloudpanel"
   check "the cron file is as it was" "cmp -s /etc/cron.d/clp $STATE/clp-cron.original"
+  check "CE's apt settings are as they were" "[ ! -e /etc/apt/preferences.d/01-cloudpanel-rust.pref ]"
   check "the new panel's data is kept" "[ -s $DB ]"
   same_as_snapshot "after rollback"
 }
@@ -332,7 +333,26 @@ cmd_after_reboot() {
   check "CE's panel stayed down" "! systemctl is-active --quiet clp-nginx && ! systemctl is-active --quiet clp-php-fpm && ! systemctl is-active --quiet clp-agent"
   check "the static site answers" "site_body static.test.local | grep -q static-ok"
   check "the PHP site runs PHP and reaches its database" "site_body php.test.local | grep -q 'php-ok.*db=ok'" "site_body php.test.local"
+  test_real_upgrade
   exit "$failures"
+}
+
+# CE's pin makes apt want to downgrade packages, and apt-get -y upgrade then refuses to run at all.
+# Upgrades are the first thing anyone does in the new panel, so run a real one, the way it does.
+test_real_upgrade() {
+  heading "apt upgrades after migrating"
+  apt-get update -q >/dev/null 2>&1
+  check "nothing would be downgraded" "! LC_ALL=C apt-get -s -q upgrade 2>/dev/null | grep -q DOWNGRADED" "LC_ALL=C apt-get -s -q upgrade 2>/dev/null | sed -n '/DOWNGRADED/,+2p'"
+  check "CE's copy of sgml-base is what was blocked" "grep -q '^Package: sgml-base' /etc/apt/preferences.d/01-cloudpanel-rust.pref" "ls -la /etc/apt/preferences.d/"
+  check "CE's builds are still preferred for what serves sites" "[[ \"\$(apt-cache policy nginx)\" == *'Candidate: '*clp* ]]" "apt-cache policy nginx | head -5"
+  check "the panel's upgrade command succeeds" "DEBIAN_FRONTEND=noninteractive apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade > /var/tmp/upgrade.log 2>&1" "tail -15 /var/tmp/upgrade.log"
+  check "nothing is left to fail next time" "! LC_ALL=C apt-get -s -q upgrade 2>/dev/null | grep -q DOWNGRADED"
+  check "CE's panel didn't come back" "! systemctl is-active --quiet clp-nginx && ! systemctl is-enabled --quiet clp-nginx"
+  check "the new panel still owns the port" "[ \"\$(port_owner 8443)\" = cloudpanel ]"
+  check "the static site answers after upgrading" "site_body static.test.local | grep -q static-ok"
+  check "the PHP site still works after upgrading" "site_body php.test.local | grep -q 'php-ok.*db=ok'" "site_body php.test.local"
+  check "fix-apt is safe to run again" "$MIGRATE fix-apt > /var/tmp/fix-apt.log 2>&1 && grep -q 'downgrade anything' /var/tmp/fix-apt.log" "cat /var/tmp/fix-apt.log"
+  check "and keeps what it blocked" "grep -q '^Package: sgml-base' /etc/apt/preferences.d/01-cloudpanel-rust.pref"
 }
 
 # A plain server that never had CE: PHP is opt-in, and works when chosen.
