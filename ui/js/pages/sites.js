@@ -598,18 +598,26 @@ function tabSsl(el, { site, reload }) {
   install.addEventListener('click', () => sslDialog(site, reload));
   const renew = h('button', { class: 'btn', hidden: !site.certificate_managed }, icon('refresh'), 'Renew now');
   renew.addEventListener('click', () => withBusy(renew, async () => { await api(`/sites/${site.id}/ssl/renew`, { method: 'POST' }); toast('Certificate renewed'); reload(); }));
+  const takeOver = h('button', { class: 'btn primary', hidden: site.certificate_renewal !== 'cloudpanel_ce' }, icon('refresh'), 'Renew from this panel');
+  takeOver.addEventListener('click', () => formDialog({
+    title: 'Renew this certificate from this panel',
+    description: `Issues a new Let’s Encrypt certificate for ${site.domain} through certbot, which then renews it automatically. The site’s nginx config doesn’t change, and the site stays up.`,
+    submitText: 'Move renewal',
+    content: [field({ label: 'Email for expiry notices', name: 'email', type: 'email', hint: 'By continuing you agree to the Let’s Encrypt terms of service.' })],
+    async onSubmit(d) { await api(`/sites/${site.id}/ssl/takeover`, { method: 'POST', body: d }); toast('Certificate moved to certbot'); reload(); },
+  }));
   const remove = h('button', { class: 'btn danger', hidden: !site.ssl_enabled || !site.vhost_managed }, icon('unlock'), 'Disable HTTPS');
   remove.addEventListener('click', async () => {
     if (!(await confirmDialog({ title: 'Disable HTTPS?', message: 'The site will be served over plain HTTP. The certificate files are kept.', confirmText: 'Disable HTTPS', danger: true }))) return;
     await withBusy(remove, async () => { await api(`/sites/${site.id}/ssl`, { method: 'DELETE' }); toast('HTTPS disabled'); reload(); });
   });
   el.append(card({
-    title: 'HTTPS', sub: !site.vhost_managed ? 'Imported from CloudPanel CE. Its Let’s Encrypt certificates keep renewing through CE’s nightly job.' : site.certificate_managed ? 'Let’s Encrypt certificates renew automatically via certbot.' : '',
+    title: 'HTTPS', sub: { certbot: 'Imported from CloudPanel CE. Its certificate renews automatically via certbot.', cloudpanel_ce: 'Imported from CloudPanel CE. Its certificate still renews through CE’s nightly job.', none: 'Imported from CloudPanel CE. This certificate isn’t from Let’s Encrypt, so nothing renews it automatically.' }[site.certificate_renewal] || (site.certificate_managed ? 'Let’s Encrypt certificates renew automatically via certbot.' : ''),
     body: h('div', { class: 'form' },
       cert ? kv([['Issuer', cert.issuer], ['Names', cert.names.join(', ') || cert.subject], ['Valid from', fmtDate(cert.not_before)], ['Expires', `${fmtDate(cert.not_after)} (${cert.days_left} days)`], ['Certificate', h('span', { class: 'mono small', text: site.ssl_cert_path })]])
         : h('p', { class: 'muted', text: 'No certificate is installed. Visitors connect over HTTP.' }),
       wwwCertWarning(site, reload),
-      h('div', { class: 'row wrap' }, install, renew, remove)),
+      h('div', { class: 'row wrap' }, install, takeOver, renew, remove)),
   }));
 }
 
@@ -662,7 +670,7 @@ function tabLogs(el, { site }) {
 
 /** Warn when https://www can't work because the certificate doesn't cover it. */
 function wwwCertWarning(site, reload) {
-  if (!site.include_www || !site.ssl_enabled || site.certificate_covers_www) return null;
+  if (!site.vhost_managed || !site.include_www || !site.ssl_enabled || site.certificate_covers_www) return null;
   const text = `The certificate doesn’t cover www.${site.domain}, so https://www.${site.domain} shows a certificate error. http://www still works.`;
   const add = h('button', { class: 'btn sm', type: 'button', text: site.certificate_managed ? 'Add www to certificate' : 'Replace certificate' });
   add.addEventListener('click', () => sslDialog(site, reload));

@@ -97,6 +97,21 @@ enum Commands {
     PanelAccessOpen,
     /// Run a cron job by id and record its output (used by /etc/cron.d/cloudpanel)
     CronRun { id: i64 },
+    /// Move Let's Encrypt renewal of sites imported from CloudPanel CE to certbot, domain by domain
+    CertTakeover {
+        /// Address for Let's Encrypt's expiry notices (agrees to its terms)
+        #[arg(short, long)]
+        email: Option<String>,
+        /// Only this domain (default: every imported site)
+        #[arg(short, long)]
+        domain: Option<String>,
+        /// Check that each domain can be validated, without issuing or changing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Only report who renews each certificate
+        #[arg(long)]
+        check: bool,
+    },
     /// Import sites, databases and users from a CloudPanel CE database (used by migrate-from-ce.sh)
     ImportCe {
         /// A copy of CE's panel database (/home/clp/htdocs/app/data/db.sq3)
@@ -349,6 +364,55 @@ async fn main() -> AnyResult<()> {
         Some(Commands::CronRun { id }) => {
             let code = services::cron::run_job(&config, &conn, id)?;
             std::process::exit(code);
+        }
+        Some(Commands::CertTakeover {
+            email,
+            domain,
+            dry_run,
+            check,
+        }) => {
+            use services::cert_takeover::{self, Renewal};
+            let email = match (&email, check) {
+                (_, true) => String::new(),
+                (Some(e), false) => validate::email(e)?,
+                (None, false) => return Err("--email is needed, unless you use --check".into()),
+            };
+            let sites: Vec<_> = list_sites(&conn)?
+                .into_iter()
+                .filter(|s| !s.vhost_managed && domain.as_deref().map_or(true, |d| d == s.domain))
+                .collect();
+            if let (Some(d), true) = (&domain, sites.is_empty()) {
+                return Err(format!("{d} isn't a site imported from CloudPanel CE").into());
+            }
+            // Exit code 1 means something still depends on CE, or failed. The other sites still ran.
+            let mut unfinished = false;
+            for site in &sites {
+                let d = &site.domain;
+                match cert_takeover::renewal(site) {
+                    None => println!("no https: {d}"),
+                    Some(Renewal::Certbot) if !dry_run => println!("renewed by certbot: {d}"),
+                    Some(Renewal::NotLetsEncrypt) => {
+                        println!("not let's encrypt, nothing renews it: {d}")
+                    }
+                    Some(Renewal::CloudPanelCe) if check => {
+                        unfinished = true;
+                        println!("still renewed by ce: {d}");
+                    }
+                    Some(_) if check => println!("renewed by certbot: {d}"),
+                    Some(_) => match cert_takeover::take_over(site, &email, dry_run) {
+                        Ok(()) if dry_run => println!("can be moved: {d}"),
+                        Ok(()) => {
+                            audit::record_system(&conn, None, None, "site.ssl_takeover", Some(d), Some("cli"));
+                            println!("moved to certbot: {d}");
+                        }
+                        Err(e) => {
+                            unfinished = true;
+                            println!("failed: {d}: {e}");
+                        }
+                    },
+                }
+            }
+            std::process::exit(i32::from(unfinished));
         }
         Some(Commands::ImportCe {
             source,

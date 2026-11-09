@@ -324,6 +324,168 @@ cmd_without_php() {
   exit "$failures"
 }
 
+# ---------- Moving certificates to certbot, then removing CE for good ----------
+
+# What Let's Encrypt or someone else issued, in the place CE keeps it. CE's test install only has
+# self-signed certificates, and the real ones need a public domain.
+seed_cert() {
+  local domain=$1 org=$2 dir=/etc/nginx/ssl-certificates
+  openssl req -x509 -newkey rsa:2048 -nodes -days 60 -subj "/O=$org/CN=$domain" \
+    -addext "subjectAltName=DNS:$domain" -keyout "$dir/$domain.key" -out "$dir/$domain.crt" >/dev/null 2>&1
+}
+
+cmd_setup_removal() {
+  systemctl start nginx mysql php8.4-fpm clp-php-fpm clp-nginx clp-agent 2>/dev/null
+  start_backends
+  seed_cert static.test.local "Let's Encrypt"
+  seed_cert node.test.local "Let's Encrypt"
+  seed_cert proxy.test.local "Some Other CA"
+  nginx -t >/dev/null 2>&1 && systemctl reload nginx
+  sleep 1
+  # Data that has to survive: CE's removal scripts would delete all of it.
+  clpctl db:add --domainName=static.test.local --databaseName=keepdb --databaseUserName=keepuser \
+    --databaseUserPassword='Test-Only-Pass-1234' </dev/null >/dev/null 2>&1
+  local creds password
+  creds=$(clpctl db:show:master-credentials </dev/null 2>/dev/null)
+  password=$(printf '%s\n' "$creds" | sed -n 's/^| Password *| *\([^ ]*\) .*/\1/p')
+  MYSQL_PWD="$password" mysql -uroot -h127.0.0.1 keepdb -e "CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('survived')"
+  for d in static:static-ok node:node-ok py:py-ok proxy:proxy-ok; do
+    check "${d%%:*} site answers before migrating" "site_body ${d%%:*}.test.local | grep -q ${d#*:}" "site_body ${d%%:*}.test.local"
+  done
+  check "the test database holds its marker" "MYSQL_PWD='$password' mysql -uroot -h127.0.0.1 -N keepdb -e 'select v from t' | grep -q survived"
+  exit "$failures"
+}
+
+served_cert() {
+  openssl s_client -servername "$1" -connect 127.0.0.1:443 </dev/null 2>/dev/null | openssl x509 -noout "$2"
+}
+keep_marker() { mysql --defaults-extra-file=/etc/cloudpanel/mysql-admin.cnf -N keepdb -e 'select v from t' 2>/dev/null; }
+vhost_hashes() { find /etc/nginx/sites-enabled -type f ! -name 'cloudpanel-*' -print0 | sort -z | xargs -0 sha256sum; }
+
+cmd_removal() {
+  local out serial id before
+  heading "before removing anything"
+  check "prepare succeeds" "$MIGRATE prepare --binary $BIN --no-php --yes > /var/tmp/prepare.log 2>&1" "cat /var/tmp/prepare.log"
+  check "cutover succeeds" "$MIGRATE cutover --yes > /var/tmp/cutover.log 2>&1" "cat /var/tmp/cutover.log"
+  vhost_hashes > /var/tmp/vhosts.before
+  echo "nginx $(pid_of nginx)" > /var/tmp/pids.before
+  echo "mysql $(pid_of mysql)" >> /var/tmp/pids.before
+
+  heading "remove-ce refuses while a PHP site exists"
+  check "it refuses" "! $MIGRATE remove-ce --yes > /var/tmp/refuse1.log 2>&1" "cat /var/tmp/refuse1.log"
+  check "and names the site" "grep -q 'php.test.local' /var/tmp/refuse1.log" "cat /var/tmp/refuse1.log"
+  check "CE's package is still there and still held" "dpkg-query -W -f='\${Status}' cloudpanel | grep -q 'hold ok installed'"
+  check "PHP is still there" "[ -d /etc/php/8.4 ]"
+  check "CE's removal scripts weren't touched" "grep -q 'delete:sites' /var/lib/dpkg/info/cloudpanel.prerm"
+  clpctl site:delete --domainName=php.test.local --force </dev/null >/dev/null 2>&1
+  check "the test's PHP site is gone" "[ ! -f /etc/nginx/sites-enabled/php.test.local.conf ]"
+  vhost_hashes > /var/tmp/vhosts.before
+
+  heading "remove-ce refuses while a certificate depends on CE"
+  check "it refuses" "! $MIGRATE remove-ce --yes > /var/tmp/refuse2.log 2>&1" "cat /var/tmp/refuse2.log"
+  check "and names the certificates" "grep -q 'still renewed by ce: static.test.local' /var/tmp/refuse2.log && grep -q 'still renewed by ce: node.test.local' /var/tmp/refuse2.log" "cat /var/tmp/refuse2.log"
+  check "but not the one that isn't from Let's Encrypt" "! grep -q 'still renewed by ce: proxy' /var/tmp/refuse2.log"
+  check "or the self-signed one" "! grep -q 'still renewed by ce: py' /var/tmp/refuse2.log"
+
+  heading "moving certificates to certbot, domain by domain"
+  serial=$(served_cert static.test.local -serial)
+  check "a dry run passes" "$MIGRATE move-certs --email admin@example.com --dry-run > /var/tmp/dry.log 2>&1" "cat /var/tmp/dry.log"
+  check "it covers what can move" "grep -q 'can be moved: static.test.local' /var/tmp/dry.log && grep -q 'can be moved: node.test.local' /var/tmp/dry.log" "cat /var/tmp/dry.log"
+  check "and skips what can't" "grep -q 'not let.s encrypt, nothing renews it: proxy.test.local' /var/tmp/dry.log" "cat /var/tmp/dry.log"
+  check "and changes nothing" "[ \"\$(served_cert static.test.local -serial)\" = '$serial' ] && [ ! -e /etc/letsencrypt/renewal/static.test.local.conf ]"
+  check "one domain can move alone" "$MIGRATE move-certs --email admin@example.com --domain static.test.local > /var/tmp/one.log 2>&1" "cat /var/tmp/one.log"
+  check "leaving the other on CE" "[ ! -e /etc/letsencrypt/renewal/node.test.local.conf ]"
+  sleep 1
+  check "nginx serves the new certificate" "served_cert static.test.local -issuer | grep -qi pebble" "served_cert static.test.local -issuer"
+  check "CE's original is kept" "[ -s /etc/nginx/ssl-certificates/static.test.local.crt.ce ] && [ -s /etc/nginx/ssl-certificates/static.test.local.key.ce ]"
+  check "the private key stays private" "[ \"\$(stat -c %a /etc/nginx/ssl-certificates/static.test.local.key)\" = 600 ]"
+  check "the vhost didn't change" "sha256sum --quiet -c /var/tmp/vhosts.before" "sha256sum -c /var/tmp/vhosts.before | grep -v OK"
+  check "nginx wasn't restarted" "[ \"nginx \$(pid_of nginx)\" = \"\$(head -1 /var/tmp/pids.before)\" ]"
+
+  heading "a domain that fails doesn't stop the others"
+  mv /home/nodesite/htdocs/node.test.local /home/nodesite/htdocs/node.moved
+  check "move-certs reports the failure" "! $MIGRATE move-certs --email admin@example.com > /var/tmp/partial.log 2>&1" "cat /var/tmp/partial.log"
+  check "naming the domain" "grep -q 'failed: node.test.local' /var/tmp/partial.log" "cat /var/tmp/partial.log"
+  check "the other stays moved" "grep -q 'renewed by certbot: static.test.local' /var/tmp/partial.log" "cat /var/tmp/partial.log"
+  check "the failed site keeps its certificate" "served_cert node.test.local -issuer | grep -q 'Encrypt'" "served_cert node.test.local -issuer"
+  mv /home/nodesite/htdocs/node.moved /home/nodesite/htdocs/node.test.local
+  check "and it works once fixed" "$MIGRATE move-certs --email admin@example.com > /var/tmp/rest.log 2>&1" "cat /var/tmp/rest.log"
+
+  heading "certbot really renews, and nginx follows"
+  serial=$(served_cert static.test.local -serial)
+  check "a forced renewal succeeds" "certbot renew --no-verify-ssl --force-renewal --non-interactive --cert-name static.test.local > /var/tmp/renew.log 2>&1" "tail -15 /var/tmp/renew.log"
+  check "the hook is in place" "[ -x /etc/letsencrypt/renewal-hooks/deploy/cloudpanel-ce-certs ]"
+  sleep 2
+  check "nginx serves the renewed certificate" "[ \"\$(served_cert static.test.local -serial)\" != '$serial' ]" "served_cert static.test.local -serial; ls -la /etc/letsencrypt/renewal-hooks/deploy/; tail -5 /var/tmp/renew.log"
+  check "certbot's timer is on" "systemctl is-enabled --quiet certbot.timer"
+  check "CE's admin can sign in" "[ \"\$(api_login 8443)\" = 200 ]"
+  id=$(sql "select id from sites where domain='static.test.local'")
+  check "the panel says certbot renews it" "api 8443 GET /sites/$id | grep -q '\"certificate_renewal\":\"certbot\"'" "api 8443 GET /sites/$id | head -c 400"
+  check "and can renew it now" "api 8443 GET /sites/$id | grep -q '\"certificate_managed\":true'"
+  id=$(sql "select id from sites where domain='proxy.test.local'")
+  check "and says nothing renews an uploaded one" "api 8443 GET /sites/$id | grep -q '\"certificate_renewal\":\"none\"'" "api 8443 GET /sites/$id | head -c 400"
+  out=$(api 8443 POST "/sites/$id/ssl/takeover" '{"email":"admin@example.com"}')
+  check "and refuses to move it" "echo \"\$out\" | grep -q 'not Let.s Encrypt'" "echo \"\$out\""
+
+  heading "remove-ce"
+  check "it succeeds" "$MIGRATE remove-ce --yes > /var/tmp/remove.log 2>&1" "cat /var/tmp/remove.log"
+  check "its own checks saw no restart" "grep -q 'nginx and MySQL were not restarted' /var/tmp/remove.log" "cat /var/tmp/remove.log"
+
+  heading "what's gone"
+  check "CE's package" "! dpkg-query -W cloudpanel >/dev/null 2>&1 || ! dpkg-query -W -f='\${db:Status-Abbrev}' cloudpanel | grep -q '^ii'"
+  check "every version of PHP" "[ -z \"\$(dpkg-query -W -f='\${Package} \${db:Status-Abbrev}\n' 'php*' 2>/dev/null | awk '\$2 ~ /^ii/')\" ]" "dpkg-query -W -f='\${Package} \${db:Status-Abbrev}\n' 'php*' | awk '\$2 ~ /^ii/' | head"
+  check "PHP's config and services" "[ ! -d /etc/php ] && ! systemctl list-unit-files --no-legend 'php*-fpm.service' | grep -q ."
+  check "CE's services" "! systemctl list-unit-files --no-legend 'clp-*' | grep -q . && ! pgrep -x clp-agent >/dev/null"
+  check "CE's tools" "[ ! -e /usr/bin/clpctl ] && [ ! -e /usr/bin/clpctlWrapper ] && [ ! -e /usr/sbin/clp-agent ]" "command -v clpctl; ls -la /usr/bin/clp* /usr/sbin/clp-agent; dpkg-query -W -f='\${db:Status-Abbrev}
+' cloudpanel; tail -5 $STATE/remove-ce.log"
+  check "CE's cron jobs" "[ -z \"\$(ls /etc/cron.d/clp* 2>/dev/null)\" ]"
+  check "CE's passwordless sudo" "[ ! -e /etc/sudoers.d/cloudpanel ] && ! grep -q clp /etc/sudoers"
+  check "sudo still works" "visudo -c >/dev/null 2>&1"
+  check "the clp user" "! getent passwd clp >/dev/null && [ ! -d /home/clp ]"
+
+  heading "what must stay"
+  check "the databases, with their data" "[ \"\$(keep_marker)\" = survived ]" "keep_marker; ls -ld /home/mysql"
+  check "MySQL's data directory" "[ -d /home/mysql/mysql ]"
+  check "site files" "[ -s /home/staticsite/htdocs/static.test.local/index.html ]"
+  check "site users" "getent passwd staticsite nodesite pysite proxysite >/dev/null"
+  check "vhosts, byte for byte" "sha256sum --quiet -c /var/tmp/vhosts.before" "sha256sum -c /var/tmp/vhosts.before | grep -v OK"
+  check "nginx wasn't restarted" "[ \"nginx \$(pid_of nginx)\" = \"\$(head -1 /var/tmp/pids.before)\" ]"
+  check "MySQL wasn't restarted" "[ \"mysql \$(pid_of mysql)\" = \"\$(tail -1 /var/tmp/pids.before)\" ]"
+  check "the new panel owns the port" "[ \"\$(port_owner 8443)\" = cloudpanel ]"
+  check "every site answers" "site_body static.test.local | grep -q static-ok && site_body node.test.local | grep -q node-ok && site_body py.test.local | grep -q py-ok && site_body proxy.test.local | grep -q proxy-ok"
+  check "a site user can still log in, with no errors" "[ -z \"\$(su - nodesite -c true 2>&1)\" ]" "su - nodesite -c true"
+  check "CE's data is saved privately" "ls /var/backups/cloudpanel/ce-archive-*.tar.gz >/dev/null && [ \"\$(stat -c %a /var/backups/cloudpanel/ce-archive-*.tar.gz)\" = 600 ]"
+  check "and holds its database" "[ -n \"\$(tar -tzf /var/backups/cloudpanel/ce-archive-*.tar.gz | grep 'home/clp/htdocs/app/data/db.sq3')\" ]" "tar -tzf /var/backups/cloudpanel/ce-archive-*.tar.gz | head -5; ls -la /var/backups/cloudpanel"
+
+  heading "living without CE"
+  serial=$(served_cert node.test.local -serial)
+  check "certbot still renews" "certbot renew --no-verify-ssl --force-renewal --non-interactive --cert-name node.test.local > /var/tmp/renew2.log 2>&1" "tail -15 /var/tmp/renew2.log"
+  sleep 2
+  check "and nginx follows" "[ \"\$(served_cert node.test.local -serial)\" != '$serial' ]"
+  apt-get update -q >/dev/null 2>&1
+  check "apt wouldn't downgrade anything" "! LC_ALL=C apt-get -s -q upgrade 2>/dev/null | grep -q DOWNGRADED"
+  # shellcheck disable=SC2016
+  check "autoremove wouldn't touch what serves sites" "! LC_ALL=C apt-get -s -q autoremove 2>/dev/null | grep -E '^Remv (nginx|libnginx|percona|mysql|mariadb|redis|varnish|proftpd|certbot|fail2ban|ufw|cron) '" "LC_ALL=C apt-get -s -q autoremove | grep '^Remv' | head -30"
+  check "a real autoremove runs" "DEBIAN_FRONTEND=noninteractive apt-get -y -q autoremove > /var/tmp/autoremove.log 2>&1" "tail -10 /var/tmp/autoremove.log"
+  check "a real upgrade runs" "DEBIAN_FRONTEND=noninteractive apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade > /var/tmp/upgrade.log 2>&1" "tail -10 /var/tmp/upgrade.log"
+  check "the databases are still there" "[ \"\$(keep_marker)\" = survived ]"
+  check "the panel can still manage MySQL" "api_login 8443 >/dev/null; api 8443 POST /sites/\$(sql \"select id from sites where domain='static.test.local'\")/databases '{\"engine\":\"mariadb\",\"name\":\"newdb\"}' >/dev/null; mysql --defaults-extra-file=/etc/cloudpanel/mysql-admin.cnf -e 'use newdb' 2>/dev/null"
+  check "rollback refuses, and says why" "! $MIGRATE rollback --yes > /var/tmp/rb.log 2>&1 && grep -q 'snapshot' /var/tmp/rb.log" "cat /var/tmp/rb.log"
+  check "prepare refuses" "! $MIGRATE prepare --binary $BIN --no-php --yes >/dev/null 2>&1"
+  check "running remove-ce again is harmless" "$MIGRATE remove-ce --yes 2>&1 | grep -q 'already been removed'"
+  exit "$failures"
+}
+
+cmd_after_removal_reboot() {
+  heading "after a reboot, with CE gone"
+  sleep 5
+  check "the new panel came back" "[ \"\$(port_owner 8443)\" = cloudpanel ]"
+  check "the static site answers" "site_body static.test.local | grep -q static-ok"
+  check "with certbot's certificate" "served_cert static.test.local -issuer | grep -qi pebble"
+  check "the databases are there" "[ \"\$(keep_marker)\" = survived ]"
+  exit "$failures"
+}
+
 # After restarting the server, with the migration done.
 cmd_after_reboot() {
   heading "after a reboot"
@@ -396,6 +558,9 @@ cmd_fresh_php() {
 
 case "${1:-}" in
   after-reboot) cmd_after_reboot ;;
+  setup-removal) cmd_setup_removal ;;
+  removal) cmd_removal ;;
+  after-removal-reboot) cmd_after_removal_reboot ;;
   fresh-no-php) cmd_fresh_no_php ;;
   fresh-php) cmd_fresh_php ;;
   setup) cmd_setup ;;

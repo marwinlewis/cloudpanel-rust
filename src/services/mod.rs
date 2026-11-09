@@ -2,6 +2,7 @@ pub mod alerts;
 pub mod apps;
 pub mod backups;
 pub mod ce_import;
+pub mod cert_takeover;
 pub mod cloudflare;
 pub mod cmd;
 pub mod cron;

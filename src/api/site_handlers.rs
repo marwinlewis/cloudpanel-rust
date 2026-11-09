@@ -5,7 +5,7 @@ use crate::authz::{require_admin, require_site, visible_sites};
 use crate::config::Config;
 use crate::db::{self, models::Site, models::SiteType};
 use crate::services::sites::{deprovision, provision, www_choice, SiteInput};
-use crate::services::{apps, php, pm2, runtimes, NginxService, SslService};
+use crate::services::{apps, cert_takeover, php, pm2, runtimes, NginxService, SslService};
 use crate::state::SharedState;
 use crate::validate;
 use axum::{
@@ -153,7 +153,12 @@ pub async fn get_site(
                 v["ecosystem_file"] = json!(pm2::detect_ecosystem(&site));
                 v["project"] = json!(apps::inspect_project(std::path::Path::new(&apps::workdir(&site))));
             }
-            v["certificate_managed"] = json!(site.ssl_cert_path.as_deref().is_some_and(SslService::is_letsencrypt));
+            let renewal = cert_takeover::renewal(&site);
+            v["certificate_renewal"] = json!(renewal.map(cert_takeover::Renewal::as_str));
+            v["certificate_managed"] = json!(
+                site.ssl_cert_path.as_deref().is_some_and(SslService::is_letsencrypt)
+                    || renewal == Some(cert_takeover::Renewal::Certbot)
+            );
             v["app"] = json!(app);
             v["app_workdir_default"] = json!(apps::workdir(&Site {
                 app_workdir: None,
@@ -374,7 +379,9 @@ pub async fn renew_site_ssl(
                 .ssl_cert_path
                 .clone()
                 .ok_or_else(|| ApiError::BadRequest("SSL is not enabled".into()))?;
-            if !SslService::is_letsencrypt(&cert) {
+            if !SslService::is_letsencrypt(&cert)
+                && cert_takeover::renewal(&site) != Some(cert_takeover::Renewal::Certbot)
+            {
                 return Err(ApiError::BadRequest(
                     "Only Let's Encrypt certificates can be renewed; upload a new custom certificate instead".into(),
                 ));
@@ -387,6 +394,31 @@ pub async fn renew_site_ssl(
         })
         .await?;
     Ok(Json(json!({ "message": "Certificate renewed" })))
+}
+
+#[derive(Deserialize)]
+pub struct TakeoverRequest {
+    pub email: String,
+}
+
+/// Move an imported site's Let's Encrypt renewal from CloudPanel CE's nightly job to certbot. Its
+/// vhost isn't touched: certbot's certificate goes to the paths the vhost already reads.
+pub async fn take_over_site_ssl(
+    Path(id): Path<i64>,
+    user: AuthUser,
+    State(state): State<SharedState>,
+    Json(p): Json<TakeoverRequest>,
+) -> ApiResult<impl IntoResponse> {
+    let email = validate::email(&p.email).map_err(ApiError::BadRequest)?;
+    state
+        .db(move |conn| {
+            let site = require_site(conn, &user, id)?;
+            cert_takeover::take_over(&site, &email, false).map_err(ApiError::Unprocessable)?;
+            audit::record(conn, &user, "site.ssl_takeover", Some(&site.domain), None);
+            Ok(())
+        })
+        .await?;
+    Ok(Json(json!({ "message": "Certificate moved to certbot" })))
 }
 
 pub async fn remove_site_ssl(

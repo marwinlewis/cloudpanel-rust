@@ -516,6 +516,27 @@ async fn imported_sites_refuse_everything_that_would_touch_their_nginx_config() 
 }
 
 #[tokio::test]
+async fn only_imported_sites_can_move_their_certificate_to_certbot() {
+    let h = harness();
+    let id = db::list_sites(&h.pool.get().unwrap()).unwrap()[0].id;
+    let cookie = h.login("admin").await;
+    let (s, v, _) = h
+        .call(
+            "POST",
+            &format!("/sites/{id}/ssl/takeover"),
+            Some(&cookie),
+            Some(json!({"email": "me@example.com"})),
+            true,
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("imported from CloudPanel CE"),
+        "{v}"
+    );
+}
+
+#[tokio::test]
 async fn php_sites_need_php_to_be_enabled_when_installing() {
     let h = harness_with(|c| c.php_enabled = false);
     let cookie = h.login("admin").await;

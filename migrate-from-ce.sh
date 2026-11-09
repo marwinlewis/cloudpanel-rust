@@ -17,6 +17,9 @@
 #   sudo bash migrate-from-ce.sh status       Show where things stand.
 #   sudo bash migrate-from-ce.sh fix-apt      Let apt upgrades run on a server that has already cut
 #                                             over. (Cutover does this itself.)
+#   sudo bash migrate-from-ce.sh move-certs   Move Let's Encrypt renewal from CE to the new panel's
+#                                             certbot, domain by domain. Needs --email.
+#   sudo bash migrate-from-ce.sh remove-ce    Permanently remove CE and all of PHP. No rollback after.
 #
 # Options:
 #   --with-php         Manage PHP sites in the new panel. (Asked if the server has PHP sites.)
@@ -25,6 +28,9 @@
 #                      opens in UFW)
 #   --binary PATH      Use a local cloudpanel binary (offline installs, testing)
 #   --version vX.Y.Z   Install a specific release
+#   --email ADDRESS    With move-certs: where Let's Encrypt sends expiry notices. Agrees to its terms.
+#   --domain NAME      With move-certs: only this domain
+#   --dry-run          With move-certs: check each domain can be validated, and change nothing
 #   --yes              Don't ask for confirmation
 #   -h, --help         Show this help
 #
@@ -52,6 +58,9 @@ PHP_CHOICE=""
 BINARY=""
 VERSION=""
 ASSUME_YES=0
+CERT_EMAIL=""
+CERT_DOMAIN=""
+CERT_DRY_RUN=0
 PROBLEMS=0
 
 if [ -t 1 ]; then
@@ -72,7 +81,10 @@ usage() { sed -n '2,/^$/p' "$0" | sed -e 's/^# \{0,1\}//' -e '$d'; }
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      preflight|prepare|cutover|rollback|status|fix-apt) COMMAND="$1" ;;
+      preflight|prepare|cutover|rollback|status|fix-apt|move-certs|remove-ce) COMMAND="$1" ;;
+      --email) CERT_EMAIL="${2:?--email needs an address}"; shift ;;
+      --domain) CERT_DOMAIN="${2:?--domain needs a name}"; shift ;;
+      --dry-run) CERT_DRY_RUN=1 ;;
       --with-php) PHP_CHOICE=1 ;;
       --no-php) PHP_CHOICE=0 ;;
       --side-port) SIDE_PORT="${2:?--side-port needs a value}"; shift ;;
@@ -402,6 +414,7 @@ backup_config() {
 }
 
 cmd_prepare() {
+  [ "$(state)" != ce-removed ] || die "CE has been removed from this server, so there is nothing to migrate."
   [ "$(state)" != cutover ] || die "Already cut over. To go back first: sudo bash $0 rollback"
   preflight_checks
   [ "$PROBLEMS" -eq 0 ] || die "$PROBLEMS problem(s) to fix before migrating."
@@ -592,6 +605,7 @@ EOF
 cmd_rollback() {
   [ "$(id -u)" -eq 0 ] || die "Please run as root."
   [ -d "$STATE_DIR" ] || die "Nothing to roll back: this script hasn't run here."
+  [ "$(state)" != ce-removed ] || die "CE has been removed from this server, so there's nothing to go back to. Restore your snapshot instead."
   log "Going back to CE's panel. The sites aren't touched."
   info "Changes made in the new panel since cutover stay in the new panel; CE won't know about them."
   confirm "Go back to CE?" || die "Nothing was changed."
@@ -610,6 +624,242 @@ cmd_fix_apt() {
   PROBLEMS=0
   pin_ce_downgrades
   log "Done. This doesn't upgrade anything. Run the upgrade from Services > Updates when it suits you."
+}
+
+# ---------- move-certs ----------
+
+# Runs the panel's own command with its settings, as the service would.
+panel_cmd() {
+  (
+    set -a
+    # shellcheck disable=SC1090
+    . "$NEW_ENV"
+    set +a
+    "$NEW_BIN" "$@"
+  )
+}
+
+cmd_move_certs() {
+  [ "$(id -u)" -eq 0 ] || die "Please run as root."
+  [ -n "$CERT_EMAIL" ] || die "Say where Let's Encrypt should send expiry notices: --email you@example.com"
+  [ -x "$NEW_BIN" ] || die "The new panel isn't installed yet. Run prepare first."
+  local args=(cert-takeover --email "$CERT_EMAIL")
+  [ -n "$CERT_DOMAIN" ] && args+=(--domain "$CERT_DOMAIN")
+  if [ "$CERT_DRY_RUN" = 1 ]; then
+    log "Checking Let's Encrypt can validate each domain. Nothing is issued or changed."
+    args+=(--dry-run)
+  else
+    log "Moving certificates to certbot. Vhosts don't change, and nginx only reloads."
+  fi
+  panel_cmd "${args[@]}" | sed 's/^/    /'
+  [ "${PIPESTATUS[0]}" -eq 0 ] || die "Some domains didn't move (above). Those keep renewing through CE."
+  log "Done."
+}
+
+# ---------- remove-ce ----------
+
+# What must never be removed along with CE. The packages it depends on are marked as installed on
+# purpose, or `apt autoremove` would later take nginx and MySQL with it.
+keep_ce_dependencies() {
+  local deps
+  deps=$(dpkg-query -W -f='${Depends}\n' cloudpanel | tr ',' '\n' | sed -e 's/^ *//' -e 's/ .*//' | grep -v '^php' || true)
+  # shellcheck disable=SC2086
+  deps="$deps $(dpkg-query -W -f='${Package} ${db:Status-Abbrev}\n' 'nginx*' 'libnginx*' 'percona*' 'mysql*' 'mariadb*' 'redis*' 'proftpd*' 'varnish*' 2>/dev/null | awk '$2 == "ii" {print $1}')"
+  local p
+  for p in $deps; do
+    if [ "$(dpkg-query -W -f='${db:Status-Abbrev}' "$p" 2>/dev/null | cut -c1-2)" = ii ]; then
+      apt-mark manual "$p" >/dev/null 2>&1 || true
+    fi
+  done
+}
+
+# CE's removal scripts stop nginx and MySQL, run `clpctl cloudpanel:delete:sites`, which deletes
+# every site, and on purge run `rm -rf /home/mysql/`, which deletes every database. Replace them
+# before touching the package, and don't go on unless that worked.
+disarm_ce_package_scripts() {
+  local f
+  for f in prerm postrm; do
+    f=/var/lib/dpkg/info/cloudpanel.$f
+    [ -e "$f" ] || continue
+    printf '#!/bin/sh\n# Disabled by migrate-from-ce.sh: this deleted every site and database.\nexit 0\n' > "$f"
+    chmod 755 "$f"
+    if grep -qE 'delete:sites|rm -rf /home/mysql|userdel|invoke-rc' "$f"; then
+      die "Could not disable $f. Nothing was removed. Do not remove the cloudpanel package."
+    fi
+  done
+}
+
+php_packages() {
+  dpkg-query -W -f='${Package} ${db:Status-Abbrev}\n' 'php*' 2>/dev/null | awk '$2 ~ /^(ii|rc)/ {print $1}' | grep -E '^php([0-9]|-)' || true
+}
+
+remove_ce_checks() {
+  PROBLEMS=0
+  log "Checking this server can do without CE (nothing is changed)"
+  [ "$(state)" = cutover ] || die "Cut over to the new panel first (state: $(state))."
+  if panel_answers "$CE_PORT" 5; then
+    pass "The new panel answers on port $CE_PORT"
+  else
+    bad "The new panel isn't answering on port $CE_PORT"
+  fi
+  local out
+  if out=$(nginx -t 2>&1); then
+    pass "nginx accepts its config"
+  else
+    bad "nginx rejects its config:"
+    printf '%s\n' "$out" | tail -3 | sed 's/^/         /'
+  fi
+
+  local php_sites vhosts panel_php
+  php_sites=$(ce_sql "SELECT domain_name FROM site WHERE type = 'php'")
+  vhosts=$(grep -rl 'fastcgi_pass' /etc/nginx/sites-enabled/ 2>/dev/null || true)
+  panel_php=$(sqlite3 -readonly /var/lib/cloudpanel/cloudpanel.db "SELECT domain FROM sites WHERE site_type = 'php'" 2>/dev/null || true)
+  if [ -z "$php_sites$vhosts$panel_php" ]; then
+    pass "No site uses PHP"
+  else
+    bad "These use PHP, and removing PHP would take them down:"
+    printf '%s\n' "$php_sites" "$vhosts" "$panel_php" | sed '/^$/d' | sort -u | sed 's/^/         /'
+  fi
+
+  # Everything Let's Encrypt has to renew through certbot, or it would expire with CE gone.
+  local certs
+  if certs=$(panel_cmd cert-takeover --check 2>&1); then
+    pass "No certificate depends on CE to renew"
+  else
+    bad "These certificates still renew through CE. Move them first: sudo bash $0 move-certs --email you@example.com"
+    printf '%s\n' "$certs" | grep 'still renewed by ce' | sed 's/^/         /'
+  fi
+  printf '%s\n' "$certs" | grep 'not let' | sed 's/^/    /' || true
+  if ! systemctl is-enabled --quiet certbot.timer 2>/dev/null; then
+    bad "certbot.timer isn't enabled, so nothing would renew certificates"
+  fi
+
+  # Only CE and PHP may go. Anything else on this list means apt has other plans.
+  apt-mark unhold cloudpanel >/dev/null
+  local plan others
+  # shellcheck disable=SC2046
+  plan=$(LC_ALL=C apt-get -s -q purge cloudpanel $(php_packages) 2>&1 || true)
+  apt-mark hold cloudpanel >/dev/null
+  others=$(printf '%s\n' "$plan" | awk '/^(Purg|Remv) / {print $2}' | grep -vE '^(php|cloudpanel$)' || true)
+  if [ -z "$others" ]; then
+    pass "Removing CE and PHP would take nothing else with it"
+  else
+    bad "Removing CE and PHP would also remove:"
+    printf '%s\n' "$others" | sed 's/^/         /'
+  fi
+}
+
+cmd_remove_ce() {
+  [ "$(id -u)" -eq 0 ] || die "Please run as root."
+  [ -f "$STATE_FILE" ] || die "This script hasn't migrated this server."
+  [ "$(state)" != ce-removed ] || { log "CE has already been removed."; return 0; }
+  [ -f "$CE_DB" ] || die "CE's database is missing, so this can't check what's safe. Nothing was changed."
+  remove_ce_checks
+  [ "$PROBLEMS" -eq 0 ] || die "$PROBLEMS problem(s) to fix first. Nothing was changed."
+
+  cat <<EOF
+
+${C_BOLD}This permanently removes CloudPanel CE and every version of PHP.${C_RST}
+  Your sites, their files and their databases stay, and nginx and MySQL aren't restarted.
+  - rollback stops working for good. Only a snapshot can undo this.
+  - CE's nightly database backups stop. Set up backups in the new panel under each site.
+  - PHP stops being available to anything, including scripts in cron jobs.
+  - Stays: nginx (from CE's apt repository, which stays for its updates), Varnish, ProFTPD, Redis.
+
+EOF
+  if [ "$ASSUME_YES" -ne 1 ]; then
+    { exec 3</dev/tty; } 2>/dev/null || die "Can't ask for confirmation without a terminal. Pass --yes to go ahead."
+    local answer=""
+    printf 'Have you taken a snapshot? Type REMOVE to go ahead: '
+    read -r answer <&3 || answer=""
+    exec 3<&-
+    [ "$answer" = REMOVE ] || die "Nothing was changed."
+  fi
+
+  log "Recording how the sites are running now"
+  service_pids | grep -vE '^php' > "$STATE_DIR/pids.remove-ce"
+  probe_sites > "$STATE_DIR/probes.remove-ce"
+  find /etc/nginx/sites-enabled -type f ! -name 'cloudpanel-*' -print0 | sort -z | xargs -0 -r sha256sum > "$STATE_DIR/vhosts.remove-ce"
+
+  local archive
+  archive="/var/backups/cloudpanel/ce-archive-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+  log "Saving CE's data to $archive"
+  install -d -m 700 /var/backups/cloudpanel
+  tar -czf "$archive" --ignore-failed-read -C / home/clp etc/bashrc etc/cron.d/clp 2>/dev/null || die "Could not save CE's data. Nothing was removed."
+  chmod 600 "$archive"
+
+  log "Removing CE"
+  disarm_ce_package_scripts
+  keep_ce_dependencies
+  # Site users' shells read this on login, and the package would take it away.
+  local bashrc
+  bashrc=$(mktemp)
+  [ -f /etc/bashrc/bashrc ] && cp -p /etc/bashrc/bashrc "$bashrc"
+  local unit
+  for unit in $CE_PANEL_UNITS; do
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+  done
+  apt-mark unhold cloudpanel >/dev/null
+  dpkg --purge --force-depends cloudpanel >> "$STATE_DIR/remove-ce.log" 2>&1 || die "Removing the cloudpanel package failed. See $STATE_DIR/remove-ce.log"
+  if [ -s "$bashrc" ]; then
+    mkdir -p /etc/bashrc
+    cp -p "$bashrc" /etc/bashrc/bashrc
+  fi
+  rm -f "$bashrc"
+  rm -f /etc/cron.d/clp /etc/cron.d/clp-* /etc/update-motd.d/10-cloudpanel /usr/sbin/clp-agent /usr/local/bin/composer
+  rm -f /lib/systemd/system/clp-nginx.service /lib/systemd/system/clp-php-fpm.service /lib/systemd/system/clp-agent.service
+  systemctl daemon-reload
+  pkill -9 -u clp 2>/dev/null || true
+  userdel clp 2>/dev/null || true
+  rm -rf /home/clp
+
+  log "Removing PHP"
+  # shellcheck disable=SC2046
+  DEBIAN_FRONTEND=noninteractive apt-get -y -q purge $(php_packages) >> "$STATE_DIR/remove-ce.log" 2>&1 \
+    || warn "Removing PHP reported a problem. See $STATE_DIR/remove-ce.log"
+  rm -rf /etc/php
+  sed -i 's|^CLOUDPANEL_PHP=.*|CLOUDPANEL_PHP=0|' "$NEW_ENV"
+  systemctl restart cloudpanel
+  set_state ce-removed
+
+  log "Checking the sites"
+  PROBLEMS=0
+  local d before after
+  if diff -q "$STATE_DIR/pids.remove-ce" <(service_pids | grep -vE '^php') >/dev/null; then
+    pass "nginx and MySQL were not restarted"
+  else
+    bad "A service restarted:"
+    diff "$STATE_DIR/pids.remove-ce" <(service_pids | grep -vE '^php') | sed 's/^/         /'
+  fi
+  if sha256sum --quiet -c "$STATE_DIR/vhosts.remove-ce" >/dev/null 2>&1; then
+    pass "Site configs are byte for byte what they were"
+  else
+    bad "A site config changed"
+  fi
+  while read -r d before; do
+    after=$(probe_one "$d")
+    if [ "$after" = "$before" ]; then
+      pass "$d answers $after, as before"
+    elif [ "$after" = 000 ] || [ "${after:0:1}" = 5 ]; then
+      bad "$d answered $before before and answers $after now"
+    else
+      warn "$d answered $before before and answers $after now"
+    fi
+  done < "$STATE_DIR/probes.remove-ce"
+  if panel_answers "$CE_PORT" 30; then
+    pass "The new panel answers on port $CE_PORT"
+  else
+    bad "The new panel isn't answering on port $CE_PORT. See: journalctl -u cloudpanel -n 50"
+  fi
+
+  echo
+  if [ "$PROBLEMS" -gt 0 ]; then
+    die "CE and PHP are gone, but $PROBLEMS check(s) failed (above). Your snapshot is the way back."
+  fi
+  log "CE and PHP are gone. Your sites, files and databases weren't touched."
+  printf '  Saved: %s (holds CE'"'"'s encrypted credentials, so keep it safe or delete it)\n' "$archive"
+  printf '  Next: set up backups in the panel. CE'"'"'s nightly database backups have stopped.\n'
+  printf '  apt autoremove can now clear the libraries only PHP used.\n'
 }
 
 # ---------- status ----------
@@ -636,6 +886,8 @@ main() {
     rollback) cmd_rollback ;;
     status) cmd_status ;;
     fix-apt) cmd_fix_apt ;;
+    move-certs) cmd_move_certs ;;
+    remove-ce) cmd_remove_ce ;;
   esac
 }
 
