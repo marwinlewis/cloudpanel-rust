@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
 /// `Content-Disposition` with an ASCII-safe filename.
-fn disposition(name: &str) -> HeaderValue {
+pub(crate) fn disposition(name: &str) -> HeaderValue {
     let safe: String = name
         .chars()
         .map(|c| {

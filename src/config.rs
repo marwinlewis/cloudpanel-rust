@@ -21,6 +21,12 @@ pub struct Config {
     pub stacks_dir: PathBuf,
     pub nginx_log_dir: PathBuf,
     pub fail2ban_dir: PathBuf,
+    /// `/etc/wireguard`: WireGuard interface configurations.
+    pub wireguard_dir: PathBuf,
+    /// `/etc/garage`: Garage's config and the secrets the panel reads (admin token).
+    pub garage_dir: PathBuf,
+    /// Garage's admin API, on loopback (`CLOUDPANEL_GARAGE_ADMIN_URL`).
+    pub garage_admin_url: String,
     /// One file per address banned from the panel, kept by fail2ban's action. Under `/run`, as
     /// fail2ban restores its bans after a reboot.
     pub ban_dir: PathBuf,
@@ -95,6 +101,12 @@ impl Config {
             stacks_dir: env_path("CLOUDPANEL_STACKS_DIR").unwrap_or_else(|| data_dir.join("stacks")),
             nginx_log_dir: PathBuf::from(env_or("CLOUDPANEL_NGINX_LOG_DIR", "/var/log/nginx", "./data/log/nginx")),
             fail2ban_dir: PathBuf::from(env_or("CLOUDPANEL_FAIL2BAN_DIR", "/etc/fail2ban", "./data/fail2ban")),
+            wireguard_dir: PathBuf::from(env_or("CLOUDPANEL_WIREGUARD_DIR", "/etc/wireguard", "./data/wireguard")),
+            garage_dir: PathBuf::from(env_or("CLOUDPANEL_GARAGE_DIR", "/etc/garage", "./data/garage")),
+            garage_admin_url: std::env::var("CLOUDPANEL_GARAGE_ADMIN_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "http://127.0.0.1:3903".to_string()),
             ban_dir: PathBuf::from(env_or("CLOUDPANEL_BAN_DIR", "/run/cloudpanel-bans", "./data/bans")),
             sshd_config_dir: PathBuf::from(env_or(
                 "CLOUDPANEL_SSHD_DIR",

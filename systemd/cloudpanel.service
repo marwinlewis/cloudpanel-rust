@@ -30,7 +30,7 @@ RestrictRealtime=yes
 LockPersonality=yes
 ReadWritePaths=-/etc/nginx -/etc/cron.d -/etc/letsencrypt -/etc/ufw -/etc/cloudpanel -/etc/fail2ban
 ReadWritePaths=-/etc/systemd/system -/etc/ssh/sshd_config.d -/etc/ssh/cloudpanel_keys -/home -/var/www -/var/backups/cloudpanel
-ReadWritePaths=-/var/log/cloudpanel -/var/lib/cloudpanel -/etc/php
+ReadWritePaths=-/var/log/cloudpanel -/var/lib/cloudpanel -/etc/php -/etc/wireguard
 
 [Install]
 WantedBy=multi-user.target

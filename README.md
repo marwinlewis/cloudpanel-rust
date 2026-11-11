@@ -1,6 +1,6 @@
 # CloudPanel (Rust Edition)
 
-A lightweight, self-contained server control panel written in Rust. One static binary serves the web UI and API and manages everything a VPS needs: sites with their own Linux users, supervised Node.js/Python apps, nginx, Let's Encrypt, databases, files, backups, services, updates, Docker, the firewall, fail2ban, cron and alerts.
+A lightweight, self-contained server control panel written in Rust. One static binary serves the web UI and API and manages everything a VPS needs: sites with their own Linux users, supervised Node.js/Python apps, nginx, Let's Encrypt, databases, files, backups, services, updates, Docker, the firewall, fail2ban, a WireGuard VPN, S3-compatible object storage (Garage), cron and alerts.
 
 - **Single binary**: the UI is embedded with `rust-embed`, and there are no PHP, Node or Python runtimes to maintain.
 - **Small footprint**: Tokio + Axum + embedded SQLite.
@@ -50,6 +50,10 @@ Then open `https://<server-ip>:8443`. Your browser will warn about the self-sign
 | `--databases LIST` | Comma-separated `mariadb,mongodb,sqlite` (skips the question) |
 | `--with-php` | Enable PHP sites and install PHP-FPM (asked if you're at a terminal; off otherwise) |
 | `--no-php` | Don't enable PHP sites, and don't ask |
+| `--with-wireguard` | Install WireGuard for the VPN page (asked if you're at a terminal; skipped when WireGuard is already installed) |
+| `--no-wireguard` | Don't install WireGuard, and don't ask |
+| `--with-garage` | Install Garage S3-compatible object storage for the Object Storage page (asked if you're at a terminal) |
+| `--no-garage` | Don't install Garage, and don't ask |
 | `--no-upgrade` | Never upgrade packages that are already installed |
 | `--no-fail2ban` | Don't install fail2ban |
 | `--port N` | Panel port (default `8443`) |
@@ -100,6 +104,8 @@ sudo cloudpanel user-disable-2fa --username admin
 - **Firewall**: UFW port and port-range rules, optionally limited to a source IP/CIDR, and an IP block list. Rules that would block SSH or the panel for your own address are refused. The most specific rule wins whatever order you add them in: rules naming a source come first, then denies for everyone, then allows for everyone.
 - **Panel hostname**: give the panel its own hostname to open it at `https://<hostname>`. You can then close its port in *Settings → Panel certificate*, from a session on that hostname, so that it only listens on loopback. If the hostname can't be served, the port opens again on the next start; otherwise reach it with `ssh -L 8443:127.0.0.1:8443` or reopen it with `cloudpanel panel-access-open`.
 - **Security**: fail2ban jails for SSH and the panel login, with ban time, retries, an ignore list, ban/unban and live status.
+- **VPN**: a WireGuard server with any number of clients. Each client gets its own keys, address and a configuration shown as a QR code or downloaded as a `.conf` file; live status shows who is connected and how much they transferred. Clients can be disabled, renamed or routed for full or split tunnelling, and the UDP port is opened in UFW for you. A server that already runs WireGuard is imported as it is: its keys, peers and custom lines such as `PostUp` are kept, and the original file is saved as `<interface>.conf.pre-cloudpanel` before the panel first rewrites it.
+- **Object storage**: [Garage](https://garagehq.deuxfleurs.fr/), an S3-compatible store, installed at setup or later from the panel. The panel downloads a pinned release, checks it against a SHA-256 built into the panel, and runs it as its own sandboxed `garage` service that listens on 127.0.0.1 only. Create buckets with optional size and object limits, and one access key per app, and give each key read, write or owner access to the buckets it needs. Secrets are shown once and never stored. A bucket or key can belong to a site, whose managers then manage it from the site's Buckets tab. An optional public hostname is served by nginx over HTTPS with a Let's Encrypt certificate (path-style URLs, region `us-east-1`). Removing CloudPanel leaves the stored data in `/var/lib/garage`.
 - **Cron**: create, edit, pause and run jobs now. Every run's exit code and output are recorded, and jobs can be tied to a site and run as its user.
 - **Containers**: list, start/stop/restart, logs, stats and removal. Run new containers from a form (ports are bound to 127.0.0.1 by default), manage images (pull/remove/prune), handle Docker Compose stacks, and expose a container on a domain.
 - **Overview**: live CPU, memory, disk and network graphs, top processes, public IPs and pending updates.

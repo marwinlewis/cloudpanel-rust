@@ -46,6 +46,21 @@ export function svgEl(tag, attrs = {}) {
   return el;
 }
 
+/** Draw a QR module matrix ('1' = dark) as an SVG element. */
+export function qrSvg(width, modules) {
+  const quiet = 2;
+  const size = width + quiet * 2;
+  const svg = svgEl('svg', { viewBox: `0 0 ${size} ${size}`, 'shape-rendering': 'crispEdges', role: 'img', 'aria-label': 'QR code' });
+  let d = '';
+  for (let y = 0; y < width; y++) {
+    for (let x = 0; x < width; x++) {
+      if (modules[y * width + x] === '1') d += `M${x + quiet},${y + quiet}h1v1h-1z`;
+    }
+  }
+  svg.append(svgEl('path', { d, fill: '#000' }));
+  return h('div', { class: 'qr' }, svg);
+}
+
 export const spinner = () => h('span', { class: 'spinner', 'aria-hidden': 'true' });
 
 // ---------- Formatting ----------

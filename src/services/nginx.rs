@@ -11,6 +11,7 @@ pub struct NginxService;
 
 /// File name of the panel's own nginx site. It can't collide with a site: domains have a dot.
 const PANEL_VHOST: &str = "cloudpanel-panel";
+const S3_VHOST: &str = "cloudpanel-s3";
 
 /// What the panel's own nginx site needs. All values come from the panel itself.
 pub struct PanelVhost {
@@ -541,6 +542,80 @@ server {{
             return Ok(());
         }
         Self::install_vhost(config, PANEL_VHOST, &content, 0o600)
+    }
+
+    /// The public HTTPS endpoint for Garage's S3 API. Path-style only, so one name and one
+    /// certificate cover every bucket. Signatures cover the Host header, so it is passed as is,
+    /// and bodies stream straight through: S3 objects can be any size.
+    pub fn render_s3_vhost(config: &Config, hostname: &str, cert: &str, key: &str, upstream: &str) -> String {
+        format!(
+            r#"# Managed by CloudPanel - changes will be overwritten
+server {{
+    listen 80;
+    listen [::]:80;
+    server_name {hostname};
+
+    location /.well-known/acme-challenge/ {{
+        root /var/www/html;
+    }}
+
+    location / {{
+        return 301 https://{hostname}$request_uri;
+    }}
+}}
+
+server {{
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name {hostname};
+
+    ssl_certificate {cert};
+    ssl_certificate_key {key};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:cloudpanel_ssl:10m;
+    ssl_session_timeout 1d;
+
+    access_log {log}/{hostname}.access.log;
+    error_log {log}/{hostname}.error.log;
+
+    client_max_body_size 0;
+
+    location / {{
+        proxy_pass http://{upstream};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_max_temp_file_size 0;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }}
+}}
+"#,
+            log = config.nginx_log_dir.display(),
+        )
+    }
+
+    pub fn apply_s3_vhost(
+        config: &Config,
+        hostname: &str,
+        cert: &str,
+        key: &str,
+        upstream: &str,
+    ) -> Result<(), String> {
+        let content = Self::render_s3_vhost(config, hostname, cert, key, upstream);
+        Self::install_vhost(config, S3_VHOST, &content, 0o644)
+    }
+
+    pub fn remove_s3_vhost(config: &Config) -> Result<(), String> {
+        if Self::paths(config, S3_VHOST).0.symlink_metadata().is_err() {
+            return Ok(());
+        }
+        Self::remove_site(config, S3_VHOST)
     }
 
     pub fn remove_panel_vhost(config: &Config) -> Result<(), String> {

@@ -11,7 +11,6 @@
 # Options:
 #   --version vX.Y.Z   Install a specific release (default: latest)
 #   --from-source      Build from source instead of downloading a release binary
-#   --binary PATH      Install a local cloudpanel binary instead of downloading one
 #   --binary PATH      Install a locally built cloudpanel binary (offline installs, testing)
 #   --branch NAME      Git branch to build when building from source (default: main)
 #   --with-docker      Also install Docker Engine from the official docker.com repository
@@ -22,6 +21,10 @@
 #   --databases LIST   Same as the three flags above, e.g. --databases mariadb,sqlite
 #   --with-php         Enable PHP sites (installs PHP-FPM; asked interactively if not given)
 #   --no-php           Don't enable PHP sites, and don't ask
+#   --with-wireguard   Install WireGuard for the panel's VPN page (asked interactively if not given)
+#   --no-wireguard     Don't install WireGuard, and don't ask
+#   --with-garage      Install Garage S3 object storage, managed from the panel (asked if not given)
+#   --no-garage        Don't install Garage, and don't ask
 #   --no-upgrade       Never upgrade packages that are already installed. Used when migrating,
 #                      as upgrading nginx or PHP would restart what serves the sites.
 #   --no-fail2ban      Don't install fail2ban
@@ -49,6 +52,10 @@ WITH_SQLITE=0
 DB_CHOSEN=0
 WITH_PHP=0
 PHP_CHOSEN=0
+WITH_WIREGUARD=0
+WG_CHOSEN=0
+WITH_GARAGE=0
+GARAGE_CHOSEN=0
 NO_UPGRADE=0
 NO_FAIL2BAN=0
 NO_FIREWALL=0
@@ -108,6 +115,10 @@ CloudPanel installer (Debian 11/12/13, Ubuntu 22.04/24.04)
   --databases LIST   Comma-separated: mariadb,mongodb,sqlite (asked interactively if omitted)
   --with-php         Enable PHP sites (installs PHP-FPM; asked interactively if omitted)
   --no-php           Don't enable PHP sites, and don't ask
+  --with-wireguard   Install WireGuard for the VPN page (asked interactively if omitted)
+  --no-wireguard     Don't install WireGuard, and don't ask
+  --with-garage      Install Garage S3 object storage (asked interactively if omitted)
+  --no-garage        Don't install Garage, and don't ask
   --no-upgrade       Never upgrade packages that are already installed
   --no-fail2ban      Don't install fail2ban
   --port N           Port for the panel (default: 8443)
@@ -148,6 +159,10 @@ parse_args() {
       --databases) set_databases "${2:?--databases needs a value}"; shift ;;
       --with-php) WITH_PHP=1; PHP_CHOSEN=1 ;;
       --no-php) WITH_PHP=0; PHP_CHOSEN=1 ;;
+      --with-wireguard) WITH_WIREGUARD=1; WG_CHOSEN=1 ;;
+      --no-wireguard) WITH_WIREGUARD=0; WG_CHOSEN=1 ;;
+      --with-garage) WITH_GARAGE=1; GARAGE_CHOSEN=1 ;;
+      --no-garage) WITH_GARAGE=0; GARAGE_CHOSEN=1 ;;
       --no-upgrade) NO_UPGRADE=1 ;;
       --no-fail2ban) NO_FAIL2BAN=1 ;;
       --no-firewall) NO_FIREWALL=1 ;;
@@ -353,6 +368,103 @@ install_php() {
   if [ -n "$unit" ]; then
     systemctl enable --now "$unit" >/dev/null 2>&1 || warn "Could not start $unit"
   fi
+}
+
+# Ask whether to install WireGuard when no flag was given. A server that already runs WireGuard
+# keeps it without asking: the panel imports its configuration and shows it under VPN.
+choose_wireguard() {
+  if [ "$WG_CHOSEN" -eq 1 ]; then
+    return
+  fi
+  WG_CHOSEN=1
+  if command -v wg-quick >/dev/null 2>&1; then
+    WITH_WIREGUARD=1
+    if ls /etc/wireguard/*.conf >/dev/null 2>&1; then
+      info "WireGuard is already set up; the panel imports it under VPN"
+    else
+      info "WireGuard is already installed"
+    fi
+    return
+  fi
+  if [ -f "$ENV_FILE" ] && grep -q '^CLOUDPANEL_WIREGUARD=' "$ENV_FILE"; then
+    if grep -q '^CLOUDPANEL_WIREGUARD=1' "$ENV_FILE"; then
+      WITH_WIREGUARD=1
+    fi
+    return
+  fi
+  local answer=""
+  if { exec 3</dev/tty; } 2>/dev/null; then
+    printf '\n%sInstall WireGuard to run a VPN server from the panel?%s [y/N]: ' "$C_BOLD" "$C_RST"
+    read -r answer <&3 || answer=""
+    exec 3<&-
+  fi
+  case "$answer" in
+    [yY]*) WITH_WIREGUARD=1 ;;
+  esac
+}
+
+# Ask whether to install Garage when no flag was given. Once installed it stays: a re-run upgrades
+# it to the version this release of the panel pins, unless --no-garage says otherwise.
+choose_garage() {
+  if [ "$GARAGE_CHOSEN" -eq 1 ]; then
+    return
+  fi
+  GARAGE_CHOSEN=1
+  if [ -x /usr/local/bin/garage ] && [ -f /etc/systemd/system/garage.service ]; then
+    WITH_GARAGE=1
+    return
+  fi
+  if [ -f "$ENV_FILE" ] && grep -q '^CLOUDPANEL_GARAGE=' "$ENV_FILE"; then
+    if grep -q '^CLOUDPANEL_GARAGE=1' "$ENV_FILE"; then
+      WITH_GARAGE=1
+    fi
+    return
+  fi
+  case "$(uname -m)" in
+    x86_64|aarch64) ;;
+    *) return ;;
+  esac
+  local answer=""
+  if { exec 3</dev/tty; } 2>/dev/null; then
+    printf '
+%sInstall Garage for S3-compatible object storage (buckets for your apps, managed from the panel)?%s [y/N]: ' "$C_BOLD" "$C_RST"
+    read -r answer <&3 || answer=""
+    exec 3<&-
+  fi
+  case "$answer" in
+    [yY]*) WITH_GARAGE=1 ;;
+  esac
+}
+
+# The panel binary downloads Garage's static release, checks it against the SHA-256 it was built
+# with, and sets up its user, config and hardened service. Every port stays on 127.0.0.1. A
+# failure here leaves the panel working; Garage can be installed from the panel later.
+install_garage() {
+  log "Installing Garage object storage"
+  if ! "$BIN" garage-install; then
+    warn "Garage could not be installed. Install it later from Object Storage in the panel."
+    WITH_GARAGE=0
+  fi
+}
+
+# Debian and Ubuntu's own wireguard-tools; the kernel module ships with every supported release.
+# iptables is for the NAT rules the panel adds when clients use the server for internet access.
+install_wireguard() {
+  if command -v wg-quick >/dev/null 2>&1; then
+    info "WireGuard is already installed"
+    return
+  fi
+  log "Installing WireGuard"
+  apt_install wireguard-tools iptables || warn "WireGuard installation failed; install it later from the VPN page"
+}
+
+# UDP ports of WireGuard interfaces that already exist, so enabling UFW doesn't cut them off.
+existing_wireguard_ports() {
+  local f
+  for f in /etc/wireguard/*.conf; do
+    [ -f "$f" ] || continue
+    sed -n 's/^[[:space:]]*[Ll]isten[Pp]ort[[:space:]]*=[[:space:]]*\([0-9]\{1,5\}\).*/\1/p' "$f"
+  done | sort -u
 }
 
 db_engines_csv() {
@@ -715,6 +827,20 @@ EOF
   else
     printf 'CLOUDPANEL_PHP=%s\n' "$WITH_PHP" >> "$ENV_FILE"
   fi
+  if grep -q '^CLOUDPANEL_WIREGUARD=' "$ENV_FILE"; then
+    sed -i "s|^CLOUDPANEL_WIREGUARD=.*|CLOUDPANEL_WIREGUARD=${WITH_WIREGUARD}|" "$ENV_FILE"
+  else
+    printf 'CLOUDPANEL_WIREGUARD=%s\n' "$WITH_WIREGUARD" >> "$ENV_FILE"
+  fi
+  if grep -q '^CLOUDPANEL_GARAGE=' "$ENV_FILE"; then
+    sed -i "s|^CLOUDPANEL_GARAGE=.*|CLOUDPANEL_GARAGE=${WITH_GARAGE}|" "$ENV_FILE"
+  else
+    printf 'CLOUDPANEL_GARAGE=%s
+' "$WITH_GARAGE" >> "$ENV_FILE"
+  fi
+  # The service may write here (ReadWritePaths), which needs the directory to exist when it
+  # starts, even if WireGuard is only installed later from the panel.
+  install -d -m 0700 /etc/wireguard
   chmod 600 "$ENV_FILE"
 
   PUBLIC_IP=$(detect_public_ip)
@@ -769,7 +895,7 @@ RestrictRealtime=yes
 LockPersonality=yes
 ReadWritePaths=-/etc/nginx -/etc/cron.d -/etc/letsencrypt -/etc/ufw -/etc/cloudpanel -/etc/fail2ban
 ReadWritePaths=-/etc/systemd/system -/etc/ssh/sshd_config.d -/etc/ssh/cloudpanel_keys -/home -/var/www -/var/backups/cloudpanel
-ReadWritePaths=-/var/log/cloudpanel -/var/lib/cloudpanel -/etc/php
+ReadWritePaths=-/var/log/cloudpanel -/var/lib/cloudpanel -/etc/php -/etc/wireguard
 
 [Install]
 WantedBy=multi-user.target
@@ -795,6 +921,9 @@ configure_firewall() {
   ufw allow 80/tcp comment 'HTTP' >/dev/null
   ufw allow 443/tcp comment 'HTTPS' >/dev/null
   ufw allow "${PORT}/tcp" comment 'CloudPanel' >/dev/null
+  for p in $(existing_wireguard_ports); do
+    ufw allow "${p}/udp" comment 'WireGuard' >/dev/null
+  done
   if ufw status | grep -q 'Status: inactive'; then
     ufw --force enable >/dev/null
     info "UFW enabled (allowed: SSH $(echo "$ssh_ports" | tr '\n' ' '), 80, 443, ${PORT})"
@@ -831,6 +960,17 @@ print_summary() {
   printf '\n  %sThe panel uses a self-signed certificate, so your browser will show a warning once.%s\n' "$C_DIM" "$C_RST"
   printf '  %sForgot the password?  cloudpanel user-reset-password --username admin%s\n' "$C_DIM" "$C_RST"
   printf '  Databases %s\n' "$(db_engines_csv | sed 's/^$/none/')"
+  if [ "$WITH_WIREGUARD" -eq 1 ]; then
+    if ls /etc/wireguard/*.conf >/dev/null 2>&1; then
+      printf '  VPN       WireGuard, imported from /etc/wireguard (see VPN in the panel)\n'
+    else
+      printf '  VPN       WireGuard installed; set it up under VPN in the panel\n'
+    fi
+  fi
+  if [ "$WITH_GARAGE" -eq 1 ]; then
+    printf '  Storage   Garage S3 on 127.0.0.1:3900; create buckets under Object Storage in the panel
+'
+  fi
   if [ "$WITH_DOCKER" -eq 1 ]; then
     printf '  %sNote: ports published by Docker bypass UFW; bind containers to 127.0.0.1 and expose them via a site.%s\n' "$C_DIM" "$C_RST"
   fi
@@ -841,6 +981,12 @@ uninstall() {
   log "Uninstalling CloudPanel"
   systemctl disable --now cloudpanel >/dev/null 2>&1 || true
   rm -f "$UNIT" "$BIN"
+  if [ -f /etc/systemd/system/garage.service ]; then
+    systemctl disable --now garage >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/garage.service /usr/local/bin/garage
+    rm -f /etc/nginx/sites-enabled/cloudpanel-s3.conf /etc/nginx/sites-available/cloudpanel-s3.conf
+    systemctl reload nginx >/dev/null 2>&1 || true
+  fi
   systemctl daemon-reload
   if [ "$PURGE" -eq 1 ]; then
     rm -rf "$DATA_DIR" "$CONF_DIR"
@@ -850,8 +996,12 @@ uninstall() {
     info "Site users, app services (cloudpanel-app-*) and backups in /var/backups/cloudpanel were left in place"
     info "Removed data, configuration and cron jobs"
     info "nginx site configs in /etc/nginx/sites-available were left in place"
+    info "WireGuard configuration in /etc/wireguard was left in place"
   else
     info "Data kept in $DATA_DIR and $CONF_DIR (use --uninstall --purge to delete)"
+  fi
+  if [ -d /var/lib/garage ]; then
+    info "Object storage data in /var/lib/garage and its config in /etc/garage were left in place"
   fi
   log "Done"
 }
@@ -867,6 +1017,8 @@ main() {
   setup_swap
   choose_databases
   choose_php
+  choose_wireguard
+  choose_garage
   install_packages
   install_databases
   if [ "$WITH_PHP" -eq 1 ]; then
@@ -878,12 +1030,18 @@ main() {
   if [ "$WITH_DOCKER" -eq 1 ]; then
     install_docker
   fi
+  if [ "$WITH_WIREGUARD" -eq 1 ]; then
+    install_wireguard
+  fi
   if systemctl is-active --quiet cloudpanel 2>/dev/null; then
     log "Existing installation found; upgrading"
   fi
   install_binary
   configure
   install_service
+  if [ "$WITH_GARAGE" -eq 1 ]; then
+    install_garage
+  fi
   configure_firewall
   wait_for_panel || true
   print_summary

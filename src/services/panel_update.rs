@@ -107,7 +107,7 @@ fn parse_response(body: &str) -> Result<Release, String> {
 
 /// reqwest's own message is only "error sending request". What went wrong (DNS, a refused
 /// connection, a certificate) is in its sources, and is what an admin needs to see.
-fn with_causes(e: &dyn std::error::Error) -> String {
+pub(crate) fn with_causes(e: &dyn std::error::Error) -> String {
     let mut text = e.to_string();
     let mut source = e.source();
     while let Some(cause) = source {

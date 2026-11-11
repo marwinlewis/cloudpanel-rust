@@ -112,6 +112,8 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
+    /// Install or upgrade Garage object storage (used by install.sh and the panel; needs root)
+    GarageInstall,
     /// Import sites, databases and users from a CloudPanel CE database (used by migrate-from-ce.sh)
     ImportCe {
         /// A copy of CE's panel database (/home/clp/htdocs/app/data/db.sq3)
@@ -258,6 +260,15 @@ async fn main() -> AnyResult<()> {
     let mut config = Config::from_env();
     if let Some(bind) = cli.bind {
         config.bind_addr = bind;
+    }
+
+    // Before the database is opened: this runs outside the panel's sandbox and doesn't need it.
+    if let Some(Commands::GarageInstall) = cli.command {
+        if let Err(e) = services::garage::install(&config, &|l| println!("{l}")).await {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     fsutil::create_private_dir(&config.data_dir, 0o700)?;
@@ -450,6 +461,7 @@ async fn main() -> AnyResult<()> {
             }
             std::process::exit(i32::from(!report.problems.is_empty()));
         }
+        Some(Commands::GarageInstall) => unreachable!("handled above"),
         Some(Commands::Server) | None => {}
     }
     drop(conn);

@@ -1230,6 +1230,265 @@ pub fn set_alert_state(
     Ok(())
 }
 
+// ---------- WireGuard ----------
+
+const WG_COLS: &str = "id, name, address, public_key, private_key, preshared_key, allowed_ips, server_allowed_ips, \
+                       extra, enabled, imported, created_at";
+
+fn wg_from_row(r: &Row) -> rusqlite::Result<WireguardClient> {
+    Ok(WireguardClient {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        address: r.get(2)?,
+        public_key: r.get(3)?,
+        private_key: r.get(4)?,
+        preshared_key: r.get(5)?,
+        allowed_ips: r.get(6)?,
+        server_allowed_ips: r.get(7)?,
+        extra: r.get(8)?,
+        enabled: r.get(9)?,
+        imported: r.get(10)?,
+        created_at: r.get(11)?,
+    })
+}
+
+pub fn list_wireguard_clients(conn: &Connection) -> rusqlite::Result<Vec<WireguardClient>> {
+    let mut stmt = conn.prepare(&format!("SELECT {WG_COLS} FROM wireguard_clients ORDER BY id"))?;
+    let rows = stmt.query_map([], wg_from_row)?;
+    rows.collect()
+}
+
+pub fn find_wireguard_client(conn: &Connection, id: i64) -> rusqlite::Result<Option<WireguardClient>> {
+    conn.query_row(
+        &format!("SELECT {WG_COLS} FROM wireguard_clients WHERE id = ?1"),
+        params![id],
+        wg_from_row,
+    )
+    .optional()
+}
+
+pub struct NewWireguardClient<'a> {
+    pub name: &'a str,
+    pub address: Option<&'a str>,
+    pub public_key: &'a str,
+    pub private_key: Option<&'a str>,
+    pub preshared_key: Option<&'a str>,
+    pub allowed_ips: &'a str,
+    pub server_allowed_ips: &'a str,
+    pub extra: &'a str,
+    pub enabled: bool,
+    pub imported: bool,
+}
+
+pub fn create_wireguard_client(conn: &Connection, c: &NewWireguardClient) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO wireguard_clients (name, address, public_key, private_key, preshared_key, allowed_ips,
+             server_allowed_ips, extra, enabled, imported, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            c.name,
+            c.address,
+            c.public_key,
+            c.private_key,
+            c.preshared_key,
+            c.allowed_ips,
+            c.server_allowed_ips,
+            c.extra,
+            c.enabled,
+            c.imported,
+            Utc::now()
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Saves what can change after creation: the name, routes, enabled flag and a private key added
+/// to an imported peer.
+pub fn save_wireguard_client(conn: &Connection, c: &WireguardClient) -> rusqlite::Result<bool> {
+    Ok(conn.execute(
+        "UPDATE wireguard_clients SET name = ?1, private_key = ?2, allowed_ips = ?3, server_allowed_ips = ?4,
+             enabled = ?5 WHERE id = ?6",
+        params![
+            c.name,
+            c.private_key,
+            c.allowed_ips,
+            c.server_allowed_ips,
+            c.enabled,
+            c.id
+        ],
+    )? > 0)
+}
+
+pub fn delete_wireguard_client(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
+    Ok(conn.execute("DELETE FROM wireguard_clients WHERE id = ?1", params![id])? > 0)
+}
+
+// ---------- Object storage (Garage) ----------
+
+const STORAGE_BUCKET_COLS: &str = "b.id, b.garage_id, b.name, b.site_id, s.domain, b.created_at";
+
+fn storage_bucket_row(r: &Row) -> rusqlite::Result<StorageBucket> {
+    Ok(StorageBucket {
+        id: r.get(0)?,
+        garage_id: r.get(1)?,
+        name: r.get(2)?,
+        site_id: r.get(3)?,
+        site_domain: r.get(4)?,
+        created_at: r.get(5)?,
+    })
+}
+
+/// Every bucket, or only those of one site.
+pub fn list_storage_buckets(conn: &Connection, site_id: Option<i64>) -> rusqlite::Result<Vec<StorageBucket>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {STORAGE_BUCKET_COLS} FROM storage_buckets b LEFT JOIN sites s ON s.id = b.site_id
+         WHERE (?1 IS NULL OR b.site_id = ?1) ORDER BY b.name"
+    ))?;
+    let rows = stmt.query_map(params![site_id], storage_bucket_row)?;
+    rows.collect()
+}
+
+pub fn find_storage_bucket(conn: &Connection, id: i64) -> rusqlite::Result<Option<StorageBucket>> {
+    conn.query_row(
+        &format!(
+            "SELECT {STORAGE_BUCKET_COLS} FROM storage_buckets b LEFT JOIN sites s ON s.id = b.site_id WHERE b.id = ?1"
+        ),
+        params![id],
+        storage_bucket_row,
+    )
+    .optional()
+}
+
+pub fn create_storage_bucket(
+    conn: &Connection,
+    garage_id: &str,
+    name: &str,
+    site_id: Option<i64>,
+) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO storage_buckets (garage_id, name, site_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![garage_id, name, site_id, Utc::now()],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn set_storage_bucket_site(conn: &Connection, id: i64, site_id: Option<i64>) -> rusqlite::Result<bool> {
+    Ok(conn.execute(
+        "UPDATE storage_buckets SET site_id = ?2 WHERE id = ?1",
+        params![id, site_id],
+    )? > 0)
+}
+
+pub fn delete_storage_bucket(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
+    Ok(conn.execute("DELETE FROM storage_buckets WHERE id = ?1", params![id])? > 0)
+}
+
+const STORAGE_KEY_COLS: &str = "k.id, k.garage_key_id, k.name, k.site_id, s.domain, k.created_at";
+
+fn storage_key_row(r: &Row) -> rusqlite::Result<StorageKey> {
+    Ok(StorageKey {
+        id: r.get(0)?,
+        garage_key_id: r.get(1)?,
+        name: r.get(2)?,
+        site_id: r.get(3)?,
+        site_domain: r.get(4)?,
+        created_at: r.get(5)?,
+    })
+}
+
+pub fn list_storage_keys(conn: &Connection, site_id: Option<i64>) -> rusqlite::Result<Vec<StorageKey>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {STORAGE_KEY_COLS} FROM storage_keys k LEFT JOIN sites s ON s.id = k.site_id
+         WHERE (?1 IS NULL OR k.site_id = ?1) ORDER BY k.name, k.id"
+    ))?;
+    let rows = stmt.query_map(params![site_id], storage_key_row)?;
+    rows.collect()
+}
+
+pub fn find_storage_key(conn: &Connection, id: i64) -> rusqlite::Result<Option<StorageKey>> {
+    conn.query_row(
+        &format!("SELECT {STORAGE_KEY_COLS} FROM storage_keys k LEFT JOIN sites s ON s.id = k.site_id WHERE k.id = ?1"),
+        params![id],
+        storage_key_row,
+    )
+    .optional()
+}
+
+pub fn create_storage_key(
+    conn: &Connection,
+    garage_key_id: &str,
+    name: &str,
+    site_id: Option<i64>,
+) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO storage_keys (garage_key_id, name, site_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![garage_key_id, name, site_id, Utc::now()],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn set_storage_key_site(conn: &Connection, id: i64, site_id: Option<i64>) -> rusqlite::Result<bool> {
+    Ok(conn.execute(
+        "UPDATE storage_keys SET site_id = ?2 WHERE id = ?1",
+        params![id, site_id],
+    )? > 0)
+}
+
+pub fn delete_storage_key(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
+    Ok(conn.execute("DELETE FROM storage_keys WHERE id = ?1", params![id])? > 0)
+}
+
+/// Bring the panel's list in line with what Garage has: adopt buckets and keys made elsewhere
+/// (unlinked, so only admins see them), forget those deleted elsewhere, follow renames.
+pub fn sync_storage(
+    conn: &Connection,
+    buckets: &[(String, String)],
+    keys: &[(String, String)],
+) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    let known: Vec<StorageBucket> = list_storage_buckets(&tx, None)?;
+    for b in &known {
+        match buckets.iter().find(|(id, _)| *id == b.garage_id) {
+            None => {
+                delete_storage_bucket(&tx, b.id)?;
+            }
+            Some((_, name)) if *name != b.name => {
+                tx.execute(
+                    "UPDATE storage_buckets SET name = ?2 WHERE id = ?1",
+                    params![b.id, name],
+                )?;
+            }
+            _ => {}
+        }
+    }
+    for (id, name) in buckets {
+        if !known.iter().any(|b| b.garage_id == *id) {
+            tx.execute(
+                "INSERT OR IGNORE INTO storage_buckets (garage_id, name, site_id, created_at) VALUES (?1, ?2, NULL, ?3)",
+                params![id, name, Utc::now()],
+            )?;
+        }
+    }
+    let known: Vec<StorageKey> = list_storage_keys(&tx, None)?;
+    for k in &known {
+        match keys.iter().find(|(id, _)| *id == k.garage_key_id) {
+            None => {
+                delete_storage_key(&tx, k.id)?;
+            }
+            Some((_, name)) if *name != k.name => {
+                tx.execute("UPDATE storage_keys SET name = ?2 WHERE id = ?1", params![k.id, name])?;
+            }
+            _ => {}
+        }
+    }
+    for (id, name) in keys {
+        if !known.iter().any(|k| k.garage_key_id == *id) {
+            create_storage_key(&tx, id, name, None)?;
+        }
+    }
+    tx.commit()
+}
+
 #[cfg(test)]
 pub fn test_conn() -> Connection {
     let conn = Connection::open_in_memory().unwrap();

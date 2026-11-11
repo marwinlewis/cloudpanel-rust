@@ -13,11 +13,15 @@ pub mod firewall_handlers;
 pub mod service_handlers;
 pub mod site_handlers;
 pub mod ssh_handlers;
+pub mod storage_handlers;
 pub mod system_handlers;
 pub mod user_handlers;
+pub mod wireguard_handlers;
 
 #[cfg(test)]
 mod security_tests;
+#[cfg(test)]
+mod storage_tests;
 #[cfg(test)]
 mod tests;
 
@@ -266,6 +270,61 @@ fn create_api_router(state: SharedState) -> Router {
         )
         .route("/fail2ban/ban", post(firewall_handlers::fail2ban_ban))
         .route("/fail2ban/unban", post(firewall_handlers::fail2ban_unban))
+        // WireGuard
+        .route(
+            "/wireguard",
+            get(wireguard_handlers::get_wireguard).put(wireguard_handlers::set_server),
+        )
+        .route("/wireguard/install", post(wireguard_handlers::install))
+        .route("/wireguard/clients", post(wireguard_handlers::create_client))
+        .route(
+            "/wireguard/clients/:id",
+            patch(wireguard_handlers::update_client).delete(wireguard_handlers::delete_client),
+        )
+        .route(
+            "/wireguard/clients/:id/config",
+            get(wireguard_handlers::get_client_config),
+        )
+        .route(
+            "/wireguard/clients/:id/download",
+            get(wireguard_handlers::download_client_config),
+        )
+        // Object storage (Garage)
+        .route("/storage", get(storage_handlers::get_storage))
+        .route("/storage/install", post(storage_handlers::install))
+        .route(
+            "/storage/endpoint",
+            put(storage_handlers::set_endpoint).delete(storage_handlers::remove_endpoint),
+        )
+        .route("/storage/buckets", post(storage_handlers::create_bucket))
+        .route(
+            "/storage/buckets/:id",
+            put(storage_handlers::update_bucket).delete(storage_handlers::delete_bucket),
+        )
+        .route(
+            "/storage/buckets/:id/keys/:key_id",
+            put(storage_handlers::set_grant).delete(storage_handlers::revoke_grant),
+        )
+        .route("/storage/keys", post(storage_handlers::create_key))
+        .route(
+            "/storage/keys/:id",
+            put(storage_handlers::update_key).delete(storage_handlers::delete_key),
+        )
+        .route("/sites/:id/storage", get(storage_handlers::get_site_storage))
+        .route("/sites/:id/storage/buckets", post(storage_handlers::create_site_bucket))
+        .route(
+            "/sites/:id/storage/buckets/:bid",
+            delete(storage_handlers::delete_site_bucket),
+        )
+        .route(
+            "/sites/:id/storage/buckets/:bid/keys/:kid",
+            put(storage_handlers::set_site_grant).delete(storage_handlers::revoke_site_grant),
+        )
+        .route("/sites/:id/storage/keys", post(storage_handlers::create_site_key))
+        .route(
+            "/sites/:id/storage/keys/:kid",
+            delete(storage_handlers::delete_site_key),
+        )
         // Cron
         .route(
             "/cron/jobs",

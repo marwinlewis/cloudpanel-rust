@@ -155,6 +155,33 @@ const ROUTES: &[(&str, &str, Guard)] = &[
     ("PUT", "/fail2ban", Admin),
     ("POST", "/fail2ban/ban", Admin),
     ("POST", "/fail2ban/unban", Admin),
+    ("GET", "/wireguard", Admin),
+    ("PUT", "/wireguard", Admin),
+    ("POST", "/wireguard/install", Admin),
+    ("POST", "/wireguard/clients", Admin),
+    ("PATCH", "/wireguard/clients/:id", Admin),
+    ("DELETE", "/wireguard/clients/:id", Admin),
+    ("GET", "/wireguard/clients/:id/config", Admin),
+    ("GET", "/wireguard/clients/:id/download", Admin),
+    ("GET", "/storage", Admin),
+    ("POST", "/storage/install", Admin),
+    ("PUT", "/storage/endpoint", Admin),
+    ("DELETE", "/storage/endpoint", Admin),
+    ("POST", "/storage/buckets", Admin),
+    ("PUT", "/storage/buckets/:id", Admin),
+    ("DELETE", "/storage/buckets/:id", Admin),
+    ("PUT", "/storage/buckets/:id/keys/:key_id", Admin),
+    ("DELETE", "/storage/buckets/:id/keys/:key_id", Admin),
+    ("POST", "/storage/keys", Admin),
+    ("PUT", "/storage/keys/:id", Admin),
+    ("DELETE", "/storage/keys/:id", Admin),
+    ("GET", "/sites/:id/storage", Site),
+    ("POST", "/sites/:id/storage/buckets", Site),
+    ("DELETE", "/sites/:id/storage/buckets/:bid", Site),
+    ("PUT", "/sites/:id/storage/buckets/:bid/keys/:kid", Site),
+    ("DELETE", "/sites/:id/storage/buckets/:bid/keys/:kid", Site),
+    ("POST", "/sites/:id/storage/keys", Site),
+    ("DELETE", "/sites/:id/storage/keys/:kid", Site),
     ("GET", "/cron/jobs", Session),
     ("POST", "/cron/jobs", Session),
     ("PUT", "/cron/jobs/:id", Owned),
@@ -281,6 +308,8 @@ fn concrete(path: &str, o: &Others) -> String {
         .replace("/*id", "/image")
         .replace(":uid", "1")
         .replace(":kid", "1")
+        .replace(":bid", "1")
+        .replace(":key_id", "1")
         .replace(":username", "otheruser")
         .replace(":name", "nginx")
         .replace(":action", "restart")

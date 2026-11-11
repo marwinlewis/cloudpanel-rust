@@ -33,8 +33,13 @@ pub(super) fn harness() -> Harness {
 pub(super) fn harness_with(adjust: impl FnOnce(&mut Config)) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config::from_env();
+    let default_garage_dir = config.garage_dir.clone();
     adjust(&mut config);
     let d = dir.path();
+    // No Garage unless a test brings its own stand-in.
+    if config.garage_dir == default_garage_dir {
+        config.garage_dir = d.join("garage");
+    }
     config.data_dir = d.join("data");
     config.db_path = d.join("data/cp.db");
     config.etc_dir = d.join("etc");

@@ -350,7 +350,7 @@ run_installer() {
     installer="$STATE_DIR/install.sh"
     curl -fsSL "$INSTALLER_URL" -o "$installer" || die "Could not download install.sh"
   fi
-  local args=(--port "$SIDE_PORT" --no-firewall --no-nodejs --no-upgrade --swap-size 0 --databases mariadb,sqlite)
+  local args=(--port "$SIDE_PORT" --no-firewall --no-nodejs --no-upgrade --swap-size 0 --databases mariadb,sqlite --no-garage)
   if [ "$PHP_CHOICE" = 1 ]; then args+=(--with-php); else args+=(--no-php); fi
   if [ -n "$BINARY" ]; then args+=(--binary "$BINARY"); fi
   if [ -n "$VERSION" ]; then args+=(--version "$VERSION"); fi

@@ -1,21 +1,6 @@
 'use strict';
-import { api, card, confirmDialog, copyButton, field, formDialog, h, hooks, icon, openDialog, state, svgEl, toast, withBusy } from '../core.js';
+import { api, card, confirmDialog, copyButton, field, formDialog, h, hooks, icon, openDialog, qrSvg, state, toast, withBusy } from '../core.js';
 import { SETTINGS_CARDS } from './settings.js';
-
-/** Draw a QR module matrix ('1' = dark) as an SVG element. */
-function qrSvg(width, modules) {
-  const quiet = 2;
-  const size = width + quiet * 2;
-  const svg = svgEl('svg', { viewBox: `0 0 ${size} ${size}`, 'shape-rendering': 'crispEdges', role: 'img', 'aria-label': 'QR code' });
-  let d = '';
-  for (let y = 0; y < width; y++) {
-    for (let x = 0; x < width; x++) {
-      if (modules[y * width + x] === '1') d += `M${x + quiet},${y + quiet}h1v1h-1z`;
-    }
-  }
-  svg.append(svgEl('path', { d, fill: '#000' }));
-  return h('div', { class: 'qr' }, svg);
-}
 
 function showRecoveryCodes(codes) {
   const text = codes.join('\n');

@@ -234,4 +234,41 @@ pub const MIGRATIONS: &[&str] = &[
         expires_at DATETIME NOT NULL
     );
     "#,
+    // 9: WireGuard clients. Keys are encrypted; an imported peer has no private key.
+    r#"
+    CREATE TABLE wireguard_clients (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        address TEXT UNIQUE,
+        public_key TEXT NOT NULL UNIQUE,
+        private_key TEXT,
+        preshared_key TEXT,
+        allowed_ips TEXT NOT NULL DEFAULT '0.0.0.0/0',
+        server_allowed_ips TEXT NOT NULL DEFAULT '',
+        extra TEXT NOT NULL DEFAULT '',
+        enabled BOOLEAN NOT NULL DEFAULT 1,
+        imported BOOLEAN NOT NULL DEFAULT 0,
+        created_at DATETIME NOT NULL
+    );
+    "#,
+    // 10: Garage buckets and access keys. Garage holds them and their grants; the panel only
+    // records which site each belongs to. Deleting a site keeps its buckets, unlinked.
+    r#"
+    CREATE TABLE storage_buckets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        garage_id TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL UNIQUE,
+        site_id INTEGER REFERENCES sites(id) ON DELETE SET NULL,
+        created_at DATETIME NOT NULL
+    );
+    CREATE TABLE storage_keys (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        garage_key_id TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        site_id INTEGER REFERENCES sites(id) ON DELETE SET NULL,
+        created_at DATETIME NOT NULL
+    );
+    CREATE INDEX storage_buckets_site ON storage_buckets(site_id);
+    CREATE INDEX storage_keys_site ON storage_keys(site_id);
+    "#,
 ];

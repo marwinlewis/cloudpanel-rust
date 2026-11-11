@@ -316,3 +316,51 @@ pub struct AlertChannel {
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
 }
+
+/// A Garage bucket and the site it belongs to, if any.
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageBucket {
+    pub id: i64,
+    #[serde(skip)]
+    pub garage_id: String,
+    pub name: String,
+    pub site_id: Option<i64>,
+    pub site_domain: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A Garage access key and the site it belongs to, if any. Its secret is never stored.
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageKey {
+    pub id: i64,
+    /// The access key ID (`GK…`), which apps put in their configuration.
+    #[serde(rename = "access_key_id")]
+    pub garage_key_id: String,
+    pub name: String,
+    pub site_id: Option<i64>,
+    pub site_domain: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WireguardClient {
+    pub id: i64,
+    pub name: String,
+    pub address: Option<String>,
+    pub public_key: String,
+    /// Encrypted; none for a peer imported from an existing configuration.
+    #[serde(skip_serializing)]
+    pub private_key: Option<String>,
+    /// Encrypted.
+    #[serde(skip_serializing)]
+    pub preshared_key: Option<String>,
+    /// Networks the client sends through the tunnel.
+    pub allowed_ips: String,
+    /// Networks behind the client, routed to it by the server.
+    pub server_allowed_ips: String,
+    #[serde(skip_serializing)]
+    pub extra: String,
+    pub enabled: bool,
+    pub imported: bool,
+    pub created_at: DateTime<Utc>,
+}

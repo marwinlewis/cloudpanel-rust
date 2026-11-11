@@ -54,6 +54,7 @@ futures-util = "0.3"
 totp-rs = { version = "5", features = ["gen_secret", "otpauth"] }
 qrcode = { version = "0.14", default-features = false }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "rustls-tls", "hostname"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs", "process"] }

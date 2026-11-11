@@ -24,7 +24,7 @@ impl S3Config {
         let url = reqwest::Url::parse(&self.endpoint)
             .map_err(|_| "Endpoint must be a URL like https://s3.eu-central-1.amazonaws.com".to_string())?;
         if url.scheme() != "https" && url.scheme() != "http" {
-            return Err("Endpoint must use https".into());
+            return Err("Endpoint must start with https:// (or http:// for a server on the same network)".into());
         }
         if self.bucket.is_empty()
             || self.bucket.len() > 63

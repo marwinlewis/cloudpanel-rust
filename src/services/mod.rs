@@ -12,6 +12,7 @@ pub mod dotenv;
 pub mod fail2ban;
 pub mod files;
 pub mod firewall;
+pub mod garage;
 pub mod nginx;
 pub mod panel_cert;
 pub mod panel_update;
@@ -24,6 +25,7 @@ pub mod ssl;
 pub mod system;
 pub mod system_metrics;
 pub mod sysusers;
+pub mod wireguard;
 
 pub use nginx::NginxService;
 pub use ssl::SslService;

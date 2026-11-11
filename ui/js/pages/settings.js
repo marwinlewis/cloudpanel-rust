@@ -59,7 +59,7 @@ function remoteStorageCard() {
     try { cfg = await api('/backups/remote'); } catch (e) { body.replaceChildren(errorState(e.message, load)); return; }
     const c = cfg || {};
     const form = h('form', { class: 'form', novalidate: true },
-      field({ label: 'Endpoint', name: 'endpoint', value: c.endpoint || '', placeholder: 'https://s3.eu-central-1.amazonaws.com', validate: 'required', hint: 'AWS S3, Cloudflare R2, Backblaze B2, Wasabi or MinIO.' }),
+      field({ label: 'Endpoint', name: 'endpoint', value: c.endpoint || '', placeholder: 'https://s3.eu-central-1.amazonaws.com', validate: 'required', hint: 'AWS S3, Cloudflare R2, Backblaze B2, Wasabi, Garage or another S3-compatible service. Use storage on another server: a backup kept on this one is lost with it.' }),
       h('div', { class: 'form-grid' },
         field({ label: 'Bucket', name: 'bucket', value: c.bucket || '', validate: 'required' }),
         field({ label: 'Region', name: 'region', value: c.region || '', placeholder: 'us-east-1 / auto' })),
@@ -67,7 +67,7 @@ function remoteStorageCard() {
         field({ label: 'Access key', name: 'access_key', value: c.access_key || '', validate: 'required', attrs: { autocomplete: 'off', spellcheck: 'false' } }),
         field({ label: 'Secret key', name: 'secret_key', type: 'password', placeholder: c.has_secret ? '(unchanged)' : '', validate: c.has_secret ? undefined : 'required', attrs: { autocomplete: 'off' } })),
       field({ label: 'Path prefix (optional)', name: 'prefix', value: c.prefix || '', placeholder: 'server-1' }),
-      h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'path_style', checked: !!c.path_style }), 'Path-style URLs (MinIO and most self-hosted servers)'),
+      h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'path_style', checked: !!c.path_style }), 'Path-style URLs (Garage, MinIO and most self-hosted servers)'),
       h('div', { class: 'row' }, h('button', { class: 'btn primary', type: 'submit', text: 'Test & save' }), cfg && h('button', { class: 'btn danger', type: 'button', text: 'Remove', onclick: remove })));
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
