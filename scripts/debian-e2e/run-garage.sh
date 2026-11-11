@@ -48,7 +48,8 @@ docker build -q -t "$image" scripts/debian-e2e >/dev/null
 cleanup() {
   rm -rf "$tmp"
   if [ "$keep" = 1 ]; then
-    echo "Kept $server and $fresh (remove with: docker rm -f $server $fresh)"
+    echo "Kept $server (https://localhost:18444) and $fresh (https://localhost:18445)"
+    echo "Remove with: docker rm -f $server $fresh"
   else
     docker rm -f "$server" "$fresh" >/dev/null 2>&1 || true
   fi
@@ -57,10 +58,12 @@ docker rm -f "$server" "$fresh" >/dev/null 2>&1 || true
 trap cleanup EXIT
 
 echo "==> Starting two Debian 13 machines with systemd"
+port=18444
 for name in "$server" "$fresh"; do
   docker run -d --name "$name" --hostname "${name#cloudpanel-garage-}" --privileged --cgroupns=private \
-    --tmpfs /run --tmpfs /run/lock --tmpfs /tmp \
+    --tmpfs /run --tmpfs /run/lock --tmpfs /tmp -p "$port:8443" \
     "$image" >/dev/null
+  port=$((port + 1))
 done
 
 wait_for_boot() {

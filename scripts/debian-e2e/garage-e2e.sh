@@ -75,7 +75,8 @@ installed() {
   check "runs as the garage user" '[ "$(ps -o user= -p "$(systemctl show -p MainPID --value garage)")" = garage ]'
   check "single-node server" 'systemctl show -p ExecStart --value garage | grep -q -- "--single-node"'
   check "every port on 127.0.0.1 only" 'listening_only_on_loopback'
-  check "secrets are root:garage 0640" '[ "$(stat -c "%U:%G %a" /etc/garage/admin.token /etc/garage/rpc.secret | sort -u)" = "root:garage 640" ]'
+  check "secrets are garage:garage 0600" '[ "$(stat -c "%U:%G %a" /etc/garage/admin.token /etc/garage/rpc.secret | sort -u)" = "garage:garage 600" ]'
+  check "config is root:garage 0640" '[ "$(stat -c "%U:%G %a" /etc/garage/garage.toml)" = "root:garage 640" ]'
   check "data owned by garage, closed to others" '[ "$(stat -c "%U %a" /var/lib/garage)" = "garage 750" ]'
   check "choice recorded" 'grep -qx "CLOUDPANEL_GARAGE=1" /etc/cloudpanel/cloudpanel.env'
   check "binary matches the pinned release" '/usr/local/bin/garage --version 2>&1 | grep -q "v2.5.0"'
@@ -116,8 +117,12 @@ manage() {
   head -c 6000000 /dev/urandom >/var/tmp/big
   check "quota refuses going over 5 MB" '[ "$(s3 PUT "$id" "$secret" /media/big.bin /var/tmp/big)" != 200 ]'
 
-  call GET /storage >/var/tmp/st.json
-  check "panel shows usage and the grant" '[ "$(j "[b for b in d[\"buckets\"] if b[\"name\"]==\"media\"][0][\"objects\"], [b for b in d[\"buckets\"] if b[\"name\"]==\"media\"][0][\"grants\"][0][\"permissions\"]" </var/tmp/st.json)" = "1 {'"'"'read'"'"': True, '"'"'write'"'"': True, '"'"'owner'"'"': False}" ]' || head -c 800 /var/tmp/st.json
+  # Garage counts objects in the background, so the number can trail the upload a little.
+  media_view() {
+    call GET /storage >/var/tmp/st.json
+    j "[(b[\"objects\"], b[\"grants\"][0][\"permissions\"][\"write\"]) for b in d[\"buckets\"] if b[\"name\"]==\"media\"][0]" </var/tmp/st.json 2>/dev/null
+  }
+  if retry '[ "$(media_view)" = "(1, True)" ]'; then ok "panel shows usage and the grant"; else bad "panel shows usage and the grant: $(media_view)"; head -c 800 /var/tmp/st.json; echo; fi
   check "the secret is not in the panel's answer" '! grep -q "$secret" /var/tmp/st.json'
   check "the secret is not in the panel's database" '! grep -aq "$secret" /var/lib/cloudpanel/cloudpanel.db*'
   check "a bucket with objects is not deleted" '[ "$(code DELETE "/storage/buckets/$bid")" = 409 ]'

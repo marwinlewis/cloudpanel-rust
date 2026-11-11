@@ -188,15 +188,19 @@ fn sh(log: &dyn Fn(&str), program: &str, args: &[&str]) -> Result<String, String
     Ok(out)
 }
 
-/// Write `contents` to `path` only if it doesn't exist yet, owned by root and group `garage`.
-fn write_once(log: &dyn Fn(&str), path: &Path, contents: &str, mode: u32) -> Result<(), String> {
+/// Write `contents` to `path` only if it doesn't exist yet, owned by `owner` (`user:group`).
+/// The mode and owner are set every time: Garage refuses to start while a secret file is readable
+/// by anyone but itself.
+fn write_once(log: &dyn Fn(&str), path: &Path, contents: &str, mode: u32, owner: &str) -> Result<(), String> {
     if path.exists() {
         log(&format!("Keeping existing {}", path.display()));
-        return Ok(());
+    } else {
+        crate::fsutil::write_atomic(path, contents.as_bytes(), mode)
+            .map_err(|e| format!("Could not write {}: {e}", path.display()))?;
     }
-    crate::fsutil::write_atomic(path, contents.as_bytes(), mode)
-        .map_err(|e| format!("Could not write {}: {e}", path.display()))?;
-    sh(log, "chgrp", &["garage", &path.to_string_lossy()])?;
+    let p = path.to_string_lossy();
+    sh(log, "chown", &[owner, &p])?;
+    sh(log, "chmod", &[&format!("{mode:o}"), &p])?;
     Ok(())
 }
 
@@ -281,9 +285,9 @@ pub async fn install(config: &Config, log: &dyn Fn(&str)) -> Result<(), String> 
         "install",
         &["-d", "-m", "0750", "-o", "root", "-g", "garage", &etc],
     )?;
-    write_once(log, &rpc_secret_path(config), &random_hex(32), 0o640)?;
-    write_once(log, &token_path(config), &random_hex(32), 0o640)?;
-    write_once(log, &conf_path(config), &render_config(config), 0o640)?;
+    write_once(log, &rpc_secret_path(config), &random_hex(32), 0o600, "garage:garage")?;
+    write_once(log, &token_path(config), &random_hex(32), 0o600, "garage:garage")?;
+    write_once(log, &conf_path(config), &render_config(config), 0o640, "root:garage")?;
 
     if !binary.is_empty() {
         let tmp = format!("{BIN}.new");
