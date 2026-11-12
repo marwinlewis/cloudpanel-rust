@@ -100,6 +100,7 @@ fn create_api_router(state: SharedState) -> Router {
         .route("/sites/:id/ssl/renew", post(site_handlers::renew_site_ssl))
         .route("/sites/:id/ssl/takeover", post(site_handlers::take_over_site_ssl))
         .route("/sites/:id/state", post(site_handlers::set_site_state))
+        .route("/sites/:id/maintenance", put(site_handlers::set_maintenance))
         .route("/sites/:id/logs", get(site_handlers::get_site_logs))
         .route("/sites/:id/vhost", get(site_handlers::get_site_vhost))
         .route("/sites/:id/directives", put(site_handlers::set_site_directives))

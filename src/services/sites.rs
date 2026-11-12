@@ -24,6 +24,9 @@ pub struct SiteInput {
     pub app_manager: Option<String>,
     /// Docker proxies point at a container and get no Linux user.
     pub create_user: bool,
+    /// Start behind the maintenance page, the default for new sites, so nobody sees a
+    /// half-built site or a placeholder before the admin is ready.
+    pub maintenance_mode: bool,
 }
 
 /// Resolve the two www request fields, where omitted means redirect, the default for new sites.
@@ -160,6 +163,7 @@ pub fn provision(config: &Config, conn: &Connection, input: SiteInput) -> ApiRes
         app_command: app_command.as_deref(),
         app_manager,
         php_version: php_version.as_deref(),
+        maintenance_mode: input.maintenance_mode,
     };
     let id = db::create_site(conn, &new).map_err(|e| {
         if db::is_unique_violation(&e) {

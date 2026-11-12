@@ -72,6 +72,7 @@ pub(super) fn harness_with(adjust: impl FnOnce(&mut Config)) -> Harness {
                     app_command: None,
                     app_manager: "systemd",
                     php_version: None,
+                    maintenance_mode: false,
                 },
             )
             .unwrap()

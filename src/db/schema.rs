@@ -271,4 +271,10 @@ pub const MIGRATIONS: &[&str] = &[
     CREATE INDEX storage_buckets_site ON storage_buckets(site_id);
     CREATE INDEX storage_keys_site ON storage_keys(site_id);
     "#,
+    // 11: maintenance mode. Existing sites stay live; new ones start in maintenance.
+    r#"
+    ALTER TABLE sites ADD COLUMN maintenance_mode BOOLEAN NOT NULL DEFAULT 0;
+    ALTER TABLE sites ADD COLUMN maintenance_message TEXT NOT NULL DEFAULT '';
+    ALTER TABLE sites ADD COLUMN maintenance_allow TEXT NOT NULL DEFAULT '';
+    "#,
 ];

@@ -25,6 +25,8 @@ pub struct DockerProxyRequest {
     pub host_port: u16,
     pub include_www: Option<bool>,
     pub www_redirect: Option<bool>,
+    /// Start behind the maintenance page. Defaults to on.
+    pub maintenance_mode: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -168,6 +170,7 @@ pub async fn proxy_container_to_site(
                     app_command: None,
                     app_manager: None,
                     create_user: false,
+                    maintenance_mode: p.maintenance_mode.unwrap_or(true),
                 },
             )?;
             audit::record(conn, &admin.0, "site.create", Some(&site.domain), Some("docker_proxy"));

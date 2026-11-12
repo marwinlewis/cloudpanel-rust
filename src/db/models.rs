@@ -111,6 +111,19 @@ pub struct Site {
     /// False when the site's nginx config was imported from CloudPanel CE. The panel keeps that
     /// file exactly as it is and refuses changes that would regenerate it.
     pub vhost_managed: bool,
+    /// Visitors see a maintenance page (HTTP 503) while the site keeps running behind it.
+    pub maintenance_mode: bool,
+    /// What the maintenance page says; empty for the default text.
+    pub maintenance_message: String,
+    /// Newline-separated IP addresses that see the site during maintenance.
+    pub maintenance_allow: String,
+}
+
+impl Site {
+    /// Whether nginx serves the site with a certificate of its own.
+    pub fn has_tls(&self) -> bool {
+        self.ssl_enabled && self.ssl_cert_path.is_some() && self.ssl_key_path.is_some()
+    }
 }
 
 pub const MANAGER_SYSTEMD: &str = "systemd";

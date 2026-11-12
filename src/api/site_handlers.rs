@@ -4,12 +4,13 @@ use crate::auth::{AdminUser, AuthUser};
 use crate::authz::{require_admin, require_site, visible_sites};
 use crate::config::Config;
 use crate::db::{self, models::Site, models::SiteType};
+use crate::services::nginx::{DEFAULT_MAINTENANCE_MESSAGE, MAINTENANCE_MESSAGE_MAX};
 use crate::services::sites::{deprovision, provision, www_choice, SiteInput};
 use crate::services::{apps, cert_takeover, php, pm2, runtimes, NginxService, SslService};
 use crate::state::SharedState;
 use crate::validate;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -17,6 +18,7 @@ use axum::{
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::json;
+use std::net::{IpAddr, SocketAddr};
 
 #[derive(Deserialize)]
 pub struct CreateSiteRequest {
@@ -32,6 +34,8 @@ pub struct CreateSiteRequest {
     pub app_command: Option<String>,
     /// `systemd` or `pm2`. Node.js sites default to PM2.
     pub app_manager: Option<String>,
+    /// Start behind the maintenance page. Defaults to on.
+    pub maintenance_mode: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -91,6 +95,7 @@ pub async fn create_new_site(
                     app_command: p.app_command,
                     app_manager: p.app_manager,
                     create_user: true,
+                    maintenance_mode: p.maintenance_mode.unwrap_or(true),
                 },
             )?;
             audit::record(conn, &admin.0, "site.create", Some(&site.domain), Some(&site.site_type));
@@ -133,6 +138,7 @@ pub async fn create_new_site(
 pub async fn get_site(
     Path(id): Path<i64>,
     user: AuthUser,
+    ConnectInfo(client): ConnectInfo<SocketAddr>,
     State(state): State<SharedState>,
 ) -> ApiResult<impl IntoResponse> {
     let config = state.config.clone();
@@ -165,6 +171,9 @@ pub async fn get_site(
                 ..site.clone()
             }));
             v["basic_auth_users"] = json!(db::list_basic_auth_users(conn, id)?);
+            // Offered as an address that may skip maintenance mode.
+            v["client_ip"] = json!(client.ip().to_canonical().to_string());
+            v["maintenance_default_message"] = json!(DEFAULT_MAINTENANCE_MESSAGE);
             Ok(v)
         })
         .await?;
@@ -473,6 +482,87 @@ pub async fn set_site_state(
                 Some(&site.domain),
                 None,
             );
+            Ok(site)
+        })
+        .await?;
+    Ok(Json(site))
+}
+
+#[derive(Deserialize)]
+pub struct MaintenanceRequest {
+    pub enabled: bool,
+    #[serde(default)]
+    pub message: String,
+    /// IP addresses that see the site while it is in maintenance.
+    #[serde(default)]
+    pub allow: Vec<String>,
+}
+
+/// Validate a maintenance message: plain text, newlines kept, other control characters dropped.
+fn maintenance_message(input: &str) -> ApiResult<String> {
+    let text: String = input
+        .replace("\r\n", "\n")
+        .chars()
+        .filter(|c| *c == '\n' || !c.is_control())
+        .collect();
+    let text = text.trim().to_string();
+    if text.chars().count() > MAINTENANCE_MESSAGE_MAX {
+        return Err(ApiError::BadRequest(format!(
+            "The message can be at most {MAINTENANCE_MESSAGE_MAX} characters"
+        )));
+    }
+    Ok(text)
+}
+
+/// Put a site behind its maintenance page, or take it out. Unlike disabling, the site keeps
+/// running, so the admin can work on it and check it from an allowed address.
+pub async fn set_maintenance(
+    Path(id): Path<i64>,
+    user: AuthUser,
+    State(state): State<SharedState>,
+    Json(p): Json<MaintenanceRequest>,
+) -> ApiResult<impl IntoResponse> {
+    let message = maintenance_message(&p.message)?;
+    let mut allow: Vec<String> = Vec::new();
+    for a in p.allow.iter().map(|a| a.trim()).filter(|a| !a.is_empty()) {
+        let ip: IpAddr = a.parse().map_err(|_| {
+            ApiError::BadRequest(format!(
+                "'{a}' is not an IP address. Ranges aren't supported here; list each address."
+            ))
+        })?;
+        let ip = ip.to_canonical().to_string();
+        if !allow.contains(&ip) {
+            allow.push(ip);
+        }
+    }
+    if allow.len() > 50 {
+        return Err(ApiError::BadRequest("At most 50 addresses".into()));
+    }
+    let config = state.config.clone();
+    let site = state
+        .db(move |conn| {
+            let previous = require_site(conn, &user, id)?;
+            NginxService::check_vhost_managed(&previous).map_err(ApiError::Unprocessable)?;
+            let mut site = previous.clone();
+            site.maintenance_mode = p.enabled;
+            site.maintenance_message = message;
+            site.maintenance_allow = allow.join("\n");
+            apply_site(&config, conn, &previous, &site)?;
+            if previous.maintenance_mode != site.maintenance_mode {
+                audit::record(
+                    conn,
+                    &user,
+                    if site.maintenance_mode {
+                        "site.maintenance_on"
+                    } else {
+                        "site.maintenance_off"
+                    },
+                    Some(&site.domain),
+                    None,
+                );
+            } else {
+                audit::record(conn, &user, "site.maintenance", Some(&site.domain), None);
+            }
             Ok(site)
         })
         .await?;

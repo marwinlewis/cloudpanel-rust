@@ -135,6 +135,7 @@ pub(super) fn add_site(h: &Harness, domain: &str, site_type: &str, home: Option<
             app_command: None,
             app_manager: "systemd",
             php_version: None,
+            maintenance_mode: false,
         },
     )
     .unwrap()

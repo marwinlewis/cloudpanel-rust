@@ -37,6 +37,24 @@ const MAINTENANCE_PAGE: &str = "<!doctype html><meta charset=utf-8><title>Mainte
 <body style=\"font-family:system-ui;display:grid;place-items:center;height:100vh;margin:0\">\
 <p>This site is temporarily unavailable.</p>";
 
+/// File name of the catch-all server for names no site claims. Like the panel's, it can't
+/// collide with a site.
+const DEFAULT_VHOST: &str = "cloudpanel-default";
+
+/// What a site in maintenance mode says when the admin hasn't written anything.
+pub const DEFAULT_MAINTENANCE_MESSAGE: &str =
+    "We're making some improvements and will be back shortly. Thank you for your patience.";
+
+/// The longest maintenance message the panel accepts.
+pub const MAINTENANCE_MESSAGE_MAX: usize = 2000;
+
+/// The answer for a name that no site on this server claims.
+const UNKNOWN_HOST_PAGE: &str = "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width\">\
+<title>Site not found</title><body style=\"font-family:system-ui;display:grid;place-items:center;height:100vh;margin:0;\
+color:#334155;background:#f8fafc\"><div style=\"text-align:center;padding:24px\"><h1 style=\"font-size:22px;margin:0 0 8px\">\
+No site is configured at this address</h1><p style=\"margin:0;color:#64748b\">If you own this domain, add it as a site in \
+the control panel.</p></div>";
+
 /// nginx runs as a user that's in every site's group, so it can read what those users can't. A link
 /// in one site pointing at another's file would be served unless it has to be the same owner's.
 const SYMLINK_RULE: &str = "disable_symlinks if_not_owner;";
@@ -102,6 +120,257 @@ impl NginxService {
         out
     }
 
+    /// Text for the maintenance page. nginx serves the page from a single-quoted string, in which
+    /// a quote or backslash would end or escape it and `$` would name a variable, so none of them
+    /// survive: they become HTML entities like everything else markup could misread.
+    fn page_text(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '"' => out.push_str("&quot;"),
+                '\'' => out.push_str("&#39;"),
+                '$' => out.push_str("&#36;"),
+                '\\' => out.push_str("&#92;"),
+                '{' => out.push_str("&#123;"),
+                '}' => out.push_str("&#125;"),
+                '\n' => out.push_str("<br>"),
+                c if c.is_control() => {}
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// The page visitors see while a site is in maintenance mode.
+    pub fn maintenance_page(site: &Site) -> String {
+        let message = site.maintenance_message.trim();
+        let message = if message.is_empty() {
+            DEFAULT_MAINTENANCE_MESSAGE
+        } else {
+            message
+        };
+        format!(
+            "<!doctype html><html lang=en><meta charset=utf-8>\
+             <meta name=viewport content=\"width=device-width,initial-scale=1\"><meta name=robots content=noindex>\
+             <title>Under maintenance</title><style>\
+             body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#f8fafc;color:#0f172a;\
+             font-family:system-ui,-apple-system,\"Segoe UI\",Roboto,sans-serif}}\
+             main{{max-width:560px;padding:40px 24px;text-align:center}}\
+             .tag{{display:inline-block;padding:4px 12px;border-radius:999px;background:#fef3c7;color:#92400e;\
+             font-size:13px;font-weight:600;letter-spacing:.02em}}\
+             h1{{font-size:30px;margin:20px 0 12px}}p{{font-size:17px;line-height:1.6;color:#475569;margin:0}}\
+             .domain{{margin-top:32px;font-size:13px;color:#94a3b8}}\
+             @media (prefers-color-scheme:dark){{body{{background:#0f172a;color:#f1f5f9}}p{{color:#cbd5e1}}\
+             .tag{{background:#422006;color:#fcd34d}}}}</style>\
+             <main><span class=tag>Maintenance</span><h1>We&#39;ll be back soon</h1><p>{message}</p>\
+             <p class=domain>{domain}</p></main>",
+            message = Self::page_text(message),
+            domain = Self::page_text(&site.domain),
+        )
+    }
+
+    /// Addresses that see the site through maintenance mode, as one regex for `$remote_addr`.
+    /// nginx's `if` can't match a CIDR range, so only whole addresses are accepted.
+    fn maintenance_bypass(site: &Site) -> Option<String> {
+        let ips: Vec<String> = site
+            .maintenance_allow
+            .lines()
+            .filter_map(|l| l.trim().parse::<std::net::IpAddr>().ok())
+            .map(|ip| ip.to_string().replace('.', "\\."))
+            .collect();
+        (!ips.is_empty()).then(|| format!("^({})$", ips.join("|")))
+    }
+
+    /// Server-level rules for maintenance mode. They run before nginx picks a location, so no
+    /// location (custom directives, basic auth's allow-list) can let a visitor past them. Only
+    /// certificate challenges and the listed addresses get through.
+    fn maintenance_block(site: &Site) -> String {
+        let mut out = String::from(
+            "    # Maintenance mode: visitors see the page below; listed addresses see the site.\n    \
+             set $cloudpanel_maintenance 1;\n    \
+             if ($uri ~ \"^/\\.well-known/acme-challenge/\") {\n        set $cloudpanel_maintenance 0;\n    }\n",
+        );
+        if let Some(bypass) = Self::maintenance_bypass(site) {
+            out.push_str(&format!(
+                "    if ($remote_addr ~ \"{bypass}\") {{\n        set $cloudpanel_maintenance 0;\n    }}\n"
+            ));
+        }
+        out.push_str(&format!(
+            "    if ($cloudpanel_maintenance) {{\n        return 503;\n    }}\n    \
+             error_page 503 @cloudpanel_maintenance;\n\n    \
+             location @cloudpanel_maintenance {{\n{headers}\n        \
+             add_header Retry-After 3600 always;\n        add_header Cache-Control \"no-store\" always;\n        \
+             default_type text/html;\n        return 503 '{page}';\n    }}\n\n",
+            headers = SECURITY_HEADERS
+                .replace("\n    ", "\n        ")
+                .replacen("    ", "        ", 1),
+            page = Self::maintenance_page(site),
+        ));
+        out
+    }
+
+    /// Where the self-signed certificate lives that answers HTTPS for names without a certificate
+    /// of their own.
+    pub fn fallback_cert_paths(config: &Config) -> (PathBuf, PathBuf) {
+        let dir = config.etc_dir.join("fallback-tls");
+        (dir.join("cert.pem"), dir.join("key.pem"))
+    }
+
+    /// TLS listen lines for a server without a certificate of its own. Without them, nginx would
+    /// hand an HTTPS request for the name to some other server on port 443. None until the
+    /// fallback certificate exists.
+    fn fallback_tls(config: &Config) -> Option<String> {
+        let (cert, key) = Self::fallback_cert_paths(config);
+        if !(cert.exists() && key.exists()) {
+            return None;
+        }
+        Some(format!(
+            "    listen 443 ssl http2;\n    listen [::]:443 ssl http2;\n    \
+             ssl_certificate {};\n    ssl_certificate_key {};\n",
+            cert.display(),
+            key.display()
+        ))
+    }
+
+    /// Create the self-signed fallback certificate once. Visitors who reach a site by HTTPS before
+    /// it has a real certificate see a certificate warning, then the site's own response; behind
+    /// Cloudflare's "Full" mode, they see the site.
+    pub fn ensure_fallback_cert(config: &Config) -> Result<(), String> {
+        use super::cmd::{run_with, CmdOpts};
+        let (cert, key) = Self::fallback_cert_paths(config);
+        if cert.exists() && key.exists() {
+            return Ok(());
+        }
+        let dir = cert.parent().ok_or("fallback certificate has no directory")?;
+        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        }
+        let (cert_s, key_s) = (cert.to_string_lossy().to_string(), key.to_string_lossy().to_string());
+        let r = run_with(
+            "openssl",
+            &[
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-sha256",
+                "-days",
+                "3650",
+                "-subj",
+                "/CN=cloudpanel-default",
+                "-keyout",
+                &key_s,
+                "-out",
+                &cert_s,
+            ],
+            &CmdOpts::default().timeout(60),
+        );
+        if r.missing {
+            return Err("openssl is not installed".into());
+        }
+        r.into_result("openssl", "").map(|_| ())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&key, fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    /// Whether a config other than the panel's own catch-all already is nginx's default server
+    /// on `port`. Two would fail `nginx -t`. Debian's stock `default` site claims port 80.
+    fn others_claim_default(config: &Config, port: &str) -> bool {
+        let own = format!("{DEFAULT_VHOST}.conf");
+        let mut dirs = vec![config.nginx_sites_enabled.clone()];
+        if let Some(root) = config.nginx_sites_available.parent() {
+            dirs.push(root.join("conf.d"));
+        }
+        dirs.iter()
+            .filter_map(|d| fs::read_dir(d).ok())
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy() != own)
+            .filter_map(|e| fs::read_to_string(e.path()).ok())
+            .any(|text| {
+                text.lines().map(str::trim_start).any(|l| {
+                    let mut words = l.trim_end_matches(';').split_whitespace();
+                    if words.next() != Some("listen") {
+                        return false;
+                    }
+                    let Some(addr) = words.next() else { return false };
+                    let addr_port = addr.rsplit_once(':').map_or(addr, |(_, p)| p);
+                    addr_port == port && words.any(|w| w == "default_server" || w == "default")
+                })
+            })
+    }
+
+    /// The catch-all server: an HTTPS request for a name no site claims would otherwise go to the
+    /// first server on port 443, the panel's own, and show its sign-in page.
+    pub fn render_default_vhost(config: &Config, claim_80: bool, claim_443: bool) -> Option<String> {
+        if !(claim_80 || claim_443) {
+            return None;
+        }
+        let mut listen = String::new();
+        if claim_80 {
+            listen.push_str("    listen 80 default_server;\n    listen [::]:80 default_server;\n");
+        }
+        if claim_443 {
+            let (cert, key) = Self::fallback_cert_paths(config);
+            listen.push_str(&format!(
+                "    listen 443 ssl http2 default_server;\n    listen [::]:443 ssl http2 default_server;\n    \
+                 ssl_certificate {};\n    ssl_certificate_key {};\n",
+                cert.display(),
+                key.display()
+            ));
+        }
+        Some(format!(
+            "# Managed by CloudPanel - changes will be overwritten\n\
+             # Answers for every name no site on this server claims.\n\
+             server {{\n{listen}    server_name _;\n\n{SECURITY_HEADERS}\n\n    \
+             location /.well-known/acme-challenge/ {{\n        root /var/www/html;\n    }}\n\n    \
+             location / {{\n        default_type text/html;\n        return 404 '{UNKNOWN_HOST_PAGE}';\n    }}\n}}\n"
+        ))
+    }
+
+    /// Put the catch-all server in place. Left untouched when nothing changed.
+    pub fn apply_default_vhost(config: &Config) -> Result<(), String> {
+        Self::ensure_fallback_cert(config)?;
+        let claim_80 = !Self::others_claim_default(config, "80");
+        let claim_443 = !Self::others_claim_default(config, "443");
+        let Some(content) = Self::render_default_vhost(config, claim_80, claim_443) else {
+            return Ok(());
+        };
+        let (available, enabled) = Self::paths(config, DEFAULT_VHOST);
+        if fs::read_to_string(&available).ok().as_deref() == Some(content.as_str())
+            && enabled.symlink_metadata().is_ok()
+        {
+            return Ok(());
+        }
+        Self::install_vhost(config, DEFAULT_VHOST, &content, 0o644)
+    }
+
+    /// Rewrite the vhosts of sites without a certificate that predate the fallback certificate,
+    /// so HTTPS for them reaches the site rather than the catch-all.
+    pub fn refresh_sites_without_tls(config: &Config, sites: &[Site]) {
+        let Some(tls) = Self::fallback_tls(config) else { return };
+        let marker = tls.lines().nth(2).unwrap_or_default().trim().to_string();
+        for site in sites.iter().filter(|s| s.vhost_managed && !s.has_tls()) {
+            if Self::read_vhost(config, &site.domain).is_some_and(|v| v.contains(&marker)) {
+                continue;
+            }
+            if let Err(e) = Self::write_and_apply(config, site) {
+                warn!("could not add HTTPS fallback for {}: {e}", site.domain);
+            }
+        }
+    }
+
     /// Everything inside the `server {}` block after listen/server_name/TLS.
     fn server_body(config: &Config, site: &Site) -> String {
         let domain = &site.domain;
@@ -125,6 +394,9 @@ impl NginxService {
                  add_header Retry-After 3600 always;\n        return 503 '{MAINTENANCE_PAGE}';\n    }}\n"
             ));
             return out;
+        }
+        if site.maintenance_mode {
+            out.push_str(&Self::maintenance_block(site));
         }
 
         if site.site_type == "static" {
@@ -229,10 +501,11 @@ server {{
 server {{
     listen 80;
     listen [::]:80;
-    server_name {names};
+{tls}    server_name {names};
 
 {body}}}
-"#
+"#,
+                tls = Self::fallback_tls(config).unwrap_or_default(),
             ),
         }
     }
@@ -272,9 +545,10 @@ server {{
             }
             _ => format!(
                 "# Managed by CloudPanel - changes will be overwritten\n\
-                 server {{\n    listen 80;\n    listen [::]:80;\n    server_name {www};\n\n{ACME}\n    \
+                 server {{\n    listen 80;\n    listen [::]:80;\n{tls}    server_name {www};\n\n{ACME}\n    \
                  location / {{\n        return 301 http://{domain}$request_uri;\n    }}\n}}\n\n\
-                 server {{\n    listen 80;\n    listen [::]:80;\n    server_name {domain};\n\n{body}}}\n"
+                 server {{\n    listen 80;\n    listen [::]:80;\n{tls}    server_name {domain};\n\n{body}}}\n",
+                tls = Self::fallback_tls(config).unwrap_or_default(),
             ),
         }
     }
@@ -716,6 +990,9 @@ pub(crate) fn test_site(site_type: &str) -> Site {
         www_redirect: false,
         php_version: None,
         vhost_managed: true,
+        maintenance_mode: false,
+        maintenance_message: String::new(),
+        maintenance_allow: String::new(),
     }
 }
 
@@ -910,6 +1187,75 @@ mod tests {
         let c = NginxService::generate_config(&cfg(), &s);
         assert!(c.contains("return 503 '"));
         assert!(!c.contains("proxy_pass"));
+    }
+
+    #[test]
+    fn maintenance_mode_answers_before_any_location() {
+        let mut s = test_site("php");
+        s.maintenance_mode = true;
+        s.basic_auth_enabled = true;
+        s.basic_auth_allow = "10.0.0.0/8".into();
+        s.custom_directives = "location /api/ {\n    return 200;\n}".into();
+        let c = NginxService::generate_config(&cfg(), &s);
+        // Server-level rules come before every location, so none can let a visitor past.
+        let gate = c.find("if ($cloudpanel_maintenance)").unwrap();
+        assert!(gate < c.find("location /").unwrap());
+        assert!(c.contains("set $cloudpanel_maintenance 1;"));
+        assert!(c.contains("if ($uri ~ \"^/\\.well-known/acme-challenge/\")"));
+        assert!(c.contains("error_page 503 @cloudpanel_maintenance;"));
+        assert!(c.contains("location @cloudpanel_maintenance {"));
+        assert!(c.contains(DEFAULT_MAINTENANCE_MESSAGE.replace('\'', "&#39;").as_str()));
+        // The site is still there behind it.
+        assert!(c.contains("fastcgi_pass"));
+        assert!(!c.contains("$remote_addr ~"));
+    }
+
+    #[test]
+    fn maintenance_bypass_lists_exact_addresses() {
+        let mut s = test_site("nodejs");
+        s.maintenance_mode = true;
+        s.maintenance_allow = "203.0.113.7\n2001:db8::1\nnot-an-ip\n".into();
+        let c = NginxService::generate_config(&cfg(), &s);
+        assert!(c.contains("if ($remote_addr ~ \"^(203\\.0\\.113\\.7|2001:db8::1)$\")"));
+    }
+
+    #[test]
+    fn maintenance_message_cannot_break_out_of_the_page() {
+        let mut s = test_site("static");
+        s.maintenance_mode = true;
+        s.maintenance_message = "Back at 5' o\\clock; costs $5 <script>{x}</script>\nThanks".into();
+        let page = NginxService::maintenance_page(&s);
+        for bad in ['\'', '\\', '$', '<' /* only from our own markup */] {
+            if bad == '<' {
+                assert!(!page.contains("<script>"));
+            } else {
+                assert!(!page.contains(bad), "{bad} survived");
+            }
+        }
+        assert!(page.contains("5&#39; o&#92;clock; costs &#36;5 &lt;script&gt;&#123;x&#125;&lt;/script&gt;<br>Thanks"));
+    }
+
+    #[test]
+    fn disabled_site_ignores_maintenance_mode() {
+        let mut s = test_site("nodejs");
+        s.is_active = false;
+        s.maintenance_mode = true;
+        let c = NginxService::generate_config(&cfg(), &s);
+        assert!(!c.contains("cloudpanel_maintenance"));
+        assert!(c.contains("return 503 '"));
+    }
+
+    #[test]
+    fn default_vhost_claims_only_free_ports() {
+        let c = cfg();
+        assert!(NginxService::render_default_vhost(&c, false, false).is_none());
+        let only_tls = NginxService::render_default_vhost(&c, false, true).unwrap();
+        assert!(only_tls.contains("listen 443 ssl http2 default_server;"));
+        assert!(!only_tls.contains("listen 80 default_server;"));
+        assert!(only_tls.contains("return 404 '"));
+        assert!(!only_tls.contains("proxy_pass"));
+        let both = NginxService::render_default_vhost(&c, true, true).unwrap();
+        assert!(both.contains("listen [::]:80 default_server;"));
     }
 
     #[test]

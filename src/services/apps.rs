@@ -735,6 +735,9 @@ mod tests {
             www_redirect: false,
             php_version: None,
             vhost_managed: true,
+            maintenance_mode: false,
+            maintenance_message: String::new(),
+            maintenance_allow: String::new(),
         }
     }
 

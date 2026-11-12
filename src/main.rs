@@ -321,6 +321,7 @@ async fn main() -> AnyResult<()> {
                     app_command: None,
                     app_manager: None,
                     create_user: true,
+                    maintenance_mode: true,
                 },
             )
             .map_err(|e| format!("{e:?}"))?;
@@ -481,6 +482,15 @@ async fn main() -> AnyResult<()> {
     let tls = tls_paths.is_some();
     let proxy_secret = load_proxy_secret(&config)?;
     let cloudflare = services::cloudflare::Ranges::load(&*pool.get()?);
+    // Names without a site of their own must never reach the panel's nginx site (and its sign-in
+    // page), which nginx would otherwise pick for any HTTPS request it can't match.
+    match services::NginxService::apply_default_vhost(&config) {
+        Ok(()) => {
+            let sites = db::list_sites(&*pool.get()?)?;
+            services::NginxService::refresh_sites_without_tls(&config, &sites);
+        }
+        Err(e) => tracing::warn!("catch-all nginx server not installed: {e}"),
+    }
     let vhost_ready = services::panel_cert::sync_vhost(&config, &*pool.get()?, tls, &proxy_secret, &cloudflare);
     // A closed port needs the hostname to work, or nobody could get in. Otherwise open it.
     let mut direct_closed = false;

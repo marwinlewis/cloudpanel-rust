@@ -34,6 +34,7 @@ VALIDATORS.optionalPassword = (v) => (!v || v.length >= 10 ? '' : 'Use at least 
 
 function statusBadge(site) {
   if (!site.is_active) return h('span', { class: 'badge warn', text: 'Disabled' });
+  if (site.maintenance_mode) return h('span', { class: 'badge warn', text: 'Maintenance' });
   return site.ssl_enabled ? h('span', { class: 'badge ok' }, icon('lock'), 'Secure') : h('span', { class: 'badge', text: 'HTTP' });
 }
 
@@ -148,9 +149,12 @@ async function addSiteDialog(done) {
       h('div', { class: 'field' }, h('span', { class: 'label', text: 'Type' }), typeGroup),
       portField, cmdField, userField,
       selectField({ label: 'www subdomain', name: 'www', options: WWW_OPTIONS, value: 'redirect' }),
+      h('div', { class: 'field' },
+        h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'maintenance_mode', checked: true }), 'Start in maintenance mode'),
+        h('div', { class: 'hint', text: 'Visitors see a “back soon” page until you take the site live from its page.' })),
     ],
     async onSubmit(d) {
-      const body = { domain: d.domain.toLowerCase(), site_type: d.site_type, ...wwwBody(d.www) };
+      const body = { domain: d.domain.toLowerCase(), site_type: d.site_type, ...wwwBody(d.www), maintenance_mode: !!d.maintenance_mode };
       if (!HAS_ROOT.has(d.site_type)) body.target_port = Number(d.target_port);
       if (d.app_command && HAS_APP.has(d.site_type)) body.app_command = d.app_command;
       if (d.system_user) body.system_user = d.system_user;
@@ -208,7 +212,7 @@ function renderSiteDetail(view, id, tab) {
     document.title = `${site.domain} · CloudPanel`;
     document.querySelector('#page-title').textContent = site.domain;
     const t = SITE_TYPES[site.site_type] || { label: site.site_type };
-    setSub(`${t.label} · ${site.is_active ? 'active' : 'disabled'}`);
+    setSub(`${t.label} · ${!site.is_active ? 'disabled' : site.maintenance_mode ? 'in maintenance' : 'active'}`);
     const url = `${site.ssl_enabled ? 'https' : 'http'}://${site.domain}`;
     const toggle = h('button', { class: 'btn' }, icon('power'), site.is_active ? 'Disable' : 'Enable');
     toggle.addEventListener('click', async () => {
@@ -238,7 +242,7 @@ function renderSiteDetail(view, id, tab) {
       show();
     });
     strip.classList.add('page-tabs');
-    view.replaceChildren(strip, body);
+    view.replaceChildren(...[maintenanceBanner(site, () => load(current)), strip, body].filter(Boolean));
 
     function show() {
       if (cleanup) { cleanup(); cleanup = null; }
@@ -252,6 +256,50 @@ function renderSiteDetail(view, id, tab) {
   }
   load();
   return () => { if (cleanup) cleanup(); };
+}
+
+// ---------- Maintenance ----------
+
+/** Shown above a site's tabs while visitors see the maintenance page. */
+function maintenanceBanner(site, reload) {
+  if (!site.is_active || !site.maintenance_mode || !site.vhost_managed) return null;
+  const live = h('button', { class: 'btn sm', type: 'button' }, icon('power'), 'Go live');
+  live.addEventListener('click', () => withBusy(live, async () => {
+    await api(`/sites/${site.id}/maintenance`, { method: 'PUT', body: { enabled: false, message: site.maintenance_message, allow: splitLines(site.maintenance_allow) } });
+    toast(`${site.domain} is live`);
+    reload();
+  }));
+  return h('div', { class: 'alert warn' }, icon('alert'), h('div', { class: 'grow', text: 'Maintenance mode is on: visitors see the maintenance page while you work on the site. Change the message or allowed addresses under Settings.' }), live);
+}
+
+function splitLines(v) { return (v || '').split('\n').map((x) => x.trim()).filter(Boolean); }
+
+function maintenanceCard(site, reload) {
+  const enabled = h('input', { type: 'checkbox', checked: site.maintenance_mode });
+  const message = h('textarea', { class: 'input', rows: 3, maxlength: 2000, placeholder: site.maintenance_default_message || '', 'aria-label': 'Maintenance message' });
+  message.value = site.maintenance_message || '';
+  const allow = h('textarea', { class: 'input mono', rows: 3, placeholder: '203.0.113.10', 'aria-label': 'Addresses that see the site' });
+  allow.value = site.maintenance_allow || '';
+  const addMine = site.client_ip && h('button', { class: 'btn sm', type: 'button' }, icon('plus'), `Add my IP (${site.client_ip})`);
+  if (addMine) addMine.addEventListener('click', () => {
+    const lines = splitLines(allow.value);
+    if (!lines.includes(site.client_ip)) allow.value = [...lines, site.client_ip].join('\n');
+  });
+  const save = h('button', { class: 'btn primary', type: 'button', text: 'Save' });
+  save.addEventListener('click', () => withBusy(save, async () => {
+    await api(`/sites/${site.id}/maintenance`, { method: 'PUT', body: { enabled: enabled.checked, message: message.value, allow: splitLines(allow.value) } });
+    toast(enabled.checked ? 'Maintenance mode is on' : 'Maintenance mode is off');
+    reload();
+  }));
+  return card({
+    title: 'Maintenance mode', sub: 'Visitors see a “back soon” page (HTTP 503) while the site keeps running behind it.', body: h('div', { class: 'form' },
+      h('label', { class: 'check' }, enabled, 'Show the maintenance page'),
+      h('div', { class: 'field' }, h('label', { text: 'Message (optional)' }), message, h('div', { class: 'hint', text: 'Plain text. Leave empty for the default message.' })),
+      h('div', { class: 'field' }, h('label', { text: 'Addresses that see the site (optional)' }), allow,
+        h('div', { class: 'hint', text: 'One IP address per line, to check your changes before going live. Behind Cloudflare’s proxy this matches Cloudflare’s address, not yours.' }),
+        addMine && h('div', null, addMine)),
+      h('div', null, save)),
+  });
 }
 
 // ---------- Overview ----------
@@ -754,7 +802,7 @@ function tabSettings(el, { site, reload }) {
     title: 'nginx', sub: isAdmin() ? 'Extra directives are inserted into the server block and checked with nginx -t before reload.' : 'Only administrators can add custom directives.',
     body: h('div', { class: 'form' }, h('label', { class: 'small strong', text: 'Custom directives' }), directives, h('div', null, saveDir), h('label', { class: 'small strong', text: 'Generated vhost' }), vhost),
   }));
-  el.append(h('div', { class: 'grid two' }, cards[0], cards[1]), cards[2]);
+  el.append(h('div', { class: 'grid two' }, cards[0], cards[1]), maintenanceCard(site, reload), cards[2]);
 }
 
 export { secretDialog };
