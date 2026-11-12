@@ -72,8 +72,30 @@ function renderServiceList(el) {
 function renderPanelUpdate(el) {
   const holder = h('div', null, card({ title: 'CloudPanel', body: h('div', { class: 'skeleton' }) }));
   el.append(holder);
+  // Follow a running upgrade. The panel goes away while it restarts, so failed requests are
+  // expected and just mean "ask again"; a different version answering means it is done.
+  let following = false;
+  function follow(from) {
+    if (following) return;
+    following = true;
+    const tick = async () => {
+      if (!holder.isConnected) { following = false; return; }
+      let p = null;
+      try { p = await api('/system/panel-update'); } catch (e) { if (e.status === 401) { following = false; return; } }
+      if (p && p.current !== from) { location.reload(); return; }
+      if (p && p.upgrade.state !== 'running') {
+        following = false;
+        draw(p);
+        if (p.upgrade.state === 'failed') toast('The upgrade didn’t finish', 'error');
+        return;
+      }
+      if (p) draw(p);
+      setTimeout(tick, 3000);
+    };
+    setTimeout(tick, 3000);
+  }
   function draw(p) {
-    const check = h('button', { class: 'btn' }, icon('refresh'), 'Check for new version');
+    const check =h('button', { class: 'btn' }, icon('refresh'), 'Check for new version');
     check.addEventListener('click', () => withBusy(check, async () => {
       const r = await api('/system/panel-update/check', { method: 'POST' });
       draw(r);
@@ -82,16 +104,50 @@ function renderPanelUpdate(el) {
       else toast(r.update_available ? `CloudPanel v${r.latest} is available` : 'CloudPanel is up to date');
     }));
     const latest = p.latest ? `v${p.latest}` : p.checked_at ? 'No release published' : 'Not checked yet';
+    const up = p.upgrade || { state: 'none' };
+    const running = up.state === 'running';
+    const command = () => h('div', { class: 'row' }, h('code', { class: 'grow wrap-anywhere', text: p.upgrade_command }), copyButton(p.upgrade_command));
+    const log = (text) => h('pre', { class: 'logs mono', text: text || 'Starting…' });
+
+    const upgrade = h('button', { class: 'btn primary', type: 'button' }, icon('download'), `Upgrade to v${p.latest}`);
+    upgrade.addEventListener('click', async () => {
+      const ok = await confirmDialog({
+        title: `Upgrade CloudPanel to v${p.latest}?`,
+        message: 'The panel restarts and is unavailable for about a minute. Your sites keep running, and your data, secrets and certificate are kept.',
+        confirmText: 'Upgrade',
+      });
+      if (!ok) return;
+      await withBusy(upgrade, async () => { draw(await api('/system/panel-update/upgrade', { method: 'POST' })); });
+    });
+
+    let notice = null;
+    if (running) {
+      check.disabled = true;
+      notice = h('div', { class: 'alert info' }, icon('download'), h('div', { class: 'grow form' },
+        h('strong', { text: `Upgrading to v${up.target}…` }),
+        h('div', { text: 'The panel restarts along the way. This page reloads by itself when the new version is running.' }),
+        log(up.log_tail)));
+      follow(p.current);
+    } else if (p.update_available) {
+      notice = h('div', { class: 'alert info' }, icon('download'), h('div', { class: 'grow form' },
+        h('div', null,
+          h('strong', { text: `CloudPanel v${p.latest} is available. ` }),
+          p.release_url && h('a', { href: p.release_url, target: '_blank', rel: 'noopener noreferrer', text: 'Release notes' })),
+        p.can_upgrade
+          ? [h('div', { text: 'Your data, secrets and certificate are kept.' }), h('div', null, upgrade),
+            h('details', null, h('summary', { class: 'muted small', text: 'Or run the installer on the server' }), command())]
+          : [h('div', { text: 'To update, run this on the server. Your data, secrets and certificate are kept.' }), command()]));
+    }
+    const failed = up.state === 'failed' && h('div', { class: 'alert warn' }, icon('alert'), h('div', { class: 'grow form' },
+      h('strong', { text: `The upgrade to v${up.target} didn’t finish (${fmtAgo(up.started_at)}).` }),
+      h('div', { text: `The panel is running v${p.current}. This is what the installer said:` }),
+      log(up.log_tail || '(nothing was logged)')));
+
     holder.replaceChildren(card({
       title: 'CloudPanel', sub: 'The control panel itself. Checked daily against GitHub releases.',
       actions: check,
       body: h('div', { class: 'form' },
-        p.update_available && h('div', { class: 'alert info' }, icon('download'), h('div', { class: 'grow form' },
-          h('div', null,
-            h('strong', { text: `CloudPanel v${p.latest} is available. ` }),
-            p.release_url && h('a', { href: p.release_url, target: '_blank', rel: 'noopener noreferrer', text: 'Release notes' })),
-          h('div', { text: 'To update, run this on the server. Your data, secrets and certificate are kept.' }),
-          h('div', { class: 'row' }, h('code', { class: 'grow wrap-anywhere', text: p.upgrade_command }), copyButton(p.upgrade_command)))),
+        failed, notice,
         p.error && h('div', { class: 'alert warn' }, icon('alert'), h('div', { text: `Could not check for a new version (${fmtAgo(p.failed_at)}): ${p.error}` })),
         kv([
           ['Installed', `v${p.current}`],

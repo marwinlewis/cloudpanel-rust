@@ -200,6 +200,7 @@ fn create_api_router(state: SharedState) -> Router {
         .route("/system/updates/upgrade", post(service_handlers::upgrade_all))
         .route("/system/panel-update", get(service_handlers::get_panel_update))
         .route("/system/panel-update/check", post(service_handlers::check_panel_update))
+        .route("/system/panel-update/upgrade", post(service_handlers::upgrade_panel))
         .route("/system/reboot", post(service_handlers::reboot))
         // Docker
         .route("/docker/status", get(docker_handlers::get_docker_status))

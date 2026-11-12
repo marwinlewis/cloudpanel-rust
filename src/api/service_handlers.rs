@@ -138,7 +138,15 @@ pub async fn upgrade_all(admin: AdminUser, State(state): State<SharedState>) -> 
 }
 
 pub async fn get_panel_update(_admin: AdminUser, State(state): State<SharedState>) -> ApiResult<impl IntoResponse> {
-    Ok(Json(state.db(|conn| Ok(panel_update::status(conn)?)).await?))
+    let config = state.config.clone();
+    Ok(Json(
+        state.db(move |conn| Ok(panel_update::status(&config, conn)?)).await?,
+    ))
+}
+
+/// Install the release the last check found. The panel restarts part-way through.
+pub async fn upgrade_panel(admin: AdminUser, State(state): State<SharedState>) -> ApiResult<impl IntoResponse> {
+    Ok(Json(panel_update::start_upgrade(&state, admin.0).await?))
 }
 
 pub async fn check_panel_update(_admin: AdminUser, State(state): State<SharedState>) -> ApiResult<impl IntoResponse> {
@@ -168,7 +176,8 @@ pub async fn system_info(_admin: AdminUser, State(state): State<SharedState>) ->
     let cache: UpdateCache = state.db(|conn| Ok(db::get_json(conn, UPDATES_SETTING)?)).await?;
     let (v4, v6) = blocking(|| Ok(system::public_ips())).await?;
     let reboot = blocking(|| Ok(system::reboot_required())).await?;
-    let panel = state.db(|conn| Ok(panel_update::status(conn)?)).await?;
+    let config = state.config.clone();
+    let panel = state.db(move |conn| Ok(panel_update::status(&config, conn)?)).await?;
     Ok(Json(json!({
         "public_ipv4": v4,
         "public_ipv6": v6,

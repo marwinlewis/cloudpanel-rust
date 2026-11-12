@@ -525,6 +525,9 @@ async fn main() -> AnyResult<()> {
     });
     scheduler::start(state.clone());
     services::cloudflare::start(state.clone());
+    if let Err(e) = services::panel_update::settle_upgrade(&*state.pool.get()?) {
+        tracing::warn!("could not settle the last upgrade: {e}");
+    }
     services::panel_update::start(state.clone());
 
     let app = web::with_security_headers(api::create_app(state.clone()), tls).layer(CompressionLayer::new());

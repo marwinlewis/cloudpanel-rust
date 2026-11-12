@@ -551,7 +551,10 @@ install_databases() {
 
 download_release() {
   local asset="cloudpanel-linux-${ARCH}" base
-  if [ "$VERSION" = "latest" ]; then
+  if [ -n "${CLOUDPANEL_RELEASE_BASE:-}" ]; then
+    # A mirror, or a test: the directory that holds the binary and its checksum.
+    base="${CLOUDPANEL_RELEASE_BASE%/}"
+  elif [ "$VERSION" = "latest" ]; then
     base="https://github.com/${REPO}/releases/latest/download"
   else
     base="https://github.com/${REPO}/releases/download/${VERSION}"

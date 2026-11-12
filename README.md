@@ -66,7 +66,9 @@ Pass flags after `bash -s --`, e.g. `... | sudo bash -s -- --port 9443`.
 
 ### Update or add a database engine
 
-Run the same install command again. It replaces the binary, restarts the service, and keeps your data, secrets and certificate. Adding `--with-mariadb` / `--with-mongodb` / `--with-sqlite` installs and enables that engine.
+The panel checks for new releases daily. When one is out, an administrator can install it from **Services → Updates** with the **Upgrade** button: the panel runs that release's installer on the server, restarts itself (sites keep running; nginx, PHP and the firewall are left alone), and puts the previous version back if the new one doesn't stay up. The installer's output is shown on the page.
+
+Or run the same install command again. It replaces the binary, restarts the service, and keeps your data, secrets and certificate. Adding `--with-mariadb` / `--with-mongodb` / `--with-sqlite` installs and enables that engine.
 
 ### Moving from CloudPanel CE
 

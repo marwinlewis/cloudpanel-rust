@@ -39,6 +39,11 @@ pub struct Config {
     pub cloudflare_ips_url: String,
     /// Where the latest CloudPanel release is looked up (`CLOUDPANEL_RELEASE_URL`).
     pub panel_release_url: String,
+    /// Where an upgrade fetches the installer from, in place of the release's tag on GitHub
+    /// (`CLOUDPANEL_UPGRADE_INSTALLER_URL`). For mirrors and tests.
+    pub upgrade_installer_url: Option<String>,
+    /// Passed to the installer as `CLOUDPANEL_RELEASE_BASE`: where it downloads the binary from.
+    pub upgrade_release_base: Option<String>,
 }
 
 fn env_or(key: &str, linux_default: &str, dev_default: &str) -> String {
@@ -128,6 +133,12 @@ impl Config {
                 .ok()
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| crate::services::panel_update::DEFAULT_URL.to_string()),
+            upgrade_installer_url: std::env::var("CLOUDPANEL_UPGRADE_INSTALLER_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            upgrade_release_base: std::env::var("CLOUDPANEL_RELEASE_BASE")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             data_dir,
         }
     }
