@@ -542,12 +542,17 @@ pub async fn set_maintenance(
     let site = state
         .db(move |conn| {
             let previous = require_site(conn, &user, id)?;
-            NginxService::check_vhost_managed(&previous).map_err(ApiError::Unprocessable)?;
             let mut site = previous.clone();
             site.maintenance_mode = p.enabled;
             site.maintenance_message = message;
             site.maintenance_allow = allow.join("\n");
-            apply_site(&config, conn, &previous, &site)?;
+            if site.vhost_managed {
+                apply_site(&config, conn, &previous, &site)?;
+            } else {
+                // An imported vhost is never regenerated; only the marked block changes.
+                NginxService::apply_imported_maintenance(&config, &site).map_err(ApiError::Unprocessable)?;
+                db::save_site(conn, &site)?;
+            }
             if previous.maintenance_mode != site.maintenance_mode {
                 audit::record(
                     conn,

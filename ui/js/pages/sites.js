@@ -214,6 +214,16 @@ function renderSiteDetail(view, id, tab) {
     const t = SITE_TYPES[site.site_type] || { label: site.site_type };
     setSub(`${t.label} · ${!site.is_active ? 'disabled' : site.maintenance_mode ? 'in maintenance' : 'active'}`);
     const url = `${site.ssl_enabled ? 'https' : 'http'}://${site.domain}`;
+    const maint = site.is_active && h('button', { class: 'btn' }, icon('alert'), h('span', { class: 'hide-sm', text: site.maintenance_mode ? 'End maintenance' : 'Maintenance' }));
+    if (maint) maint.addEventListener('click', async () => {
+      const on = !site.maintenance_mode;
+      if (on && !(await confirmDialog({ title: `Put ${site.domain} in maintenance?`, message: 'Visitors will see the maintenance page (HTTP 503) until you end it. The site keeps running, and addresses allowed under Settings still see it.', confirmText: 'Start maintenance' }))) return;
+      await withBusy(maint, async () => {
+        await api(`/sites/${id}/maintenance`, { method: 'PUT', body: { enabled: on, message: site.maintenance_message, allow: splitLines(site.maintenance_allow) } });
+        toast(on ? 'Maintenance mode is on' : `${site.domain} is live`);
+        await load(current);
+      });
+    });
     const toggle = h('button', { class: 'btn' }, icon('power'), site.is_active ? 'Disable' : 'Enable');
     toggle.addEventListener('click', async () => {
       if (site.is_active && !(await confirmDialog({ title: `Disable ${site.domain}?`, message: 'Visitors will see a maintenance page (HTTP 503) and the app is stopped.', confirmText: 'Disable', danger: true }))) return;
@@ -226,6 +236,7 @@ function renderSiteDetail(view, id, tab) {
     setActions(
       h('a', { class: 'btn ghost', href: '#/sites' }, icon('back'), h('span', { class: 'hide-sm', text: 'Sites' })),
       h('a', { class: 'btn', href: url, target: '_blank', rel: 'noopener noreferrer' }, icon('external'), h('span', { class: 'hide-sm', text: 'Open' })),
+      maint,
       toggle,
       isAdmin() && moreButton([{ icon: 'trash', label: 'Delete site', danger: true, action: () => deleteSite(site, () => { location.hash = '#/sites'; }) }]));
 
@@ -262,7 +273,7 @@ function renderSiteDetail(view, id, tab) {
 
 /** Shown above a site's tabs while visitors see the maintenance page. */
 function maintenanceBanner(site, reload) {
-  if (!site.is_active || !site.maintenance_mode || !site.vhost_managed) return null;
+  if (!site.is_active || !site.maintenance_mode) return null;
   const live = h('button', { class: 'btn sm', type: 'button' }, icon('power'), 'Go live');
   live.addEventListener('click', () => withBusy(live, async () => {
     await api(`/sites/${site.id}/maintenance`, { method: 'PUT', body: { enabled: false, message: site.maintenance_message, allow: splitLines(site.maintenance_allow) } });
@@ -773,7 +784,7 @@ function tabSettings(el, { site, reload }) {
     general.querySelectorAll('input, select').forEach((e) => { e.disabled = true; });
     const imported = h('pre', { class: 'logs mono tall', text: 'Loading…' });
     api(`/sites/${site.id}/vhost`).then((r) => { imported.textContent = r.vhost; }).catch((e) => { imported.textContent = e.message; });
-    el.append(card({ title: 'General', body: general }), card({ title: 'nginx config', sub: 'As imported from CloudPanel CE.', body: imported }));
+    el.append(card({ title: 'General', body: general }), maintenanceCard(site, reload), card({ title: 'nginx config', sub: 'As imported from CloudPanel CE. Maintenance mode adds a marked block to it, which is removed again when maintenance ends.', body: imported }));
     return;
   }
 

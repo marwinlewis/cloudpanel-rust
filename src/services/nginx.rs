@@ -45,6 +45,11 @@ const DEFAULT_VHOST: &str = "cloudpanel-default";
 pub const DEFAULT_MAINTENANCE_MESSAGE: &str =
     "We're making some improvements and will be back shortly. Thank you for your patience.";
 
+/// Marks the maintenance block the panel adds to a vhost imported from CE, so it can be taken
+/// out again without touching anything else in the file.
+const MAINTENANCE_BEGIN: &str = "# BEGIN CloudPanel maintenance mode (removed when maintenance ends)";
+const MAINTENANCE_END: &str = "# END CloudPanel maintenance mode";
+
 /// The longest maintenance message the panel accepts.
 pub const MAINTENANCE_MESSAGE_MAX: usize = 2000;
 
@@ -354,6 +359,134 @@ impl NginxService {
             return Ok(());
         }
         Self::install_vhost(config, DEFAULT_VHOST, &content, 0o644)
+    }
+
+    /// Take every marked maintenance block out of an imported vhost, leaving it exactly as it was.
+    fn strip_maintenance(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut inside = false;
+        for line in text.split_inclusive('\n') {
+            let t = line.trim();
+            if t == MAINTENANCE_BEGIN {
+                inside = true;
+            } else if t == MAINTENANCE_END {
+                inside = false;
+            } else if !inside {
+                out.push_str(line);
+            }
+        }
+        out
+    }
+
+    /// Add the maintenance block to an imported vhost, right after `server_name` in each server
+    /// that visitors reach on port 80 or 443. CE also has an internal server, reached from
+    /// 127.0.0.1 through the public one; gating it too would refuse the allowed addresses.
+    fn add_maintenance(text: &str, site: &Site) -> Result<String, String> {
+        let clean = Self::strip_maintenance(text);
+        let block = format!(
+            "    {MAINTENANCE_BEGIN}\n{}    {MAINTENANCE_END}\n",
+            Self::maintenance_block(site)
+        );
+        let lines: Vec<&str> = clean.split_inclusive('\n').collect();
+        // Line ranges of the top-level server blocks.
+        let mut blocks: Vec<(usize, usize)> = Vec::new();
+        let mut depth = 0i32;
+        let mut start = None;
+        for (i, line) in lines.iter().enumerate() {
+            let code = line.split('#').next().unwrap_or_default();
+            if depth == 0 && start.is_none() && code.trim_start().starts_with("server") && code.contains('{') {
+                start = Some(i);
+            }
+            depth += code.matches('{').count() as i32 - code.matches('}').count() as i32;
+            if depth <= 0 {
+                depth = 0;
+                if let Some(s) = start.take() {
+                    blocks.push((s, i));
+                }
+            }
+        }
+        let public = |l: &str| {
+            let mut w = l
+                .split('#')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .trim_end_matches(';')
+                .split_whitespace();
+            w.next() == Some("listen")
+                && w.next()
+                    .map(|a| a.rsplit_once(':').map_or(a, |(_, p)| p))
+                    .is_some_and(|p| p == "80" || p == "443")
+        };
+        let mut insert_after = Vec::new();
+        for (s, e) in blocks {
+            let body = &lines[s..=e];
+            if !body.iter().any(|l| public(l)) {
+                continue;
+            }
+            if let Some(off) = body.iter().position(|l| l.trim_start().starts_with("server_name")) {
+                insert_after.push(s + off);
+            }
+        }
+        if insert_after.is_empty() {
+            return Err(format!(
+                "No server in the nginx config of {} listens on port 80 or 443, so maintenance mode can't be added",
+                site.domain
+            ));
+        }
+        let mut out = String::with_capacity(clean.len() + block.len() * insert_after.len());
+        for (i, line) in lines.iter().enumerate() {
+            out.push_str(line);
+            if insert_after.contains(&i) {
+                if !line.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str(&block);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Turn maintenance mode on or off for a site whose vhost was imported from CE. Its file is
+    /// kept as it is apart from the marked block, which is taken out again when maintenance ends.
+    /// The file is changed where it is (CE keeps plain files in sites-enabled), checked with
+    /// `nginx -t` and put back on failure.
+    pub fn apply_imported_maintenance(config: &Config, site: &Site) -> Result<(), String> {
+        let (available, enabled) = Self::paths(config, &site.domain);
+        // A link in sites-enabled points at sites-available: change the file it points at.
+        let path = if available.exists() { available } else { enabled };
+        let previous = fs::read(&path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+        let text = String::from_utf8(previous.clone()).map_err(|_| format!("{} is not valid UTF-8", path.display()))?;
+        let next = if site.maintenance_mode {
+            Self::add_maintenance(&text, site)?
+        } else {
+            Self::strip_maintenance(&text)
+        };
+        if next == text {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            fs::metadata(&path)
+                .map(|m| m.permissions().mode() & 0o7777)
+                .unwrap_or(0o644)
+        };
+        #[cfg(not(unix))]
+        let mode = 0o644;
+        write_atomic(&path, next.as_bytes(), mode).map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+        if let Err(e) = Self::test() {
+            let _ = write_atomic(&path, &previous, mode);
+            warn!("nginx rejected maintenance mode for {}: {e}", site.domain);
+            return Err(e);
+        }
+        Self::reload()?;
+        info!(
+            "Maintenance mode {} for imported site {}",
+            if site.maintenance_mode { "on" } else { "off" },
+            site.domain
+        );
+        Ok(())
     }
 
     /// Rewrite the vhosts of sites without a certificate that predate the fallback certificate,
@@ -1138,6 +1271,63 @@ mod tests {
         let c = NginxService::generate_config(&cfg(), &s);
         let php = &c[c.find("location ~ \\.php$").unwrap()..];
         assert!(php.contains("auth_basic \"Restricted\";"));
+    }
+
+    /// As CE writes a vhost: a public server, and an internal one the public one proxies to.
+    const CE_VHOST: &str = "server {\n  listen 80;\n  listen [::]:80;\n  listen 443 ssl http2;\n  \
+        ssl_certificate /etc/nginx/ssl-certificates/shop.test.crt;\n  server_name shop.test www.shop.test; # names\n  \
+        root /home/shop/htdocs/shop.test;\n  location / {\n    proxy_pass http://127.0.0.1:8080;\n  }\n}\n\n\
+        server {\n  listen 8080;\n  listen [::]:8080;\n  server_name shop.test www.shop.test;\n  \
+        location ~ \\.php$ {\n    fastcgi_pass 127.0.0.1:18001;\n  }\n}\n";
+
+    fn imported() -> Site {
+        let mut s = test_site("php");
+        s.domain = "shop.test".into();
+        s.vhost_managed = false;
+        s.maintenance_mode = true;
+        s.maintenance_allow = "203.0.113.7".into();
+        s
+    }
+
+    #[test]
+    fn imported_vhost_gets_maintenance_only_on_its_public_server() {
+        let out = NginxService::add_maintenance(CE_VHOST, &imported()).unwrap();
+        assert_eq!(out.matches(MAINTENANCE_BEGIN).count(), 1);
+        let public_end = out.find("\n}\n").unwrap();
+        let gate = out.find("if ($cloudpanel_maintenance)").unwrap();
+        assert!(gate > out.find("server_name shop.test www.shop.test; # names").unwrap());
+        assert!(gate < public_end, "the block goes into the public server");
+        // Adding it again replaces it rather than stacking.
+        let again = NginxService::add_maintenance(&out, &imported()).unwrap();
+        assert_eq!(again, out);
+        // Taking it out restores the file byte for byte.
+        assert_eq!(NginxService::strip_maintenance(&out), CE_VHOST);
+    }
+
+    #[test]
+    fn imported_vhost_without_a_public_server_is_refused() {
+        let internal = "server {\n  listen 8080;\n  server_name shop.test;\n}\n";
+        assert!(NginxService::add_maintenance(internal, &imported()).is_err());
+    }
+
+    #[test]
+    fn imported_maintenance_edits_the_file_in_place() {
+        let dir = std::env::temp_dir().join(format!("cp-maint-{}", std::process::id()));
+        let mut c = cfg();
+        c.nginx_sites_available = dir.join("sites-available");
+        c.nginx_sites_enabled = dir.join("sites-enabled");
+        fs::create_dir_all(&c.nginx_sites_enabled).unwrap();
+        // CE keeps a plain file in sites-enabled and nothing in sites-available.
+        let file = c.nginx_sites_enabled.join("shop.test.conf");
+        fs::write(&file, CE_VHOST).unwrap();
+        let mut s = imported();
+        NginxService::apply_imported_maintenance(&c, &s).unwrap();
+        assert!(fs::read_to_string(&file).unwrap().contains("return 503;"));
+        assert!(!c.nginx_sites_available.join("shop.test.conf").exists());
+        s.maintenance_mode = false;
+        NginxService::apply_imported_maintenance(&c, &s).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), CE_VHOST);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
