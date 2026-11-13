@@ -158,8 +158,10 @@ struct Upgrade {
 fn upgrade_state(upgrade: Option<&Upgrade>, current: &str, unit_active: bool) -> &'static str {
     match upgrade {
         None => "none",
-        Some(_) if unit_active => "running",
+        // The version it aimed for is answering: done, as far as the page goes, even while the
+        // unit still watches that it stays up.
         Some(u) if u.target == current => "none",
+        Some(_) if unit_active => "running",
         Some(_) => "failed",
     }
 }
@@ -209,7 +211,11 @@ fn plain_tail(text: &str, max_lines: usize) -> String {
             plain.push(c);
         }
     }
-    let lines: Vec<&str> = plain.lines().collect();
+    // The installer's summary repeats the first admin password for as long as it was never changed.
+    let lines: Vec<&str> = plain
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("Password"))
+        .collect();
     lines[lines.len().saturating_sub(max_lines)..].join("\n")
 }
 
@@ -355,7 +361,13 @@ pub fn status(config: &Config, conn: &rusqlite::Connection) -> rusqlite::Result<
 /// is where a finished upgrade leaves the panel.
 pub fn settle_upgrade(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     let mut stored: Stored = db::get_json(conn, SETTING)?;
-    if let Some(u) = stored.upgrade.as_ref().filter(|u| u.target == CURRENT) {
+    // While the unit is still watching the new version, the record stays: if this version stops
+    // and the previous one is put back, that one finds it and reports the failure.
+    if let Some(u) = stored
+        .upgrade
+        .as_ref()
+        .filter(|u| u.target == CURRENT && !unit_active())
+    {
         tracing::info!("upgraded from v{} to v{}", u.from, u.target);
         stored.upgrade = None;
         db::set_json(conn, SETTING, &stored)?;
@@ -367,7 +379,8 @@ fn launch_upgrade(config: &Config, version: &str) -> Result<(), String> {
     let systemd_run = cmd::systemd_run().ok_or("systemd-run is not available")?;
     let log = config.log_dir.join(UPGRADE_LOG);
     // systemd writes from the start of the file without emptying it.
-    std::fs::write(&log, b"").map_err(|e| format!("Failed to write {}: {e}", log.display()))?;
+    // Only root reads it: the installer's output can name the first admin password.
+    crate::fsutil::write_atomic(&log, b"", 0o600).map_err(|e| format!("Failed to write {}: {e}", log.display()))?;
     let url = installer_url(config, version);
     let mut args: Vec<String> = vec![
         format!("--unit={UPGRADE_UNIT}"),
@@ -724,7 +737,7 @@ mod tests {
         assert_eq!(st["upgrade"]["target"], "0.3.1");
         assert_eq!(st["upgrade"]["log_tail"], "log");
         // The new version starts while the unit is still watching it.
-        assert_eq!(status_of(&s, "0.3.1", &view(true))["upgrade"]["state"], "running");
+        assert_eq!(status_of(&s, "0.3.1", &view(true))["upgrade"]["state"], "none");
         // Ended on the old version: it didn't work, and the log says why.
         let st = status_of(&s, "0.3.0", &view(false));
         assert_eq!(st["upgrade"]["state"], "failed");
@@ -774,6 +787,10 @@ mod tests {
         let log = "one\n\u{1b}[1m==>\u{1b}[0m Installing\nthree\n";
         assert_eq!(plain_tail(log, 2), "==> Installing\nthree");
         assert_eq!(plain_tail("", 5), "");
+        assert_eq!(
+            plain_tail("  Username  admin\n  Password  hunter2\nend\n", 5),
+            "  Username  admin\nend"
+        );
     }
 
     #[test]
