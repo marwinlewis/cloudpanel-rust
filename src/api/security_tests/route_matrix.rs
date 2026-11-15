@@ -119,6 +119,7 @@ const ROUTES: &[(&str, &str, Guard)] = &[
     ("GET", "/system/panel-update", Admin),
     ("POST", "/system/panel-update/check", Admin),
     ("POST", "/system/panel-update/upgrade", Admin),
+    ("PUT", "/system/panel-update/auto", Admin),
     ("POST", "/system/reboot", Admin),
     ("GET", "/docker/status", Admin),
     ("GET", "/docker/containers", Admin),

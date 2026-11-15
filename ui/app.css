@@ -359,6 +359,7 @@ td.nowrap { white-space: nowrap; }
 /* ---------- v0.3 additions ---------- */
 .row.wrap { flex-wrap: wrap; }
 .row.end { justify-content: flex-end; }
+.row.bottom { align-items: flex-end; }
 .row.between { justify-content: space-between; }
 .page-tabs { display: flex; flex-wrap: wrap; width: fit-content; max-width: 100%; }
 .logs.tall { min-height: 420px; }

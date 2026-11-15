@@ -1,7 +1,7 @@
 'use strict';
 import {
   api, card, confirmDialog, copyButton, emptyState, errorState, fmtAgo, fmtBytes, h, hooks, icon, kv, moreButton, openDialog,
-  runJob, setActions, setSub, skeletonRows, table, tabStrip, toast, withBusy,
+  runJob, selectField, setActions, setSub, skeletonRows, table, tabStrip, toast, withBusy,
 } from '../core.js';
 
 function stateBadge(s) {
@@ -67,6 +67,8 @@ function renderServiceList(el) {
   }
   load();
 }
+
+const hourLabel = (hr) => `${String(hr).padStart(2, '0')}:00–${String(hr).padStart(2, '0')}:59`;
 
 // The panel's own version, which is separate from the server's packages below it.
 function renderPanelUpdate(el) {
@@ -134,7 +136,9 @@ function renderPanelUpdate(el) {
           h('strong', { text: `CloudPanel v${p.latest} is available. ` }),
           p.release_url && h('a', { href: p.release_url, target: '_blank', rel: 'noopener noreferrer', text: 'Release notes' })),
         p.can_upgrade
-          ? [h('div', { text: 'Your data, secrets and certificate are kept.' }), h('div', null, upgrade),
+          ? [h('div', { text: p.auto && p.auto.will_install
+            ? `It will be installed automatically at ${hourLabel(p.auto.hour)} server time, or now with the button. Your data, secrets and certificate are kept.`
+            : 'Your data, secrets and certificate are kept.' }), h('div', null, upgrade),
             h('details', null, h('summary', { class: 'muted small', text: 'Or run the installer on the server' }), command())]
           : [h('div', { text: 'To update, run this on the server. Your data, secrets and certificate are kept.' }), command()]));
     }
@@ -153,8 +157,34 @@ function renderPanelUpdate(el) {
           ['Installed', `v${p.current}`],
           ['Latest', latest],
           ['Last checked', p.checked_at ? fmtAgo(p.checked_at) : 'Never'],
-        ])),
+        ]),
+        p.can_upgrade && p.auto && autoForm(p)),
     }));
+  }
+  // Whether new releases install by themselves, and in which hour of the night.
+  function autoForm(p) {
+    const a = p.auto;
+    const hours = Array.from({ length: 24 }, (_, i) => [String(i), hourLabel(i)]);
+    const sel = selectField({ label: `Install between (server time, UTC${a.utc_offset})`, name: 'hour', options: hours, value: String(a.hour) });
+    const box = h('input', { type: 'checkbox', name: 'enabled', checked: a.enabled });
+    const save = h('button', { class: 'btn', type: 'submit', text: 'Save' });
+    const form = h('form', { class: 'form', novalidate: true },
+      h('label', { class: 'check' }, box, 'Install new CloudPanel versions automatically'),
+      h('div', { class: 'hint', text: 'Final releases only. If the new version doesn’t stay up, the previous one is put back and that version isn’t tried again automatically.' }),
+      h('div', { class: 'row bottom' },h('div', { class: 'grow' }, sel), save));
+    const hourSel = sel.querySelector('select');
+    const sync = () => { hourSel.disabled = !box.checked; };
+    box.addEventListener('change', sync);
+    sync();
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      withBusy(save, async () => {
+        const r = await api('/system/panel-update/auto', { method: 'PUT', body: { enabled: box.checked, hour: Number(hourSel.value) } });
+        draw(r);
+        toast(r.auto.enabled ? `Automatic updates on, at ${hourLabel(r.auto.hour)}` : 'Automatic updates off');
+      });
+    });
+    return form;
   }
   async function load() {
     try { draw(await api('/system/panel-update')); } catch (e) { if (e.status !== 401) holder.replaceChildren(card({ title: 'CloudPanel', body: errorState(e.message, load) })); }

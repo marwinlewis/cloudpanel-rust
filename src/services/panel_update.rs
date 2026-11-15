@@ -8,6 +8,10 @@
 //!
 //! The answer is stored, but whether it is an update is worked out from the running version each
 //! time, so the notice goes away by itself once the new version is running.
+//!
+//! Automatic updates, on unless an admin turns them off, install a newer final release by
+//! themselves during one hour of the night (server time), through the same upgrade the button
+//! starts. A version whose upgrade didn't finish is not tried again automatically.
 
 use super::alerts;
 use super::cmd::{self, CmdOpts};
@@ -16,12 +20,13 @@ use crate::auth::AuthUser;
 use crate::config::Config;
 use crate::db;
 use crate::state::SharedState;
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Duration;
 
 pub const SETTING: &str = "panel_update";
+pub const AUTO_SETTING: &str = "panel_auto_update";
 pub const DEFAULT_URL: &str = "https://api.github.com/repos/marwinlewis/cloudpanel-rust/releases/latest";
 pub const UPGRADE_COMMAND: &str =
     "curl -fsSL https://raw.githubusercontent.com/marwinlewis/cloudpanel-rust/main/install.sh | sudo bash";
@@ -81,6 +86,45 @@ echo "CloudPanel v$version is running"
 const CHECK_EVERY_HOURS: i64 = 24;
 const RETRY_AFTER_HOURS: i64 = 1;
 const MIN_WAIT: Duration = Duration::from_secs(60);
+/// How often the automatic-update loop looks at the clock. Several looks fall in each hour.
+const AUTO_TICK: Duration = Duration::from_secs(10 * 60);
+/// An answer older than this is refreshed before installing automatically.
+const AUTO_FRESH_HOURS: i64 = 6;
+/// Who the audit log names for an upgrade nobody pressed a button for.
+const AUTO_ACTOR: &str = "auto-update";
+
+/// Whether, and when, a new release is installed without anyone pressing Upgrade.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(default)]
+pub struct AutoUpdate {
+    pub enabled: bool,
+    /// The hour of the day, in the server's time zone, in which it may start.
+    pub hour: u8,
+}
+
+impl Default for AutoUpdate {
+    fn default() -> Self {
+        AutoUpdate { enabled: true, hour: 3 }
+    }
+}
+
+/// The version to install automatically now, if any. Only a final release, only in the chosen
+/// hour, and never one whose upgrade already ran: a failure was put back and stays visible until
+/// an admin retries it or a newer release comes out.
+fn auto_target(stored: &Stored, auto: &AutoUpdate, current: &str, local_hour: u32) -> Option<String> {
+    if !auto.enabled || u32::from(auto.hour) != local_hour {
+        return None;
+    }
+    let version = &stored.release.as_ref()?.version;
+    let final_release = Version::parse(version).is_some_and(|v| v.is_final);
+    let tried = stored.upgrade.as_ref().is_some_and(|u| &u.target == version);
+    (final_release && is_newer(version, current) && safe_version(version) && !tried).then(|| version.clone())
+}
+
+/// Whether the update on offer will be installed by itself, so the page and alerts can say when.
+fn auto_will_install(stored: &Stored, auto: &AutoUpdate, current: &str, can_upgrade: bool) -> bool {
+    can_upgrade && auto_target(stored, auto, current, u32::from(auto.hour)).is_some()
+}
 
 /// Fields in the order they compare. A pre-release comes before its own final version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -327,12 +371,18 @@ fn record(
     Some(release)
 }
 
-fn status_of(stored: &Stored, current: &str, view: &UpgradeView) -> serde_json::Value {
+fn status_of(stored: &Stored, auto: &AutoUpdate, current: &str, view: &UpgradeView) -> serde_json::Value {
     let release = stored.release.as_ref();
     let state = upgrade_state(stored.upgrade.as_ref(), current, view.unit_active);
     let upgrade = stored.upgrade.as_ref().filter(|_| state != "none");
     json!({
         "can_upgrade": view.can_upgrade,
+        "auto": {
+            "enabled": auto.enabled,
+            "hour": auto.hour,
+            "utc_offset": chrono::Local::now().format("%:z").to_string(),
+            "will_install": state == "none" && auto_will_install(stored, auto, current, view.can_upgrade),
+        },
         "upgrade": {
             "state": state,
             "target": upgrade.map(|u| &u.target),
@@ -354,7 +404,28 @@ fn status_of(stored: &Stored, current: &str, view: &UpgradeView) -> serde_json::
 /// What the panel knows, without asking GitHub.
 pub fn status(config: &Config, conn: &rusqlite::Connection) -> rusqlite::Result<serde_json::Value> {
     let stored: Stored = db::get_json(conn, SETTING)?;
-    Ok(status_of(&stored, CURRENT, &UpgradeView::read(config, &stored)))
+    let auto: AutoUpdate = db::get_json(conn, AUTO_SETTING)?;
+    Ok(status_of(&stored, &auto, CURRENT, &UpgradeView::read(config, &stored)))
+}
+
+/// Turn automatic updates on or off, or move them to another hour.
+pub async fn set_auto(state: &SharedState, actor: AuthUser, auto: AutoUpdate) -> ApiResult<serde_json::Value> {
+    if auto.hour > 23 {
+        return Err(ApiError::BadRequest("The hour must be from 0 to 23".into()));
+    }
+    let config = state.config.clone();
+    state
+        .db(move |conn| {
+            db::set_json(conn, AUTO_SETTING, &auto)?;
+            let detail = if auto.enabled {
+                format!("on, at {:02}:00", auto.hour)
+            } else {
+                "off".into()
+            };
+            crate::audit::record(conn, &actor, "panel.auto_update", None, Some(&detail));
+            Ok(status(&config, conn)?)
+        })
+        .await
 }
 
 /// Forget an upgrade once the version it aimed for is the one running. Called at startup, which
@@ -420,54 +491,102 @@ pub async fn start_upgrade(state: &SharedState, actor: AuthUser) -> ApiResult<se
     let config = state.config.clone();
     state
         .db(move |conn| {
-            let mut stored: Stored = db::get_json(conn, SETTING)?;
-            let version = stored
-                .release
-                .as_ref()
-                .map(|r| r.version.clone())
-                .filter(|v| is_newer(v, CURRENT))
-                .ok_or_else(|| ApiError::BadRequest("CloudPanel is already up to date".into()))?;
-            if !safe_version(&version) {
-                return Err(ApiError::BadRequest(format!(
-                    "The release has a version the panel won't install: '{version}'"
-                )));
-            }
-            if !can_upgrade() {
-                return Err(ApiError::Unprocessable(
-                    "This panel doesn't run as the systemd service the installer sets up, so it can't upgrade \
-                     itself. Run the command on the server instead."
-                        .into(),
-                ));
-            }
-            if unit_active() {
-                return Err(ApiError::Conflict("An upgrade is already running".into()));
-            }
-            stored.upgrade = Some(Upgrade {
-                target: version.clone(),
-                from: CURRENT.to_string(),
-                started_at: Utc::now(),
-            });
-            db::set_json(conn, SETTING, &stored)?;
-            if let Err(e) = launch_upgrade(&config, &version) {
-                stored.upgrade = None;
-                db::set_json(conn, SETTING, &stored)?;
-                return Err(ApiError::Unprocessable(e));
-            }
-            crate::audit::record(
-                conn,
-                &actor,
-                "panel.upgrade",
-                Some(&format!("v{version}")),
-                Some(CURRENT),
-            );
+            let stored = begin_upgrade(conn, &config, Some(&actor))?;
+            let auto: AutoUpdate = db::get_json(conn, AUTO_SETTING)?;
             let view = UpgradeView {
                 can_upgrade: true,
                 unit_active: true,
                 log_tail: String::new(),
             };
-            Ok(status_of(&stored, CURRENT, &view))
+            Ok(status_of(&stored, &auto, CURRENT, &view))
         })
         .await
+}
+
+/// Start upgrading to the release the last check found, for an admin or, with no actor, for
+/// automatic updates.
+fn begin_upgrade(conn: &rusqlite::Connection, config: &Config, actor: Option<&AuthUser>) -> ApiResult<Stored> {
+    let mut stored: Stored = db::get_json(conn, SETTING)?;
+    let version = stored
+        .release
+        .as_ref()
+        .map(|r| r.version.clone())
+        .filter(|v| is_newer(v, CURRENT))
+        .ok_or_else(|| ApiError::BadRequest("CloudPanel is already up to date".into()))?;
+    if !safe_version(&version) {
+        return Err(ApiError::BadRequest(format!(
+            "The release has a version the panel won't install: '{version}'"
+        )));
+    }
+    if !can_upgrade() {
+        return Err(ApiError::Unprocessable(
+            "This panel doesn't run as the systemd service the installer sets up, so it can't upgrade \
+             itself. Run the command on the server instead."
+                .into(),
+        ));
+    }
+    if unit_active() {
+        return Err(ApiError::Conflict("An upgrade is already running".into()));
+    }
+    stored.upgrade = Some(Upgrade {
+        target: version.clone(),
+        from: CURRENT.to_string(),
+        started_at: Utc::now(),
+    });
+    db::set_json(conn, SETTING, &stored)?;
+    if let Err(e) = launch_upgrade(config, &version) {
+        stored.upgrade = None;
+        db::set_json(conn, SETTING, &stored)?;
+        return Err(ApiError::Unprocessable(e));
+    }
+    let target = format!("v{version}");
+    match actor {
+        Some(actor) => crate::audit::record(conn, actor, "panel.upgrade", Some(&target), Some(CURRENT)),
+        None => crate::audit::record_system(
+            conn,
+            Some(AUTO_ACTOR),
+            None,
+            "panel.upgrade",
+            Some(&target),
+            Some(CURRENT),
+        ),
+    }
+    Ok(stored)
+}
+
+/// Install a release by itself if automatic updates are on and it is their hour.
+async fn auto_tick(state: &SharedState) -> ApiResult<()> {
+    async fn read(state: &SharedState) -> ApiResult<(Stored, AutoUpdate)> {
+        state
+            .db(|conn| {
+                let stored: Stored = db::get_json(conn, SETTING)?;
+                let auto: AutoUpdate = db::get_json(conn, AUTO_SETTING)?;
+                Ok((stored, auto))
+            })
+            .await
+    }
+    let hour = chrono::Local::now().hour();
+    let (stored, auto) = read(state).await?;
+    if auto_target(&stored, &auto, CURRENT, hour).is_none() || !can_upgrade() {
+        return Ok(());
+    }
+    // Make sure it is still the latest before installing it.
+    let stale = stored
+        .checked_at
+        .map_or(true, |t| Utc::now() - t > ChronoDuration::hours(AUTO_FRESH_HOURS));
+    if stale {
+        check(state).await?;
+        let (stored, auto) = read(state).await?;
+        if auto_target(&stored, &auto, CURRENT, hour).is_none() {
+            return Ok(());
+        }
+    }
+    let config = state.config.clone();
+    let stored = state.db(move |conn| begin_upgrade(conn, &config, None)).await?;
+    if let Some(u) = &stored.upgrade {
+        tracing::info!("automatic update: upgrading from v{} to v{}", u.from, u.target);
+    }
+    Ok(())
 }
 
 /// Ask GitHub now. Being unable to reach it isn't an error here: the answer says so, and what the
@@ -485,22 +604,34 @@ pub async fn check(state: &SharedState) -> ApiResult<serde_json::Value> {
     state
         .db(move |conn| {
             let mut stored: Stored = db::get_json(conn, SETTING)?;
+            let auto: AutoUpdate = db::get_json(conn, AUTO_SETTING)?;
             let announce = record(&mut stored, outcome, CURRENT, Utc::now());
             db::set_json(conn, SETTING, &stored)?;
+            let view = UpgradeView::read(&st.config, &stored);
             if let Some(release) = announce {
-                let (title, body) = announcement(&release, CURRENT);
+                let auto_hour = auto_will_install(&stored, &auto, CURRENT, view.can_upgrade).then_some(auto.hour);
+                let (title, body) = announcement(&release, CURRENT, auto_hour);
                 alerts::notify_event(&st.config, &st.pool, &title, &body);
             }
-            Ok(status_of(&stored, CURRENT, &UpgradeView::read(&st.config, &stored)))
+            Ok(status_of(&stored, &auto, CURRENT, &view))
         })
         .await
 }
 
-fn announcement(release: &Release, current: &str) -> (String, String) {
-    let mut body = format!(
-        "This server runs v{current}. To update it, press Upgrade under Services > Updates in the panel, \
-         or run this on the server:\n\n{UPGRADE_COMMAND}\n\nYour data, secrets and certificate are kept."
-    );
+/// `auto_hour` is when automatic updates will install it, if they will.
+fn announcement(release: &Release, current: &str, auto_hour: Option<u8>) -> (String, String) {
+    let mut body = match auto_hour {
+        Some(hour) => format!(
+            "This server runs v{current}. Automatic updates will install v{} at {hour:02}:00 server time. \
+             To install it sooner, press Upgrade under Services > Updates in the panel, or run this on the \
+             server:\n\n{UPGRADE_COMMAND}\n\nYour data, secrets and certificate are kept.",
+            release.version
+        ),
+        None => format!(
+            "This server runs v{current}. To update it, press Upgrade under Services > Updates in the panel, \
+             or run this on the server:\n\n{UPGRADE_COMMAND}\n\nYour data, secrets and certificate are kept."
+        ),
+    };
     if let Some(url) = &release.url {
         body.push_str(&format!("\n\nRelease notes: {url}"));
     }
@@ -530,8 +661,18 @@ async fn time_to_next_check(state: &SharedState) -> Duration {
     due_in(&stored, Utc::now())
 }
 
-/// Keep checking for as long as the panel runs.
+/// Keep checking, and installing automatically when that is on, for as long as the panel runs.
 pub fn start(state: SharedState) {
+    let auto_state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(90)).await;
+        loop {
+            if let Err(e) = auto_tick(&auto_state).await {
+                tracing::warn!("automatic update did not start: {e:?}");
+            }
+            tokio::time::sleep(AUTO_TICK).await;
+        }
+    });
     tokio::spawn(async move {
         // Let the server finish starting first.
         tokio::time::sleep(Duration::from_secs(30)).await;
@@ -655,7 +796,7 @@ mod tests {
         let mut s = Stored::default();
         record(&mut s, Ok(Some(release("0.3.1"))), "0.3.0", t1);
         record(&mut s, Err("down".into()), "0.3.0", t2);
-        let st = status_of(&s, "0.3.0", &view(false));
+        let st = status_of(&s, &AutoUpdate::default(), "0.3.0", &view(false));
         assert_eq!(st["latest"], "0.3.1");
         assert_eq!(st["update_available"], true);
         assert_eq!(st["checked_at"], json!(t1));
@@ -663,7 +804,7 @@ mod tests {
         assert_eq!(st["error"], "down");
 
         record(&mut s, Ok(Some(release("0.3.1"))), "0.3.0", t3);
-        let st = status_of(&s, "0.3.0", &view(false));
+        let st = status_of(&s, &AutoUpdate::default(), "0.3.0", &view(false));
         assert_eq!(st["checked_at"], json!(t3));
         assert!(st["failed_at"].is_null());
         assert!(st["error"].is_null());
@@ -673,8 +814,11 @@ mod tests {
     fn the_notice_goes_away_once_the_new_version_is_running() {
         let mut s = Stored::default();
         record(&mut s, Ok(Some(release("0.3.1"))), "0.3.0", at("2026-11-07T00:00:00Z"));
-        assert_eq!(status_of(&s, "0.3.0", &view(false))["update_available"], true);
-        let st = status_of(&s, "0.3.1", &view(false));
+        assert_eq!(
+            status_of(&s, &AutoUpdate::default(), "0.3.0", &view(false))["update_available"],
+            true
+        );
+        let st = status_of(&s, &AutoUpdate::default(), "0.3.1", &view(false));
         assert_eq!(st["update_available"], false);
         assert_eq!(st["current"], "0.3.1");
         assert_eq!(st["latest"], "0.3.1");
@@ -682,7 +826,7 @@ mod tests {
 
     #[test]
     fn the_status_before_any_check_says_so() {
-        let st = status_of(&Stored::default(), "0.3.0", &view(false));
+        let st = status_of(&Stored::default(), &AutoUpdate::default(), "0.3.0", &view(false));
         assert_eq!(st["update_available"], false);
         assert!(st["latest"].is_null());
         assert!(st["checked_at"].is_null());
@@ -716,7 +860,7 @@ mod tests {
 
     #[test]
     fn the_announcement_says_what_to_do() {
-        let (title, body) = announcement(&release("0.3.1"), "0.3.0");
+        let (title, body) = announcement(&release("0.3.1"), "0.3.0", None);
         assert_eq!(title, "Update available: CloudPanel v0.3.1");
         assert!(body.contains("v0.3.0"));
         assert!(body.contains(UPGRADE_COMMAND));
@@ -726,24 +870,30 @@ mod tests {
     #[test]
     fn an_upgrade_is_running_failed_or_forgotten() {
         let mut s = Stored::default();
-        assert_eq!(status_of(&s, "0.3.0", &view(false))["upgrade"]["state"], "none");
+        assert_eq!(
+            status_of(&s, &AutoUpdate::default(), "0.3.0", &view(false))["upgrade"]["state"],
+            "none"
+        );
         s.upgrade = Some(Upgrade {
             target: "0.3.1".into(),
             from: "0.3.0".into(),
             started_at: at("2026-11-07T00:00:00Z"),
         });
-        let st = status_of(&s, "0.3.0", &view(true));
+        let st = status_of(&s, &AutoUpdate::default(), "0.3.0", &view(true));
         assert_eq!(st["upgrade"]["state"], "running");
         assert_eq!(st["upgrade"]["target"], "0.3.1");
         assert_eq!(st["upgrade"]["log_tail"], "log");
         // The new version starts while the unit is still watching it.
-        assert_eq!(status_of(&s, "0.3.1", &view(true))["upgrade"]["state"], "none");
+        assert_eq!(
+            status_of(&s, &AutoUpdate::default(), "0.3.1", &view(true))["upgrade"]["state"],
+            "none"
+        );
         // Ended on the old version: it didn't work, and the log says why.
-        let st = status_of(&s, "0.3.0", &view(false));
+        let st = status_of(&s, &AutoUpdate::default(), "0.3.0", &view(false));
         assert_eq!(st["upgrade"]["state"], "failed");
         assert_eq!(st["upgrade"]["log_tail"], "log");
         // Ended on the new one: nothing left to say.
-        let st = status_of(&s, "0.3.1", &view(false));
+        let st = status_of(&s, &AutoUpdate::default(), "0.3.1", &view(false));
         assert_eq!(st["upgrade"]["state"], "none");
         assert!(st["upgrade"]["target"].is_null());
         assert!(st["upgrade"]["log_tail"].is_null());
@@ -800,6 +950,93 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.upgrade, None);
+    }
+
+    fn found(version: &str) -> Stored {
+        let mut s = Stored::default();
+        record(&mut s, Ok(Some(release(version))), "0.3.0", at("2026-11-07T00:00:00Z"));
+        s
+    }
+
+    #[test]
+    fn automatic_updates_are_on_at_three_by_default() {
+        let a: AutoUpdate = serde_json::from_str("{}").unwrap();
+        assert_eq!(a, AutoUpdate { enabled: true, hour: 3 });
+        assert_eq!(a, AutoUpdate::default());
+    }
+
+    #[test]
+    fn installs_automatically_only_in_its_hour() {
+        let auto = AutoUpdate { enabled: true, hour: 3 };
+        let s = found("0.3.1");
+        assert_eq!(auto_target(&s, &auto, "0.3.0", 3).as_deref(), Some("0.3.1"));
+        assert_eq!(auto_target(&s, &auto, "0.3.0", 2), None);
+        assert_eq!(auto_target(&s, &auto, "0.3.0", 4), None);
+        let off = AutoUpdate { enabled: false, ..auto };
+        assert_eq!(auto_target(&s, &off, "0.3.0", 3), None);
+    }
+
+    #[test]
+    fn installs_automatically_only_a_newer_final_release() {
+        let auto = AutoUpdate::default();
+        assert_eq!(auto_target(&Stored::default(), &auto, "0.3.0", 3), None);
+        assert_eq!(auto_target(&found("0.3.0"), &auto, "0.3.0", 3), None);
+        assert_eq!(auto_target(&found("0.2.9"), &auto, "0.3.0", 3), None);
+        assert_eq!(auto_target(&found("0.4.0-rc1"), &auto, "0.3.0", 3), None);
+        assert_eq!(auto_target(&found("0.4.0-a;b"), &auto, "0.3.0", 3), None);
+    }
+
+    #[test]
+    fn a_version_that_failed_is_not_tried_again_automatically() {
+        let auto = AutoUpdate::default();
+        let mut s = found("0.3.1");
+        s.upgrade = Some(Upgrade {
+            target: "0.3.1".into(),
+            from: "0.3.0".into(),
+            started_at: at("2026-11-07T03:00:00Z"),
+        });
+        assert_eq!(auto_target(&s, &auto, "0.3.0", 3), None);
+        // A newer release after it is.
+        record(&mut s, Ok(Some(release("0.3.2"))), "0.3.0", at("2026-11-08T00:00:00Z"));
+        assert_eq!(auto_target(&s, &auto, "0.3.0", 3).as_deref(), Some("0.3.2"));
+    }
+
+    #[test]
+    fn the_status_says_whether_it_will_install_by_itself() {
+        let s = found("0.3.1");
+        let st = status_of(&s, &AutoUpdate::default(), "0.3.0", &view(false));
+        assert_eq!(st["auto"]["enabled"], true);
+        assert_eq!(st["auto"]["hour"], 3);
+        assert_eq!(st["auto"]["will_install"], true);
+        let off = AutoUpdate {
+            enabled: false,
+            hour: 3,
+        };
+        assert_eq!(
+            status_of(&s, &off, "0.3.0", &view(false))["auto"]["will_install"],
+            false
+        );
+        let cannot = UpgradeView {
+            can_upgrade: false,
+            ..view(false)
+        };
+        assert_eq!(
+            status_of(&s, &AutoUpdate::default(), "0.3.0", &cannot)["auto"]["will_install"],
+            false
+        );
+        assert_eq!(
+            status_of(&s, &AutoUpdate::default(), "0.3.1", &view(false))["auto"]["will_install"],
+            false
+        );
+    }
+
+    #[test]
+    fn the_announcement_says_when_it_installs_by_itself() {
+        let (_, body) = announcement(&release("0.3.1"), "0.3.0", Some(3));
+        assert!(body.contains("install v0.3.1 at 03:00 server time"));
+        assert!(body.contains(UPGRADE_COMMAND));
+        let (_, body) = announcement(&release("0.3.1"), "0.3.0", None);
+        assert!(!body.contains("Automatic"));
     }
 
     #[test]

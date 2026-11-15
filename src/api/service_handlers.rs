@@ -153,6 +153,15 @@ pub async fn check_panel_update(_admin: AdminUser, State(state): State<SharedSta
     Ok(Json(panel_update::check(&state).await?))
 }
 
+/// Turn automatic panel updates on or off, or pick the hour they run in.
+pub async fn set_panel_auto_update(
+    admin: AdminUser,
+    State(state): State<SharedState>,
+    Json(auto): Json<panel_update::AutoUpdate>,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(panel_update::set_auto(&state, admin.0, auto).await?))
+}
+
 pub async fn reboot(admin: AdminUser, State(state): State<SharedState>) -> ApiResult<impl IntoResponse> {
     state
         .db(move |conn| {

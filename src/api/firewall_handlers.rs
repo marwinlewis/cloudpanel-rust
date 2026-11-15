@@ -24,8 +24,38 @@ pub struct CreateRuleRequest {
     pub port: Option<serde_json::Value>,
     pub protocol: Option<String>,
     pub action: Option<String>,
+    /// One address or network. May also hold several, separated by commas or spaces.
     pub source: Option<String>,
+    /// Several addresses or networks; each becomes its own ufw rule.
+    #[serde(default)]
+    pub sources: Option<Vec<String>>,
     pub comment: Option<String>,
+}
+
+/// Most sources one request may name.
+const MAX_SOURCES: usize = 50;
+
+/// The sources a request names: validated, normalised and de-duplicated, in the order given.
+/// Blanks and `any` are dropped, so an empty list means "from anywhere".
+fn parse_sources(single: Option<&str>, many: Option<&[String]>) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    let items = single
+        .into_iter()
+        .chain(many.unwrap_or_default().iter().map(String::as_str));
+    for item in items.flat_map(|s| s.split(|c: char| c == ',' || c.is_whitespace())) {
+        let s = item.trim();
+        if s.is_empty() || s == "any" {
+            continue;
+        }
+        let v = validate::cidr(s)?;
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    if out.len() > MAX_SOURCES {
+        return Err(format!("At most {MAX_SOURCES} addresses per request"));
+    }
+    Ok(out)
 }
 
 fn to_rule(r: &FirewallRule) -> Rule {
@@ -56,27 +86,19 @@ pub async fn add_rule(
     Json(p): Json<CreateRuleRequest>,
 ) -> ApiResult<impl IntoResponse> {
     let block = p.kind.as_deref() == Some("block");
-    let source = match p
-        .source
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && *s != "any")
-    {
-        Some(s) => Some(validate::cidr(s).map_err(ApiError::BadRequest)?),
-        None => None,
-    };
+    let sources = parse_sources(p.source.as_deref(), p.sources.as_deref()).map_err(ApiError::BadRequest)?;
     let comment = validate::short_text(p.comment.as_deref(), 120).map_err(ApiError::BadRequest)?;
-    let rule = if block {
+    // Every rule in a request is this one with a different source: ufw takes one source per rule.
+    let template = if block {
+        if sources.is_empty() {
+            return Err(ApiError::BadRequest("Enter the IP or network to block".into()));
+        }
         Rule {
             action: Action::Deny,
             port: None,
             port_end: None,
             protocol: Protocol::Any,
-            source: Some(
-                source
-                    .clone()
-                    .ok_or_else(|| ApiError::BadRequest("Enter the IP or network to block".into()))?,
-            ),
+            source: None,
         }
     } else {
         let port_s = match &p.port {
@@ -96,57 +118,96 @@ pub async fn add_rule(
             port: Some(port),
             port_end,
             protocol,
-            source: source.clone(),
+            source: None,
         }
+    };
+    let rules: Vec<Rule> = if sources.is_empty() {
+        vec![template]
+    } else {
+        sources
+            .into_iter()
+            .map(|s| Rule {
+                source: Some(s),
+                ..template.clone()
+            })
+            .collect()
     };
 
     // Lockout protection.
-    if rule.action == Action::Deny {
+    if rules[0].action == Action::Deny {
         let ssh = blocking(|| Ok(FirewallService::ssh_ports())).await?;
         let my_ip = admin.0.ip.as_deref().and_then(|i| i.parse().ok());
-        let hits_me = match (&rule.source, my_ip) {
-            (None, _) => true,
-            (Some(src), Some(ip)) => cidr_contains(src, ip),
-            (Some(_), None) => false,
-        };
-        if hits_me && ssh.iter().any(|p| rule.covers_port(*p)) {
-            return Err(ApiError::BadRequest(
-                "Refusing a rule that would block SSH for your own connection".into(),
-            ));
-        }
         // Nothing outside can reach a closed panel port, so a rule there can't lock anyone out.
         let panel = state.config.panel_port().filter(|_| !state.direct_closed);
-        if hits_me && panel.is_some_and(|p| rule.covers_port(p)) {
-            return Err(ApiError::BadRequest(
-                "Refusing a rule that would block the control panel for your own connection. To stop direct access \
-                 to the panel's port, set up a panel hostname and close the port in Settings → Panel certificate."
-                    .into(),
-            ));
+        for rule in &rules {
+            let hits_me = match (&rule.source, my_ip) {
+                (None, _) => true,
+                (Some(src), Some(ip)) => cidr_contains(src, ip),
+                (Some(_), None) => false,
+            };
+            if hits_me && ssh.iter().any(|p| rule.covers_port(*p)) {
+                return Err(ApiError::BadRequest(
+                    "Refusing a rule that would block SSH for your own connection".into(),
+                ));
+            }
+            if hits_me && panel.is_some_and(|p| rule.covers_port(p)) {
+                return Err(ApiError::BadRequest(
+                    "Refusing a rule that would block the control panel for your own connection. To stop direct \
+                     access to the panel's port, set up a panel hostname and close the port in Settings → Panel \
+                     certificate."
+                        .into(),
+                ));
+            }
         }
     }
 
     let created = state
         .db(move |conn| {
-            let new = NewRule {
-                port: rule.port,
-                port_end: rule.port_end,
-                protocol: rule.protocol.as_str(),
-                action: rule.action.as_str(),
-                source: rule.source.as_deref(),
-                comment: comment.as_deref(),
-            };
-            if db::firewall_rule_exists(conn, &new)? {
-                return Err(ApiError::Conflict("That rule already exists".into()));
+            let mut created = Vec::new();
+            let mut applied: Vec<String> = Vec::new();
+            for rule in &rules {
+                let new = NewRule {
+                    port: rule.port,
+                    port_end: rule.port_end,
+                    protocol: rule.protocol.as_str(),
+                    action: rule.action.as_str(),
+                    source: rule.source.as_deref(),
+                    comment: comment.as_deref(),
+                };
+                // Already there: nothing to do for this source.
+                if db::firewall_rule_exists(conn, &new)? {
+                    continue;
+                }
+                // Rules added before a failure stay: each has its own row, matching ufw.
+                if let Err(e) = FirewallService::add(rule, comment.as_deref()) {
+                    return Err(ApiError::Unprocessable(if applied.is_empty() {
+                        e
+                    } else {
+                        format!("{e} (rules for {} were added)", applied.join(", "))
+                    }));
+                }
+                // Adding it removed a rule with the same match and the other action from ufw.
+                db::delete_firewall_rule_with_action(conn, &new, rule.action.opposite().as_str())?;
+                let id = db::create_firewall_rule(conn, &new)?;
+                let desc = format!("{} {}", rule.action.as_str(), rule.spec().join(" "));
+                audit::record(conn, &admin.0, "firewall.add", None, Some(&desc));
+                applied.push(rule.source.clone().unwrap_or_else(|| "anywhere".into()));
+                created.extend(db::find_firewall_rule(conn, id)?);
             }
-            FirewallService::add(&rule, comment.as_deref()).map_err(ApiError::Unprocessable)?;
-            // Adding it removed a rule with the same match and the other action from ufw.
-            db::delete_firewall_rule_with_action(conn, &new, rule.action.opposite().as_str())?;
-            let id = db::create_firewall_rule(conn, &new)?;
-            let desc = format!("{} {}", rule.action.as_str(), rule.spec().join(" "));
-            audit::record(conn, &admin.0, "firewall.add", None, Some(&desc));
-            Ok(db::find_firewall_rule(conn, id)?)
+            if created.is_empty() {
+                return Err(ApiError::Conflict(
+                    if rules.len() == 1 {
+                        "That rule already exists"
+                    } else {
+                        "Those rules already exist"
+                    }
+                    .into(),
+                ));
+            }
+            Ok(created)
         })
         .await?;
+    // A list of the rules added, one per source.
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -274,4 +335,39 @@ async fn ban_or_unban(admin: AdminUser, state: SharedState, p: BanRequest, ban: 
         })
         .await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sources_are_split_normalised_and_deduplicated() {
+        let many = vec!["10.0.0.1, 192.168.1.0/24".to_string(), " 10.0.0.1 ".to_string()];
+        assert_eq!(
+            parse_sources(Some("203.0.113.9\n2001:db8::1"), Some(&many)).unwrap(),
+            vec!["203.0.113.9", "2001:db8::1", "10.0.0.1", "192.168.1.0/24"]
+        );
+        assert!(parse_sources(Some(" any "), Some(&[String::new()])).unwrap().is_empty());
+        assert!(parse_sources(None, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_bad_source_rejects_the_request() {
+        let err = parse_sources(Some("10.0.0.1, 10.0.0.999"), None).unwrap_err();
+        assert!(err.contains("10.0.0.999"), "{err}");
+        assert!(parse_sources(Some("10.0.0.0/33"), None).is_err());
+    }
+
+    #[test]
+    fn too_many_sources_are_refused() {
+        let many: Vec<String> = (1..=MAX_SOURCES + 1)
+            .map(|i| format!("10.0.{}.{}", i / 250, i % 250))
+            .collect();
+        assert!(parse_sources(None, Some(&many)).is_err());
+        assert_eq!(
+            parse_sources(None, Some(&many[..MAX_SOURCES])).unwrap().len(),
+            MAX_SOURCES
+        );
+    }
 }

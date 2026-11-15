@@ -68,6 +68,8 @@ Pass flags after `bash -s --`, e.g. `... | sudo bash -s -- --port 9443`.
 
 The panel checks for new releases daily. When one is out, an administrator can install it from **Services → Updates** with the **Upgrade** button: the panel runs that release's installer on the server, restarts itself (sites keep running; nginx, PHP and the firewall are left alone), and puts the previous version back if the new one doesn't stay up. The installer's output is shown on the page.
 
+**Automatic updates** are on by default: a new final release is installed by itself between 03:00 and 03:59 server time, through the same upgrade and rollback. Turn them off or pick another hour under **Services → Updates**. Pre-releases are never installed automatically, and a version whose upgrade was rolled back isn't tried again until an administrator retries it or a newer release comes out.
+
 Or run the same install command again. It replaces the binary, restarts the service, and keeps your data, secrets and certificate. Adding `--with-mariadb` / `--with-mongodb` / `--with-sqlite` installs and enables that engine.
 
 ### Moving from CloudPanel CE
@@ -102,8 +104,8 @@ sudo cloudpanel user-disable-2fa --username admin
 **Server**
 - **Services**: status and memory of nginx, SSH, cron, fail2ban, Docker, MariaDB/MySQL, MongoDB, UFW and site apps. Start, stop, restart and reload them, and read their journal.
 - **Updates**: check for apt updates (security updates are flagged), install them all, and see when a reboot is required. You can reboot from the panel.
-- **CloudPanel updates**: the panel looks for a new release daily, and you can check any time under *Services → Updates*. A new version is flagged in the sidebar and sent once to your notification channels, along with the command that installs it.
-- **Firewall**: UFW port and port-range rules, optionally limited to a source IP/CIDR, and an IP block list. Rules that would block SSH or the panel for your own address are refused. The most specific rule wins whatever order you add them in: rules naming a source come first, then denies for everyone, then allows for everyone.
+- **CloudPanel updates**: the panel looks for a new release daily, and you can check any time under *Services → Updates*. A new version is flagged in the sidebar and sent once to your notification channels, along with the command that installs it. With automatic updates on (the default), it is then installed in the chosen nightly hour.
+- **Firewall**: UFW port and port-range rules, optionally limited to one or more source IPs/CIDRs (one UFW rule each), and an IP block list. Rules that would block SSH or the panel for your own address are refused. The most specific rule wins whatever order you add them in: rules naming a source come first, then denies for everyone, then allows for everyone.
 - **Panel hostname**: give the panel its own hostname to open it at `https://<hostname>`. You can then close its port in *Settings → Panel certificate*, from a session on that hostname, so that it only listens on loopback. If the hostname can't be served, the port opens again on the next start; otherwise reach it with `ssh -L 8443:127.0.0.1:8443` or reopen it with `cloudpanel panel-access-open`.
 - **Security**: fail2ban jails for SSH and the panel login, with ban time, retries, an ignore list, ban/unban and live status.
 - **VPN**: a WireGuard server with any number of clients. Each client gets its own keys, address and a configuration shown as a QR code or downloaded as a `.conf` file; live status shows who is connected and how much they transferred. Clients can be disabled, renamed or routed for full or split tunnelling, and the UDP port is opened in UFW for you. A server that already runs WireGuard is imported as it is: its keys, peers and custom lines such as `PostUp` are kept, and the original file is saved as `<interface>.conf.pre-cloudpanel` before the panel first rewrites it.

@@ -5,8 +5,16 @@ import {
 } from '../core.js';
 
 VALIDATORS.portrange = (v) => (/^\d{1,5}([:-]\d{1,5})?$/.test(v) ? '' : 'A port (443) or range (6000:6010)');
-VALIDATORS.optionalCidr = (v) => (!v || /^[0-9a-fA-F:.]+(\/\d{1,3})?$/.test(v) ? '' : 'An IP address or CIDR, e.g. 203.0.113.0/24');
-VALIDATORS.cidr = (v) => (/^[0-9a-fA-F:.]+(\/\d{1,3})?$/.test(v) ? '' : 'An IP address or CIDR, e.g. 203.0.113.9');
+const CIDR_RE = /^[0-9a-fA-F:.]+(\/\d{1,3})?$/;
+/** Addresses or networks separated by commas, spaces or new lines. */
+const splitSources = (v) => (v || '').split(/[\s,]+/).filter(Boolean);
+const badSource = (v) => splitSources(v).find((s) => !CIDR_RE.test(s));
+VALIDATORS.fwSourcesOptional = (v) => {
+  const bad = badSource(v);
+  return bad ? `"${bad}" is not an IP address or CIDR, e.g. 203.0.113.0/24` : '';
+};
+VALIDATORS.fwSources = (v) => (splitSources(v).length ? VALIDATORS.fwSourcesOptional(v) : 'An IP address or CIDR, e.g. 203.0.113.9');
+const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
 function describe(r) {
   if (r.port == null) return 'All traffic';
@@ -75,12 +83,13 @@ function addRuleDialog(done) {
         field({ label: 'Port or range', name: 'port', placeholder: '3306 or 6000:6010', validate: 'portrange', attrs: { inputmode: 'numeric' } }),
         selectField({ label: 'Protocol', name: 'protocol', value: 'tcp', options: [['tcp', 'TCP'], ['udp', 'UDP'], ['any', 'Any']] }),
         selectField({ label: 'Action', name: 'action', value: 'allow', options: [['allow', 'Allow'], ['deny', 'Deny']] })),
-      field({ label: 'From (optional)', name: 'source', placeholder: 'Anywhere, or 203.0.113.0/24', validate: 'optionalCidr', hint: 'Limit the rule to one IP address or network.' }),
+      field({ label: 'From (optional)', name: 'source', placeholder: 'Anywhere, or 203.0.113.10, 198.51.100.0/24', validate: 'fwSourcesOptional', hint: 'Limit the rule to one or more IP addresses or networks, separated by commas. Each gets its own rule.' }),
       field({ label: 'Comment (optional)', name: 'comment', placeholder: 'e.g. MySQL for app server', attrs: { maxlength: 120 } }),
     ],
     async onSubmit(d) {
-      await api('/firewall/rules', { method: 'POST', body: { kind: 'port', port: d.port, protocol: d.protocol, action: d.action, source: d.source || null, comment: d.comment || null } });
-      toast(`Rule added for ${d.port}`);
+      const sources = splitSources(d.source);
+      const added = await api('/firewall/rules', { method: 'POST', body: { kind: 'port', port: d.port, protocol: d.protocol, action: d.action, sources, comment: d.comment || null } });
+      toast(sources.length > 1 ? `${plural(added.length, 'rule')} added for ${d.port}` : `Rule added for ${d.port}`);
       done();
     },
   });
@@ -88,15 +97,16 @@ function addRuleDialog(done) {
 
 function blockDialog(done) {
   formDialog({
-    title: 'Block an IP address', description: 'All traffic from the address or network is dropped. The rule is placed first.',
+    title: 'Block IP addresses', description: 'All traffic from these addresses or networks is dropped. The rules are placed first.',
     submitText: 'Block',
     content: [
-      field({ label: 'IP or network', name: 'source', placeholder: '203.0.113.9', validate: 'cidr' }),
+      field({ label: 'IPs or networks', name: 'source', placeholder: '203.0.113.9, 198.51.100.0/24', validate: 'fwSources', hint: 'Separate several with commas. Each gets its own rule.' }),
       field({ label: 'Comment (optional)', name: 'comment', attrs: { maxlength: 120 } }),
     ],
     async onSubmit(d) {
-      await api('/firewall/rules', { method: 'POST', body: { kind: 'block', source: d.source, comment: d.comment || null } });
-      toast(`${d.source} blocked`);
+      const sources = splitSources(d.source);
+      const added = await api('/firewall/rules', { method: 'POST', body: { kind: 'block', sources, comment: d.comment || null } });
+      toast(sources.length > 1 ? `${plural(added.length, 'address', 'addresses')} blocked` : `${sources[0]} blocked`);
       done();
     },
   });
