@@ -424,7 +424,9 @@ pub fn run(
     // CE's sshd_config has no Include for sshd_config.d, so keys added in the panel would be
     // ignored. The import runs as root, outside the panel's sandbox, so it can add it.
     if let Err(e) = sysusers::ensure_sshd_dropin(config) {
-        report.notes.push(format!("SSH keys added in the panel won't work until this is fixed: {e}"));
+        report.notes.push(format!(
+            "SSH keys added in the panel won't work until this is fixed: {e}"
+        ));
     }
     // Lets the panel manage SSH keys for the imported accounts. Group membership doesn't affect
     // anything the sites do, and a failure here only matters for that later.
