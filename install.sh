@@ -946,8 +946,21 @@ configure() {
   install -d -m 0755 /etc/ssh/sshd_config.d /etc/ssh/cloudpanel_keys
   getent group cloudpanel-users >/dev/null || groupadd cloudpanel-users
   getent group cloudpanel-sftp >/dev/null || groupadd cloudpanel-sftp
-  if ! grep -Eq '^\s*Include\s+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config 2>/dev/null; then
-    warn "/etc/ssh/sshd_config does not include sshd_config.d; SFTP-only users will not be enforced"
+  # SSH keys and SFTP-only users live in a drop-in. CloudPanel CE ships an sshd_config without
+  # this Include, so add it at the top (before any Match block) and keep the old file if sshd rejects it.
+  if [ -f /etc/ssh/sshd_config ] && ! grep -Eq '^\s*Include\s+"?/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config; then
+    cp -p /etc/ssh/sshd_config /etc/ssh/sshd_config.cloudpanel-bak
+    { printf '# Added by CloudPanel: SSH keys and SFTP-only users are configured here\nInclude /etc/ssh/sshd_config.d/*.conf\n\n'
+      cat /etc/ssh/sshd_config.cloudpanel-bak; } > /etc/ssh/sshd_config.cloudpanel-new
+    chmod 644 /etc/ssh/sshd_config.cloudpanel-new
+    mv -f /etc/ssh/sshd_config.cloudpanel-new /etc/ssh/sshd_config
+    if sshd -t 2>/dev/null; then
+      systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+      info "added Include for /etc/ssh/sshd_config.d to /etc/ssh/sshd_config"
+    else
+      mv -f /etc/ssh/sshd_config.cloudpanel-bak /etc/ssh/sshd_config
+      warn "/etc/ssh/sshd_config does not include sshd_config.d; SSH keys added in the panel will not work"
+    fi
   fi
   # Reload nginx after certbot renews a certificate.
   install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy

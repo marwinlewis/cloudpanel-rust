@@ -41,6 +41,30 @@ pub fn group_exists(group: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// `user` is listed as a supplementary member of `group` in /etc/group.
+pub fn in_group(user: &str, group: &str) -> bool {
+    fs::read_to_string("/etc/group")
+        .map(|p| {
+            p.lines().any(|l| {
+                let mut f = l.split(':');
+                f.next() == Some(group) && f.nth(2).is_some_and(|m| m.split(',').any(|x| x.trim() == user))
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Put `user` in the panel's users group so sshd reads its keys from the panel's key file
+/// (the `Match Group` block of the drop-in). Accounts imported from CE start outside it.
+pub fn ensure_panel_member(user: &str) -> Result<(), String> {
+    if !cfg!(unix) || !user_exists(user) || in_group(user, USERS_GROUP) {
+        return Ok(());
+    }
+    ensure_groups()?;
+    sys("gpasswd", &["-a", user, USERS_GROUP], &CmdOpts::default())?;
+    info!("added {user} to {USERS_GROUP}");
+    Ok(())
+}
+
 fn ensure_groups() -> Result<(), String> {
     for g in [USERS_GROUP, SFTP_GROUP] {
         if cfg!(unix) && !group_exists(g) {
@@ -326,17 +350,62 @@ pub fn render_sshd_dropin(keys_dir: &Path) -> String {
     )
 }
 
-/// Install the sshd drop-in once; validated with `sshd -t` and rolled back on failure.
+/// `sshd_config` already has an `Include` that pulls in files from `dropin_dir`.
+fn includes_dropin_dir(sshd_config: &str, dropin_dir: &Path) -> bool {
+    let dir = dropin_dir.to_string_lossy();
+    let dir = dir.trim_end_matches('/');
+    sshd_config.lines().any(|l| {
+        let mut w = l.split_whitespace();
+        w.next().is_some_and(|k| k.eq_ignore_ascii_case("include"))
+            && w.any(|p| p.trim_matches('"').starts_with(&format!("{dir}/")))
+    })
+}
+
+/// Put an `Include` for the drop-in directory at the top of `sshd_config` (before any `Match`,
+/// which would otherwise scope it). CE ships an sshd_config without one, so on migrated
+/// servers sshd never read the drop-in and keys added in the panel were ignored.
+pub fn with_dropin_include(sshd_config: &str, dropin_dir: &Path) -> Option<String> {
+    if includes_dropin_dir(sshd_config, dropin_dir) {
+        return None;
+    }
+    Some(format!(
+        "# Added by CloudPanel: SSH keys and SFTP-only users are configured here\nInclude {}/*.conf\n\n{sshd_config}",
+        dropin_dir.to_string_lossy().trim_end_matches('/')
+    ))
+}
+
+/// Install the sshd drop-in (and the `Include` that loads it); validated with `sshd -t` and
+/// rolled back on failure.
 pub fn ensure_sshd_dropin(config: &Config) -> Result<(), String> {
     let dir = &config.sshd_config_dir;
     let path = dir.join(DROPIN_FILE);
     let body = render_sshd_dropin(&keys_dir(config));
     let previous = fs::read_to_string(&path).ok();
-    if previous.as_deref() == Some(body.as_str()) {
+    let main_path = dir
+        .parent()
+        .map(|p| p.join("sshd_config"))
+        .unwrap_or_else(|| PathBuf::from("/etc/ssh/sshd_config"));
+    let main_previous = fs::read_to_string(&main_path).ok();
+    let main_new = main_previous.as_deref().and_then(|m| with_dropin_include(m, dir));
+    if previous.as_deref() == Some(body.as_str()) && main_new.is_none() {
         return Ok(());
     }
     fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     write_atomic(&path, body.as_bytes(), 0o644).map_err(|e| format!("write {}: {e}", path.display()))?;
+    if let Some(m) = &main_new {
+        // The panel service can't write /etc/ssh (systemd sandbox); the installer and the CE
+        // import, which run as root, add it. Saying so beats keys that silently don't work.
+        write_atomic(&main_path, m.as_bytes(), 0o644).map_err(|e| {
+            format!(
+                "{} doesn't load {}, so SSH keys added here would be ignored, and it couldn't be \
+                 updated ({e}). Add the line 'Include {}/*.conf' at the top of it and reload ssh.",
+                main_path.display(),
+                dir.display(),
+                dir.display()
+            )
+        })?;
+        info!("added Include for {} to {}", dir.display(), main_path.display());
+    }
     let test = run_with("sshd", &["-t"], &CmdOpts::default());
     if !test.missing && !test.success() {
         match previous {
@@ -346,6 +415,9 @@ pub fn ensure_sshd_dropin(config: &Config) -> Result<(), String> {
             None => {
                 let _ = fs::remove_file(&path);
             }
+        }
+        if let (Some(_), Some(m)) = (&main_new, &main_previous) {
+            let _ = write_atomic(&main_path, m.as_bytes(), 0o644);
         }
         return Err(format!("sshd rejected the configuration: {}", test.combined().trim()));
     }
@@ -371,6 +443,20 @@ mod tests {
         assert!(s.contains("ForceCommand internal-sftp"));
         assert!(s.contains("AuthorizedKeysFile .ssh/authorized_keys /etc/ssh/cloudpanel_keys/%u"));
         assert!(s.trim_end().ends_with("Match all"));
+    }
+
+    #[test]
+    fn adds_include_to_ce_sshd_config() {
+        let d = Path::new("/etc/ssh/sshd_config.d");
+        let ce = "PasswordAuthentication yes\nDenyUsers clp\n";
+        let out = with_dropin_include(ce, d).expect("CE config has no Include");
+        assert!(out.starts_with("# Added by CloudPanel"));
+        assert!(out.contains("\nInclude /etc/ssh/sshd_config.d/*.conf\n"));
+        assert!(out.ends_with(ce));
+        assert_eq!(with_dropin_include(&out, d), None, "idempotent");
+        let debian = "Include /etc/ssh/sshd_config.d/*.conf\nKbdInteractiveAuthentication no\n";
+        assert_eq!(with_dropin_include(debian, d), None);
+        assert!(with_dropin_include("#Include /etc/ssh/sshd_config.d/*.conf\n", d).is_some());
     }
 
     #[test]

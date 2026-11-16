@@ -24,6 +24,9 @@ fn sync_keys(config: &Config, conn: &Connection, u: &SshUser) -> ApiResult<()> {
         .into_iter()
         .map(|k| k.public_key)
         .collect();
+    if !keys.is_empty() {
+        sysusers::ensure_panel_member(&u.username).map_err(ApiError::Unprocessable)?;
+    }
     sysusers::write_authorized_keys(config, &u.username, &keys).map_err(ApiError::internal)
 }
 
