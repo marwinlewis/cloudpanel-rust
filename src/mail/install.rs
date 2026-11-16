@@ -432,7 +432,11 @@ pub async fn install(
     log("Getting a TLS certificate");
     // Re-runs (panel upgrades) reuse the address given the first time, and keep a working
     // Let's Encrypt certificate rather than falling back to a self-signed one.
-    let email = opts.email.clone().or_else(|| super::env("CLOUDPANEL_MAIL_ACME_EMAIL")).unwrap_or_default();
+    let email = opts
+        .email
+        .clone()
+        .or_else(|| super::env("CLOUDPANEL_MAIL_ACME_EMAIL"))
+        .unwrap_or_default();
     let existing_le = match (&mc.cert_source, &mc.key_source) {
         (Some(c), Some(k)) if c.starts_with("/etc/letsencrypt") && c.exists() && k.exists() && mc.hostname == host => {
             Some((c.clone(), k.clone()))
@@ -444,7 +448,9 @@ pub async fn install(
             log(&format!("{why}; keeping the current Let's Encrypt certificate."));
             return Ok(pair);
         }
-        log(&format!("{why}; using a self-signed certificate for now. Run cloudpanel mail-install again to replace it."));
+        log(&format!(
+            "{why}; using a self-signed certificate for now. Run cloudpanel mail-install again to replace it."
+        ));
         self_signed(log, host)
     };
     let (cert, key) = if opts.self_signed {
