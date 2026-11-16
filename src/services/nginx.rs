@@ -12,6 +12,7 @@ pub struct NginxService;
 /// File name of the panel's own nginx site. It can't collide with a site: domains have a dot.
 const PANEL_VHOST: &str = "cloudpanel-panel";
 const S3_VHOST: &str = "cloudpanel-s3";
+const MAIL_VHOST: &str = crate::mail::VHOST;
 
 /// What the panel's own nginx site needs. All values come from the panel itself.
 pub struct PanelVhost {
@@ -955,6 +956,18 @@ server {{
     /// certificate cover every bucket. Signatures cover the Host header, so it is passed as is,
     /// and bodies stream straight through: S3 objects can be any size.
     pub fn render_s3_vhost(config: &Config, hostname: &str, cert: &str, key: &str, upstream: &str) -> String {
+        Self::render_proxy_vhost(config, hostname, cert, key, upstream, "0")
+    }
+
+    /// An HTTPS reverse proxy for one hostname, as used by object storage and the email API.
+    fn render_proxy_vhost(
+        config: &Config,
+        hostname: &str,
+        cert: &str,
+        key: &str,
+        upstream: &str,
+        max_body: &str,
+    ) -> String {
         format!(
             r#"# Managed by CloudPanel - changes will be overwritten
 server {{
@@ -986,7 +999,7 @@ server {{
     access_log {log}/{hostname}.access.log;
     error_log {log}/{hostname}.error.log;
 
-    client_max_body_size 0;
+    client_max_body_size {max_body};
 
     location / {{
         proxy_pass http://{upstream};
@@ -1016,6 +1029,25 @@ server {{
     ) -> Result<(), String> {
         let content = Self::render_s3_vhost(config, hostname, cert, key, upstream);
         Self::install_vhost(config, S3_VHOST, &content, 0o644)
+    }
+
+    /// The public HTTPS endpoint for the email sending API.
+    pub fn apply_mail_vhost(
+        config: &Config,
+        hostname: &str,
+        cert: &str,
+        key: &str,
+        upstream: &str,
+    ) -> Result<(), String> {
+        let content = Self::render_proxy_vhost(config, hostname, cert, key, upstream, "40m");
+        Self::install_vhost(config, MAIL_VHOST, &content, 0o644)
+    }
+
+    pub fn remove_mail_vhost(config: &Config) -> Result<(), String> {
+        if Self::paths(config, MAIL_VHOST).0.symlink_metadata().is_err() {
+            return Ok(());
+        }
+        Self::remove_site(config, MAIL_VHOST)
     }
 
     pub fn remove_s3_vhost(config: &Config) -> Result<(), String> {

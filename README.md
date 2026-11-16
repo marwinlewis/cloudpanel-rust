@@ -1,6 +1,6 @@
 # CloudPanel (Rust Edition)
 
-A lightweight, self-contained server control panel written in Rust. One static binary serves the web UI and API and manages everything a VPS needs: sites with their own Linux users, supervised Node.js/Python apps, nginx, Let's Encrypt, databases, files, backups, services, updates, Docker, the firewall, fail2ban, a WireGuard VPN, S3-compatible object storage (Garage), cron and alerts.
+A lightweight, self-contained server control panel written in Rust. One static binary serves the web UI and API and manages everything a VPS needs: sites with their own Linux users, supervised Node.js/Python apps, nginx, Let's Encrypt, databases, files, backups, services, updates, Docker, the firewall, fail2ban, a WireGuard VPN, S3-compatible object storage (Garage), an optional email sending service, cron and alerts.
 
 - **Single binary**: the UI is embedded with `rust-embed`, and there are no PHP, Node or Python runtimes to maintain.
 - **Small footprint**: Tokio + Axum + embedded SQLite.
@@ -54,6 +54,10 @@ Then open `https://<server-ip>:8443`. Your browser will warn about the self-sign
 | `--no-wireguard` | Don't install WireGuard, and don't ask |
 | `--with-garage` | Install Garage S3-compatible object storage for the Object Storage page (asked if you're at a terminal) |
 | `--no-garage` | Don't install Garage, and don't ask |
+| `--with-mail` | Install the [email sending service](#email-sending-service) (asked if you're at a terminal; off otherwise) |
+| `--no-mail` | Don't install the email service, and don't ask |
+| `--mail-hostname H` | Its hostname, e.g. `mail.example.com` (needed with `--with-mail` unless asked) |
+| `--mail-email ADDR` | Address for its Let's Encrypt certificate (self-signed until given) |
 | `--no-upgrade` | Never upgrade packages that are already installed |
 | `--no-fail2ban` | Don't install fail2ban |
 | `--port N` | Panel port (default `8443`) |
@@ -110,6 +114,7 @@ sudo cloudpanel user-disable-2fa --username admin
 - **Security**: fail2ban jails for SSH and the panel login, with ban time, retries, an ignore list, ban/unban and live status.
 - **VPN**: a WireGuard server with any number of clients. Each client gets its own keys, address and a configuration shown as a QR code or downloaded as a `.conf` file; live status shows who is connected and how much they transferred. Clients can be disabled, renamed or routed for full or split tunnelling, and the UDP port is opened in UFW for you. A server that already runs WireGuard is imported as it is: its keys, peers and custom lines such as `PostUp` are kept, and the original file is saved as `<interface>.conf.pre-cloudpanel` before the panel first rewrites it.
 - **Object storage**: [Garage](https://garagehq.deuxfleurs.fr/), an S3-compatible store, installed at setup or later from the panel. The panel downloads a pinned release, checks it against a SHA-256 built into the panel, and runs it as its own sandboxed `garage` service that listens on 127.0.0.1 only. Create buckets with optional size and object limits, and one access key per app, and give each key read, write or owner access to the buckets it needs. Secrets are shown once and never stored. A bucket or key can belong to a site, whose managers then manage it from the site's Buckets tab. An optional public hostname is served by nginx over HTTPS with a Let's Encrypt certificate (path-style URLs, region `us-east-1`). Removing CloudPanel leaves the stored data in `/var/lib/garage`.
+- **Email sending** (optional, no UI): a service like Resend on your own server. Verify a domain, create API keys, then send through SMTP (Gmail's "Send mail as" works) or an HTTP API, with DKIM signing, delivery tracking, webhooks and forwarding of incoming mail to Gmail. See [Email sending service](#email-sending-service).
 - **Cron**: create, edit, pause and run jobs now. Every run's exit code and output are recorded, and jobs can be tied to a site and run as its user.
 - **Containers**: list, start/stop/restart, logs, stats and removal. Run new containers from a form (ports are bound to 127.0.0.1 by default), manage images (pull/remove/prune), handle Docker Compose stacks, and expose a container on a domain.
 - **Overview**: live CPU, memory, disk and network graphs, top processes, public IPs and pending updates.
@@ -146,7 +151,8 @@ Taken from a real install on a Debian 13 test container, with demo sites and dat
 | CSRF | State-changing requests need a custom header and a same-origin `Origin`/`Sec-Fetch-Site`. No CORS. |
 | Input | Domains, ports, emails, users, keys, CIDRs, database identifiers, image names, paths and cron schedules are validated against strict allow-lists before they reach a config file, the filesystem or a command line. Commands run via `execve`, never through a shell (cron commands and app start commands are deliberately run by `/bin/sh` as the configured user). |
 | nginx / sshd / fail2ban | Every change is tested (`nginx -t`, `sshd -t`, `fail2ban-client -t`) and rolled back if rejected. |
-| Secrets | Database and SSH passwords are never stored. S3 keys, SMTP passwords and webhook URLs are encrypted with ChaCha20-Poly1305 using a key in `/etc/cloudpanel/secret.key` (mode 600). |
+| Secrets | Database and SSH passwords are never stored. S3 keys, SMTP passwords and webhook URLs are encrypted with ChaCha20-Poly1305 using a key in `/etc/cloudpanel/secret.key` (mode 600). Email API keys are stored only as SHA-256 hashes; DKIM private keys are readable only by the email service's own user. |
+| Email service | Optional. Runs as its own unprivileged `cloudpanel-mail` user (only `CAP_NET_BIND_SERVICE`, `ProtectSystem=strict`), never as root, with its own database. SMTP login works only after TLS, with an API key, and from a verified domain the key may use; 5 failed logins lock an address out for 15 minutes. Postfix only accepts mail for forwarding addresses on port 25, never relays, and only root and the service may submit mail locally. |
 | Browser | Strict CSP (`default-src 'self'`, no inline scripts or styles), `X-Frame-Options: DENY` and `nosniff`. The UI never inserts server data as HTML; the 2FA QR code is drawn from a module matrix. |
 | Audit | Sign-ins (including failures) and every change are recorded with user, IP and time. |
 | Behind Cloudflare | On the panel's hostname and its own port, `CF-Connecting-IP` names the client only on a connection from Cloudflare's published address ranges. Anyone else's copy of the header is ignored, so servers not using Cloudflare behave the same. The ranges are fetched from Cloudflare's API daily and rejected if implausible. A built-in copy is used until the first fetch succeeds, and **Settings → Panel certificate** shows the list's age. |
@@ -155,6 +161,62 @@ Taken from a real install on a Debian 13 test container, with demo sites and dat
 > **The panel is root-equivalent.** Any administrator can run commands as any user through cron jobs, containers and custom nginx directives. Use strong passwords, enable 2FA, and consider limiting the panel port to your IP: `ufw delete allow 8443/tcp && ufw allow from <your-ip> to any port 8443 proto tcp`.
 
 > **Docker and UFW:** ports published by Docker on 0.0.0.0 bypass UFW. The panel binds published ports to `127.0.0.1` by default. Expose containers through a site instead.
+
+## Email sending service
+
+An optional service, managed from the command line only, that works like [Resend](https://resend.com) on your own server:
+
+- **SMTP** on `587` (STARTTLS) and `465` (SSL/TLS). Username `cloudpanel`, password = an API key. Use it in Gmail's **Send mail as**, or any app's SMTP settings.
+- **HTTP API** at `https://<mail hostname>/emails`, with the same request shape as Resend's (`from`, `to`, `cc`, `bcc`, `reply_to`, `subject`, `html`, `text`, `headers`, `attachments`), plus `/emails/batch` and `GET /emails/{id}`. Existing Resend clients work by changing the base URL.
+- Every email is **DKIM-signed** and logged with its delivery status (`sent`, `delivered`, `delivery_delayed`, `bounced`), kept for 30 days.
+- **Webhooks** for those events, signed with `svix-*` headers like Resend's.
+- **Forwarding**: mail to an address on your domain goes on to another mailbox, e.g. Gmail. Forwarded mail is rewritten with SRS so it passes SPF.
+
+Postfix does the queueing, retries and delivery. The service hands it signed mail and follows its log.
+
+### Set up
+
+```bash
+# 1. Install (or pick it during install.sh). Point mail.example.com's A record here first for Let's Encrypt.
+cloudpanel mail-install --hostname mail.example.com --email you@example.com
+
+# 2. Add your domain, then publish the DKIM, SPF, MX and DMARC records it prints.
+cloudpanel mail-domain-add --domain example.com
+cloudpanel mail-domain-verify --domain example.com
+
+# 3. Receive mail for your address in Gmail (Gmail sends its verification code there).
+cloudpanel mail-forward-add --address you@example.com --to you@gmail.com
+
+# 4. Create a key. It prints the Gmail settings and a curl example.
+cloudpanel mail-key-create --name gmail --domain example.com
+```
+
+In Gmail: **Settings → Accounts and Import → Send mail as → Add another email address**, enter `you@example.com`, then SMTP server `mail.example.com`, port `587` (TLS) or `465` (SSL), username `cloudpanel`, and the key as the password.
+
+Also set the server's **reverse DNS (PTR)** to the mail hostname at your provider. Many providers (DigitalOcean, AWS, Google Cloud, new Hetzner accounts) block outbound port 25 until you ask; `cloudpanel mail-status` checks it.
+
+### Send through the API
+
+```bash
+curl -X POST https://mail.example.com/emails   -H 'Authorization: Bearer cp_…' -H 'Content-Type: application/json'   -d '{"from": "Acme <hi@example.com>", "to": ["someone@example.org"], "subject": "Hello", "html": "<p>Hi</p>"}'
+```
+
+### Commands
+
+```bash
+cloudpanel mail-install --hostname H [--email ADDR] [--self-signed]   # install or update
+cloudpanel mail-status                                                # services, ports, outbound :25
+cloudpanel mail-domain-add|mail-domain-verify|mail-dns|mail-domain-remove --domain D
+cloudpanel mail-domain-list
+cloudpanel mail-key-create --name N [--domain D] [--permission sending|full] [--hourly-limit 500]
+cloudpanel mail-key-list | mail-key-revoke --id ID
+cloudpanel mail-forward-add --address A --to B | mail-forward-list | mail-forward-remove --address A
+cloudpanel mail-webhook-add --url https://… [--events email.bounced,email.delivered] | mail-webhook-list | mail-webhook-remove --id ID
+cloudpanel mail-log [--limit 50] [--status bounced] [--id EMAIL_ID]
+cloudpanel mail-uninstall                                             # removes the service; keeps Postfix and data
+```
+
+A `sending` key can send and read its own emails; a `full` key can read every email's status. Each key has an hourly limit (default 500).
 
 ## Configuration
 
@@ -198,6 +260,7 @@ cloudpanel site-add --domain api.example.com --site-type nodejs --port 3000 [--n
 cloudpanel site-list
 cloudpanel panel-access-open                        # reopen the panel's port after closing it in Settings
 cloudpanel cron-run <id>                            # used by /etc/cron.d/cloudpanel
+cloudpanel mail-…                                   # email service, see "Email sending service"
 ```
 
 The old `user:add`-style names still work as aliases.

@@ -168,7 +168,7 @@ fn mysql(sql: &str) -> Result<String, String> {
 const MONGO_PRELUDE: &str = "const a = JSON.parse(process.env.CP_ARGS); \
     const conn = new Mongo('mongodb://127.0.0.1:27017'); \
     const admin = conn.getDB('admin'); \
-    if (process.env.CP_MONGO_USER) { admin.auth(process.env.CP_MONGO_USER, process.env.CP_MONGO_PASSWORD); } ";
+    if (process.env.CP_MONGO_USER) { admin.auth({ user: process.env.CP_MONGO_USER, pwd: process.env.CP_MONGO_PASSWORD }); } ";
 
 fn mongo_creds(config: &Config) -> (String, String) {
     let path = config.etc_dir.join("mongodb.env");

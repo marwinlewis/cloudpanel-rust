@@ -1,7 +1,7 @@
 'use strict';
 import {
   api, card, confirmDialog, emptyState, errorState, field, jobDialog, fmtAgo, fmtBytes, fmtDate, formDialog, h, icon, isAdmin,
-  kv, moreButton, openDialog, runJob, secretDialog, selectField, setActions, setSub, skeletonRows, table, tabStrip,
+  kv, moreButton, openDialog, runJob, secretDialog, selectField, setActions, setSub, skeletonRows, store, table, tabStrip,
   toast, typedConfirm, withBusy, VALIDATORS,
 } from '../core.js';
 import { SITE_TABS } from './site-tabs.js';
@@ -49,6 +49,29 @@ function appBadge(app) {
 // Site list
 // ======================================================================
 
+/** Second-level suffixes where the registrable domain has three labels (example.co.uk). */
+const TWO_PART_SUFFIXES = new Set(['co.uk', 'org.uk', 'ac.uk', 'com.au', 'net.au', 'co.nz', 'co.in', 'com.br', 'co.jp', 'co.za', 'com.sg', 'com.my']);
+
+/** The registrable domain a site belongs to, used to group subdomains under it. */
+export function groupKey(domain) {
+  const labels = domain.toLowerCase().replace(/^www\./, '').split('.');
+  const n = TWO_PART_SUFFIXES.has(labels.slice(-2).join('.')) ? 3 : 2;
+  return labels.slice(-n).join('.');
+}
+
+/** Sites grouped by registrable domain: Map<key, { parent, children }>, sorted by key, children by domain. */
+function groupSites(sites) {
+  const map = new Map();
+  for (const s of sites) {
+    const key = groupKey(s.domain);
+    if (!map.has(key)) map.set(key, { parent: null, children: [] });
+    const g = map.get(key);
+    if (s.domain.replace(/^www\./, '') === key && !g.parent) g.parent = s; else g.children.push(s);
+  }
+  for (const g of map.values()) g.children.sort((a, b) => a.domain.localeCompare(b.domain));
+  return new Map([...map].sort(([a], [b]) => a.localeCompare(b)));
+}
+
 export function renderSites(view, params) {
   if (params && params[0]) return renderSiteDetail(view, Number(params[0]), params[1] || 'overview');
   let sites = [];
@@ -82,35 +105,72 @@ export function renderSites(view, params) {
       return;
     }
     holder.replaceChildren(tableEl);
-    const list = sites.filter((s) => s.domain.includes(query) || s.site_type.includes(query));
-    if (!list.length) {
+    const matches = (s) => s.domain.includes(query) || s.site_type.includes(query);
+    const groups = groupSites(sites);
+    const rows = [];
+    for (const [key, g] of groups) {
+      const members = g.parent ? [g.parent, ...g.children] : g.children;
+      if (query && !members.some(matches)) continue;
+      // A lone site, with or without its parent domain, renders as a plain row.
+      if (members.length === 1) { rows.push(siteRow(members[0])); continue; }
+      const kids = query ? g.children.filter(matches) : g.children;
+      const saved = store.get(`sites.open.${key}`) === '1';
+      let open = query ? true : saved;
+      const n = g.children.length;
+      const childRows = kids.map((c) => siteRow(c, { child: true }));
+      childRows.forEach((r) => { r.hidden = !open; });
+      const toggle = h('button', {
+        class: 'icon-btn site-toggle', type: 'button',
+        'aria-expanded': String(open), 'aria-controls': kids.map((c) => `site-row-${c.id}`).join(' ') || null,
+        'aria-label': `Show ${n} subdomain${n === 1 ? '' : 's'} of ${key}`,
+        onclick: () => {
+          open = !open;
+          toggle.setAttribute('aria-expanded', String(open));
+          toggle.setAttribute('aria-label', `${open ? 'Hide' : 'Show'} ${n} subdomain${n === 1 ? '' : 's'} of ${key}`);
+          childRows.forEach((r) => { r.hidden = !open; });
+          if (!query) store.set(`sites.open.${key}`, open ? '1' : null);
+        },
+      }, icon('chevron'));
+      if (open) toggle.setAttribute('aria-label', `Hide ${n} subdomain${n === 1 ? '' : 's'} of ${key}`);
+      const more = h('span', { class: 'badge site-count', title: `${n} subdomain${n === 1 ? '' : 's'}`, text: `+${n}` });
+      const head = g.parent ? siteRow(g.parent, { toggle, more }) : h('tr', { class: 'site-group' },
+        h('td', { colspan: 6 },
+          h('div', { class: 'cell-title' }, toggle, h('span', { class: 'muted', text: `${key} · ${n} site${n === 1 ? '' : 's'}` }))));
+      rows.push(head, ...childRows);
+    }
+    if (!rows.length) {
       tbody.replaceChildren(h('tr', null, h('td', { colspan: 6, class: 'muted', text: `No sites match “${query}”.` })));
       return;
     }
-    tbody.replaceChildren(...list.map((s) => {
-      const t = SITE_TYPES[s.site_type] || { label: s.site_type };
-      const url = `${s.ssl_enabled ? 'https' : 'http'}://${s.domain}`;
-      const items = [
-        { icon: 'settings', label: 'Manage', action: () => { location.hash = `#/sites/${s.id}`; } },
-        { icon: 'external', label: 'Open site', action: () => window.open(url, '_blank', 'noopener,noreferrer') },
-      ];
-      if (isAdmin()) items.push('-', { icon: 'trash', label: 'Delete site', danger: true, action: () => deleteSite(s, load) });
-      return h('tr', null,
-        h('td', null,
-          h('div', { class: 'cell-title' }, h('a', { href: `#/sites/${s.id}`, text: s.domain })),
-          s.include_www && h('div', { class: 'cell-sub', text: wwwLabel(s) })),
-        h('td', null, h('span', { class: 'badge', text: t.label })),
-        h('td', { class: 'hide-sm mono muted truncate', text: HAS_ROOT.has(s.site_type) ? (s.document_root || '') : `127.0.0.1:${s.target_port}` }),
-        h('td', null, statusBadge(s)),
-        h('td', { class: 'hide-sm muted nowrap', title: fmtDate(s.created_at), text: fmtAgo(s.created_at) }),
-        h('td', { class: 'actions' }, moreButton(items)));
-    }));
+    tbody.replaceChildren(...rows);
+  }
+
+  function siteRow(s, { child = false, toggle = null, more = null } = {}) {
+    const t = SITE_TYPES[s.site_type] || { label: s.site_type };
+    const url = `${s.ssl_enabled ? 'https' : 'http'}://${s.domain}`;
+    const items = [
+      { icon: 'settings', label: 'Manage', action: () => { location.hash = `#/sites/${s.id}`; } },
+      { icon: 'external', label: 'Open site', action: () => window.open(url, '_blank', 'noopener,noreferrer') },
+    ];
+    if (isAdmin()) items.push('-', { icon: 'trash', label: 'Delete site', danger: true, action: () => deleteSite(s, load) });
+    return h('tr', { id: `site-row-${s.id}`, class: child ? 'site-child' : null },
+      h('td', { class: 'site-domain' },
+        h('div', { class: 'cell-title' },
+          child ? null : toggle || h('span', { class: 'site-toggle-spacer', 'aria-hidden': 'true' }),
+          h('a', { href: `#/sites/${s.id}`, text: s.domain }), more),
+        s.include_www && h('div', { class: 'cell-sub', text: wwwLabel(s) })),
+      h('td', null, h('span', { class: 'badge', text: t.label })),
+      h('td', { class: 'hide-sm mono muted truncate', text: HAS_ROOT.has(s.site_type) ? (s.document_root || '') : `127.0.0.1:${s.target_port}` }),
+      h('td', null, statusBadge(s)),
+      h('td', { class: 'hide-sm muted nowrap', title: fmtDate(s.created_at), text: fmtAgo(s.created_at) }),
+      h('td', { class: 'actions' }, moreButton(items)));
   }
 
   async function load() {
     try {
       sites = await api('/sites');
-      setSub(`${sites.length} site${sites.length === 1 ? '' : 's'}`);
+      const m = groupSites(sites).size;
+      setSub(`${sites.length} site${sites.length === 1 ? '' : 's'} in ${m} domain${m === 1 ? '' : 's'}`);
       draw();
     } catch (e) {
       if (e.status !== 401) holder.replaceChildren(errorState(e.message, load));

@@ -6,6 +6,7 @@ mod config;
 mod db;
 mod fsutil;
 mod jobs;
+mod mail;
 mod scheduler;
 mod secrets;
 mod services;
@@ -114,6 +115,8 @@ enum Commands {
     },
     /// Install or upgrade Garage object storage (used by install.sh and the panel; needs root)
     GarageInstall,
+    #[command(flatten)]
+    Mail(mail::cli::MailCommand),
     /// Import sites, databases and users from a CloudPanel CE database (used by migrate-from-ce.sh)
     ImportCe {
         /// A copy of CE's panel database (/home/clp/htdocs/app/data/db.sq3)
@@ -269,6 +272,17 @@ async fn main() -> AnyResult<()> {
             std::process::exit(1);
         }
         return Ok(());
+    }
+
+    // The mail service runs as its own user and never opens the panel's database.
+    if let Some(Commands::Mail(cmd)) = cli.command {
+        match mail::cli::run(&config, cmd).await {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     fsutil::create_private_dir(&config.data_dir, 0o700)?;
@@ -462,7 +476,7 @@ async fn main() -> AnyResult<()> {
             }
             std::process::exit(i32::from(!report.problems.is_empty()));
         }
-        Some(Commands::GarageInstall) => unreachable!("handled above"),
+        Some(Commands::GarageInstall) | Some(Commands::Mail(_)) => unreachable!("handled above"),
         Some(Commands::Server) | None => {}
     }
     drop(conn);

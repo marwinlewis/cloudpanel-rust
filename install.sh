@@ -25,6 +25,11 @@
 #   --no-wireguard     Don't install WireGuard, and don't ask
 #   --with-garage      Install Garage S3 object storage, managed from the panel (asked if not given)
 #   --no-garage        Don't install Garage, and don't ask
+#   --with-mail        Install the email sending service: SMTP and an HTTP API like Resend's, which
+#                      Gmail's "Send mail as" can use (asked interactively if not given)
+#   --no-mail          Don't install the email service, and don't ask
+#   --mail-hostname H  Its hostname, e.g. mail.example.com (asked if --with-mail is given without it)
+#   --mail-email ADDR  Address for its Let's Encrypt certificate (self-signed until given)
 #   --no-upgrade       Never upgrade packages that are already installed. Used when migrating,
 #                      as upgrading nginx or PHP would restart what serves the sites.
 #   --no-fail2ban      Don't install fail2ban
@@ -56,6 +61,10 @@ WITH_WIREGUARD=0
 WG_CHOSEN=0
 WITH_GARAGE=0
 GARAGE_CHOSEN=0
+WITH_MAIL=0
+MAIL_CHOSEN=0
+MAIL_HOST=""
+MAIL_EMAIL=""
 NO_UPGRADE=0
 NO_FAIL2BAN=0
 NO_FIREWALL=0
@@ -119,6 +128,10 @@ CloudPanel installer (Debian 11/12/13, Ubuntu 22.04/24.04)
   --no-wireguard     Don't install WireGuard, and don't ask
   --with-garage      Install Garage S3 object storage (asked interactively if omitted)
   --no-garage        Don't install Garage, and don't ask
+  --with-mail        Install the email sending service (SMTP + API; asked interactively if omitted)
+  --no-mail          Don't install the email service, and don't ask
+  --mail-hostname H  Mail hostname, e.g. mail.example.com
+  --mail-email ADDR  Address for the mail hostname's Let's Encrypt certificate
   --no-upgrade       Never upgrade packages that are already installed
   --no-fail2ban      Don't install fail2ban
   --port N           Port for the panel (default: 8443)
@@ -163,6 +176,10 @@ parse_args() {
       --no-wireguard) WITH_WIREGUARD=0; WG_CHOSEN=1 ;;
       --with-garage) WITH_GARAGE=1; GARAGE_CHOSEN=1 ;;
       --no-garage) WITH_GARAGE=0; GARAGE_CHOSEN=1 ;;
+      --with-mail) WITH_MAIL=1; MAIL_CHOSEN=1 ;;
+      --no-mail) WITH_MAIL=0; MAIL_CHOSEN=1 ;;
+      --mail-hostname) MAIL_HOST="${2:?--mail-hostname needs a value}"; shift ;;
+      --mail-email) MAIL_EMAIL="${2:?--mail-email needs a value}"; shift ;;
       --no-upgrade) NO_UPGRADE=1 ;;
       --no-fail2ban) NO_FAIL2BAN=1 ;;
       --no-firewall) NO_FIREWALL=1 ;;
@@ -184,6 +201,12 @@ parse_args() {
   fi
   if [ -n "$SWAP_SIZE" ] && ! valid_swap_size "$SWAP_SIZE"; then
     die "--swap-size must be a whole number of GB from 0 to 64"
+  fi
+  if [ -n "$MAIL_HOST" ] && ! valid_hostname "$MAIL_HOST"; then
+    die "--mail-hostname must be a hostname such as mail.example.com"
+  fi
+  if [ -n "$MAIL_EMAIL" ] && ! printf '%s' "$MAIL_EMAIL" | grep -Eq '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'; then
+    die "--mail-email must be an email address"
   fi
   if [ "$VERSION" != "latest" ] && ! printf '%s' "$VERSION" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$'; then
     die "--version must look like v1.2.3"
@@ -401,6 +424,85 @@ choose_wireguard() {
   case "$answer" in
     [yY]*) WITH_WIREGUARD=1 ;;
   esac
+}
+
+valid_hostname() {
+  printf '%s' "$1" | grep -Eq '^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$'
+}
+
+# The mail hostname an earlier run set up, if any.
+existing_mail_host() {
+  sed -n 's/^CLOUDPANEL_MAIL_HOST=//p' /etc/cloudpanel/mail.env 2>/dev/null | head -n 1
+}
+
+# Ask whether to install the email service when no flag was given. Like Garage, once installed it
+# stays, and a re-run updates it. Without a terminal the answer is no.
+choose_mail() {
+  if [ "$MAIL_CHOSEN" -eq 1 ]; then
+    if [ "$WITH_MAIL" -eq 1 ] && [ -z "$MAIL_HOST" ]; then
+      MAIL_HOST=$(existing_mail_host)
+    fi
+    if [ "$WITH_MAIL" -eq 1 ] && [ -z "$MAIL_HOST" ]; then
+      die "--with-mail needs --mail-hostname, e.g. --mail-hostname mail.example.com"
+    fi
+    return
+  fi
+  MAIL_CHOSEN=1
+  if [ -f /etc/systemd/system/cloudpanel-mail.service ] && [ -n "$(existing_mail_host)" ]; then
+    WITH_MAIL=1
+    MAIL_HOST=$(existing_mail_host)
+    return
+  fi
+  if [ -f "$ENV_FILE" ] && grep -q '^CLOUDPANEL_MAIL=' "$ENV_FILE"; then
+    return
+  fi
+  if ! { exec 3</dev/tty; } 2>/dev/null; then
+    return
+  fi
+  local answer="" default="" domain=""
+  printf '
+%sInstall the email sending service (SMTP + API like Resend; works with Gmail "Send mail as")?%s [y/N]: ' "$C_BOLD" "$C_RST"
+  read -r answer <&3 || answer=""
+  case "$answer" in
+    [yY]*)
+      domain=$(hostname -d 2>/dev/null || true)
+      if [ -n "$domain" ]; then
+        default="mail.${domain}"
+      fi
+      while :; do
+        ask MAIL_HOST "  Mail hostname, pointed at this server${default:+ [$default]}: "
+        MAIL_HOST="${MAIL_HOST:-$default}"
+        if [ -z "$MAIL_HOST" ] || valid_hostname "$MAIL_HOST"; then
+          break
+        fi
+        warn "That isn't a hostname such as mail.example.com"
+        MAIL_HOST=""
+      done
+      if [ -z "$MAIL_HOST" ]; then
+        warn "No mail hostname given; skipping it. Install it later with: cloudpanel mail-install --hostname mail.example.com"
+      else
+        WITH_MAIL=1
+        if [ -z "$MAIL_EMAIL" ]; then
+          ask MAIL_EMAIL "  Email for its Let's Encrypt certificate (blank: self-signed for now): "
+        fi
+      fi
+      ;;
+  esac
+  exec 3<&-
+}
+
+# The panel binary installs Postfix and postsrsd, the cloudpanel-mail service and its certificate.
+# A failure here leaves the panel working; it can be installed later with the same command.
+install_mail() {
+  log "Installing the email sending service"
+  local args=(mail-install --hostname "$MAIL_HOST")
+  if [ -n "$MAIL_EMAIL" ]; then
+    args+=(--email "$MAIL_EMAIL")
+  fi
+  if ! "$BIN" "${args[@]}"; then
+    warn "The email service could not be installed. Try again with: cloudpanel mail-install --hostname $MAIL_HOST"
+    WITH_MAIL=0
+  fi
 }
 
 # Ask whether to install Garage when no flag was given. Once installed it stays: a re-run upgrades
@@ -841,6 +943,12 @@ EOF
     printf 'CLOUDPANEL_GARAGE=%s
 ' "$WITH_GARAGE" >> "$ENV_FILE"
   fi
+  if grep -q '^CLOUDPANEL_MAIL=' "$ENV_FILE"; then
+    sed -i "s|^CLOUDPANEL_MAIL=.*|CLOUDPANEL_MAIL=${WITH_MAIL}|" "$ENV_FILE"
+  else
+    printf 'CLOUDPANEL_MAIL=%s
+' "$WITH_MAIL" >> "$ENV_FILE"
+  fi
   # The service may write here (ReadWritePaths), which needs the directory to exist when it
   # starts, even if WireGuard is only installed later from the panel.
   install -d -m 0700 /etc/wireguard
@@ -927,6 +1035,11 @@ configure_firewall() {
   for p in $(existing_wireguard_ports); do
     ufw allow "${p}/udp" comment 'WireGuard' >/dev/null
   done
+  if [ "$WITH_MAIL" -eq 1 ]; then
+    for p in 25 465 587; do
+      ufw allow "${p}/tcp" comment 'Mail' >/dev/null
+    done
+  fi
   if ufw status | grep -q 'Status: inactive'; then
     ufw --force enable >/dev/null
     info "UFW enabled (allowed: SSH $(echo "$ssh_ports" | tr '\n' ' '), 80, 443, ${PORT})"
@@ -974,6 +1087,12 @@ print_summary() {
     printf '  Storage   Garage S3 on 127.0.0.1:3900; create buckets under Object Storage in the panel
 '
   fi
+  if [ "$WITH_MAIL" -eq 1 ]; then
+    printf '  Mail      SMTP on %s:587 and :465, API at https://%s/emails
+' "$MAIL_HOST" "$MAIL_HOST"
+    printf '            Next: cloudpanel mail-domain-add --domain example.com
+'
+  fi
   if [ "$WITH_DOCKER" -eq 1 ]; then
     printf '  %sNote: ports published by Docker bypass UFW; bind containers to 127.0.0.1 and expose them via a site.%s\n' "$C_DIM" "$C_RST"
   fi
@@ -983,6 +1102,9 @@ print_summary() {
 uninstall() {
   log "Uninstalling CloudPanel"
   systemctl disable --now cloudpanel >/dev/null 2>&1 || true
+  if [ -f /etc/systemd/system/cloudpanel-mail.service ] && [ -x "$BIN" ]; then
+    "$BIN" mail-uninstall || warn "Could not remove the email service cleanly"
+  fi
   rm -f "$UNIT" "$BIN"
   if [ -f /etc/systemd/system/garage.service ]; then
     systemctl disable --now garage >/dev/null 2>&1 || true
@@ -1022,6 +1144,7 @@ main() {
   choose_php
   choose_wireguard
   choose_garage
+  choose_mail
   install_packages
   install_databases
   if [ "$WITH_PHP" -eq 1 ]; then
@@ -1044,6 +1167,9 @@ main() {
   install_service
   if [ "$WITH_GARAGE" -eq 1 ]; then
     install_garage
+  fi
+  if [ "$WITH_MAIL" -eq 1 ]; then
+    install_mail
   fi
   configure_firewall
   wait_for_panel || true
