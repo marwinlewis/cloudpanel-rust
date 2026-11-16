@@ -27,6 +27,11 @@ pub struct Config {
     pub garage_dir: PathBuf,
     /// Garage's admin API, on loopback (`CLOUDPANEL_GARAGE_ADMIN_URL`).
     pub garage_admin_url: String,
+    /// Where the pinned GitHub Actions runner release is kept, readable by site users so they can
+    /// unpack it (`CLOUDPANEL_RUNNER_CACHE_DIR`).
+    pub runner_cache_dir: PathBuf,
+    /// GitHub's REST API, for runner registration tokens (`CLOUDPANEL_GITHUB_API_URL`).
+    pub github_api_url: String,
     /// One file per address banned from the panel, kept by fail2ban's action. Under `/run`, as
     /// fail2ban restores its bans after a reboot.
     pub ban_dir: PathBuf,
@@ -112,6 +117,16 @@ impl Config {
                 .ok()
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| "http://127.0.0.1:3903".to_string()),
+            runner_cache_dir: PathBuf::from(env_or(
+                "CLOUDPANEL_RUNNER_CACHE_DIR",
+                "/var/cache/cloudpanel/runners",
+                "./data/runner-cache",
+            )),
+            github_api_url: std::env::var("CLOUDPANEL_GITHUB_API_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| v.trim_end_matches('/').to_string())
+                .unwrap_or_else(|| "https://api.github.com".to_string()),
             ban_dir: PathBuf::from(env_or("CLOUDPANEL_BAN_DIR", "/run/cloudpanel-bans", "./data/bans")),
             sshd_config_dir: PathBuf::from(env_or(
                 "CLOUDPANEL_SSHD_DIR",

@@ -18,6 +18,7 @@ pub mod panel_cert;
 pub mod panel_update;
 pub mod php;
 pub mod pm2;
+pub mod runners;
 pub mod runtimes;
 pub mod s3;
 pub mod sites;

@@ -51,6 +51,8 @@ pub(super) fn harness_with(adjust: impl FnOnce(&mut Config)) -> Harness {
     config.nginx_sites_available = d.join("nginx/sites-available");
     config.nginx_sites_enabled = d.join("nginx/sites-enabled");
     config.cron_file = d.join("cron");
+    config.systemd_dir = d.join("systemd");
+    config.runner_cache_dir = d.join("runner-cache");
     let pool = db::init_db(&config.db_path).unwrap();
     {
         let conn = pool.get().unwrap();

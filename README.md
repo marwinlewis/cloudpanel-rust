@@ -1,6 +1,6 @@
 # CloudPanel (Rust Edition)
 
-A lightweight, self-contained server control panel written in Rust. One static binary serves the web UI and API and manages everything a VPS needs: sites with their own Linux users, supervised Node.js/Python apps, nginx, Let's Encrypt, databases, files, backups, services, updates, Docker, the firewall, fail2ban, a WireGuard VPN, S3-compatible object storage (Garage), an optional email sending service, cron and alerts.
+A lightweight, self-contained server control panel written in Rust. One static binary serves the web UI and API and manages everything a VPS needs: sites with their own Linux users, supervised Node.js/Python apps, nginx, Let's Encrypt, databases, files, backups, services, updates, Docker, the firewall, fail2ban, a WireGuard VPN, S3-compatible object storage (Garage), GitHub Actions self-hosted runners that deploy your sites, an optional email sending service, cron and alerts.
 
 - **Single binary**: the UI is embedded with `rust-embed`, and there are no PHP, Node or Python runtimes to maintain.
 - **Small footprint**: Tokio + Axum + embedded SQLite.
@@ -54,6 +54,8 @@ Then open `https://<server-ip>:8443`. Your browser will warn about the self-sign
 | `--no-wireguard` | Don't install WireGuard, and don't ask |
 | `--with-garage` | Install Garage S3-compatible object storage for the Object Storage page (asked if you're at a terminal) |
 | `--no-garage` | Don't install Garage, and don't ask |
+| `--with-runners` | Download the GitHub Actions [runner](#github-runners) release and its libraries, for the Runners page (asked if you're at a terminal) |
+| `--no-runners` | Don't install GitHub runners, and don't ask |
 | `--with-mail` | Install the [email sending service](#email-sending-service) (asked if you're at a terminal; off otherwise) |
 | `--no-mail` | Don't install the email service, and don't ask |
 | `--mail-hostname H` | Its hostname, e.g. `mail.example.com` (needed with `--with-mail` unless asked) |
@@ -91,7 +93,7 @@ sudo cloudpanel user-disable-2fa --username admin
 
 **Sites**
 - Node.js, Python, static sites, generic reverse proxies and Docker proxies, each with its own nginx vhost. PHP sites too, if you enable PHP when installing, each with its own PHP-FPM pool running as the site user.
-- Every site gets its own **Linux user** and home (`/home/<user>/htdocs/<domain>`). nginx reads static files through the site group.
+- Every site gets its own **Linux user** and home (`/home/<user>/htdocs/<domain>`), with a private `~/.ssh` for deploy keys. nginx reads static files through the site group.
 - **App process manager**: apps run as the site user with auto-restart, start/stop/restart, live output and a hardened systemd unit (`cloudpanel-app-<domain>`) that brings them back at boot. Node.js sites choose per site between **PM2** (the default for new sites) and plain **systemd**; other app types use systemd.
   - **PM2** adds zero-downtime reload, cluster mode, a memory limit, scheduled restarts, per-process status and log rotation, and uses `ecosystem.config.{js,cjs}` when the working directory has one. Each site user has their own daemon in `~/.pm2`, so `pm2 ls` over SSH shows what the panel shows. A daemon started by hand can be taken over.
   - **Install dependencies**, **Build** and **Deploy** (install, build, restart) are separate jobs. They detect npm, yarn and pnpm from the lockfile. Prebuilt deploys (build output and `node_modules`, but no source or lockfile) are left alone.
@@ -114,6 +116,7 @@ sudo cloudpanel user-disable-2fa --username admin
 - **Security**: fail2ban jails for SSH and the panel login, with ban time, retries, an ignore list, ban/unban and live status.
 - **VPN**: a WireGuard server with any number of clients. Each client gets its own keys, address and a configuration shown as a QR code or downloaded as a `.conf` file; live status shows who is connected and how much they transferred. Clients can be disabled, renamed or routed for full or split tunnelling, and the UDP port is opened in UFW for you. A server that already runs WireGuard is imported as it is: its keys, peers and custom lines such as `PostUp` are kept, and the original file is saved as `<interface>.conf.pre-cloudpanel` before the panel first rewrites it.
 - **Object storage**: [Garage](https://garagehq.deuxfleurs.fr/), an S3-compatible store, installed at setup or later from the panel. The panel downloads a pinned release, checks it against a SHA-256 built into the panel, and runs it as its own sandboxed `garage` service that listens on 127.0.0.1 only. Create buckets with optional size and object limits, and one access key per app, and give each key read, write or owner access to the buckets it needs. Secrets are shown once and never stored. A bucket or key can belong to a site, whose managers then manage it from the site's Buckets tab. An optional public hostname is served by nginx over HTTPS with a Let's Encrypt certificate (path-style URLs, region `us-east-1`). Removing CloudPanel leaves the stored data in `/var/lib/garage`.
+- <a id="github-runners"></a>**GitHub runners**: GitHub Actions self-hosted runners, installed at setup (`--with-runners`) or later from the Runners page. The panel downloads a pinned runner release and checks its SHA-256. Each runner belongs to a site and runs as that site's Linux user from `~/actions-runner/<name>`, in a sandboxed `cloudpanel-runner-<id>` service, so it can reach that site's files and no other site's. Register a repository or organization runner with a registration token pasted from GitHub, or with a saved GitHub token (stored encrypted), which also shows whether GitHub sees the runner. Workflows deploy their site by calling `$CLOUDPANEL_DEPLOY_URL` with `$CLOUDPANEL_DEPLOY_TOKEN`, which install, build and restart it like the Deploy button; the token works for that one site only. Runners installed by hand (`config.sh` and `svc.sh`) are found and can be adopted without registering again. Site managers manage their sites' runners. Use runners only with private repositories.
 - **Email sending** (optional, no UI): a service like Resend on your own server. Verify a domain, create API keys, then send through SMTP (Gmail's "Send mail as" works) or an HTTP API, with DKIM signing, delivery tracking, webhooks and forwarding of incoming mail to Gmail. See [Email sending service](#email-sending-service).
 - **Cron**: create, edit, pause and run jobs now. Every run's exit code and output are recorded, and jobs can be tied to a site and run as its user.
 - **Containers**: list, start/stop/restart, logs, stats and removal. Run new containers from a form (ports are bound to 127.0.0.1 by default), manage images (pull/remove/prune), handle Docker Compose stacks, and expose a container on a domain.
@@ -138,7 +141,7 @@ Taken from a real install on a Debian 13 test container, with demo sites and dat
 | **Services**<br>[![System services and site apps with status and memory](docs/screenshots/services.png)](docs/screenshots/services.png) | **Updates**<br>[![Panel release notice and pending package updates](docs/screenshots/updates.png)](docs/screenshots/updates.png) |
 | **Firewall**<br>[![UFW rules and a blocked IP](docs/screenshots/firewall.png)](docs/screenshots/firewall.png) | **Security**<br>[![fail2ban jails and settings](docs/screenshots/security.png)](docs/screenshots/security.png) |
 | **Cron jobs**<br>[![Cron jobs with schedule, user and last run](docs/screenshots/cron.png)](docs/screenshots/cron.png) | **Containers**<br>[![Docker containers with ports, usage and status](docs/screenshots/containers.png)](docs/screenshots/containers.png) |
-| **Events**<br>[![Audit log of sign-ins and changes](docs/screenshots/events.png)](docs/screenshots/events.png) | |
+| **Events**<br>[![Audit log of sign-ins and changes](docs/screenshots/events.png)](docs/screenshots/events.png) | **GitHub runners**<br>[![Self-hosted runners per site with status and the deploy step](docs/screenshots/runners.png)](docs/screenshots/runners.png) |
 
 ## Security model
 
@@ -260,6 +263,7 @@ cloudpanel site-add --domain api.example.com --site-type nodejs --port 3000 [--n
 cloudpanel site-list
 cloudpanel panel-access-open                        # reopen the panel's port after closing it in Settings
 cloudpanel cron-run <id>                            # used by /etc/cron.d/cloudpanel
+cloudpanel runners-install                          # download the GitHub runner release (needs root)
 cloudpanel mail-…                                   # email service, see "Email sending service"
 ```
 

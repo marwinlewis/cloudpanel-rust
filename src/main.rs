@@ -115,6 +115,9 @@ enum Commands {
     },
     /// Install or upgrade Garage object storage (used by install.sh and the panel; needs root)
     GarageInstall,
+    /// Download the pinned GitHub Actions runner release and its system libraries (used by
+    /// install.sh and the panel; needs root)
+    RunnersInstall,
     #[command(flatten)]
     Mail(mail::cli::MailCommand),
     /// Import sites, databases and users from a CloudPanel CE database (used by migrate-from-ce.sh)
@@ -268,6 +271,14 @@ async fn main() -> AnyResult<()> {
     // Before the database is opened: this runs outside the panel's sandbox and doesn't need it.
     if let Some(Commands::GarageInstall) = cli.command {
         if let Err(e) = services::garage::install(&config, &|l| println!("{l}")).await {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    if let Some(Commands::RunnersInstall) = cli.command {
+        if let Err(e) = services::runners::install(&config, &|l| println!("{l}")).await {
             eprintln!("{e}");
             std::process::exit(1);
         }
@@ -476,7 +487,9 @@ async fn main() -> AnyResult<()> {
             }
             std::process::exit(i32::from(!report.problems.is_empty()));
         }
-        Some(Commands::GarageInstall) | Some(Commands::Mail(_)) => unreachable!("handled above"),
+        Some(Commands::GarageInstall) | Some(Commands::RunnersInstall) | Some(Commands::Mail(_)) => {
+            unreachable!("handled above")
+        }
         Some(Commands::Server) | None => {}
     }
     drop(conn);
@@ -489,6 +502,11 @@ async fn main() -> AnyResult<()> {
             .and_then(|v| serde_json::from_str(&v).ok())
             .unwrap_or_default();
         services::fail2ban::ensure(&config, &f2b);
+    }
+    {
+        // Sites made before the panel created ~/.ssh get one now, off the startup path.
+        let sites = db::list_sites(&*pool.get()?)?;
+        tokio::task::spawn_blocking(move || services::sysusers::ensure_ssh_dirs(&sites));
     }
     let jwt_secret = load_jwt_secret(&config)?;
     let stored_tls = services::panel_cert::load(&*pool.get()?);

@@ -185,6 +185,21 @@ const ROUTES: &[(&str, &str, Guard)] = &[
     ("DELETE", "/sites/:id/storage/buckets/:bid/keys/:kid", Site),
     ("POST", "/sites/:id/storage/keys", Site),
     ("DELETE", "/sites/:id/storage/keys/:kid", Site),
+    ("GET", "/runners", Session),
+    ("POST", "/runners", Session),
+    ("POST", "/runners/install", Admin),
+    ("GET", "/runners/scan", Admin),
+    ("POST", "/runners/adopt", Admin),
+    ("GET", "/runners/:id", Owned),
+    ("GET", "/runners/:id/logs", Owned),
+    ("POST", "/runners/:id/remove", Owned),
+    ("POST", "/runners/:id/deploy-token", Owned),
+    ("POST", "/runners/:id/:action", Owned),
+    ("GET", "/github-credentials", Admin),
+    ("POST", "/github-credentials", Admin),
+    ("DELETE", "/github-credentials/:id", Admin),
+    // Signs in with a runner's own deploy token instead; see the runner tests.
+    ("POST", "/runner-hook/deploy", Public),
     ("GET", "/cron/jobs", Session),
     ("POST", "/cron/jobs", Session),
     ("PUT", "/cron/jobs/:id", Owned),
@@ -260,6 +275,7 @@ struct Others {
     backup: i64,
     cron: i64,
     job: i64,
+    runner: i64,
 }
 
 fn seed(h: &Harness) -> Others {
@@ -282,7 +298,24 @@ fn seed(h: &Harness) -> Others {
     .unwrap();
     let admin = db::find_user_by_username(&conn, "admin").unwrap().unwrap().id;
     let job = db::create_job(&conn, "test", None, Some(admin)).unwrap();
+    let runner = db::create_runner(
+        &conn,
+        &db::NewRunner {
+            site_id: Some(site),
+            name: "other-runner",
+            github_url: "https://github.com/acme/other",
+            labels: "",
+            runner_group: "",
+            system_user: "otheruser",
+            dir: "/home/otheruser/actions-runner/other-runner",
+            credential_id: None,
+            deploy_token_hash: None,
+            adopted: false,
+        },
+    )
+    .unwrap();
     Others {
+        runner,
         site,
         user: admin,
         database,
@@ -302,6 +335,8 @@ fn concrete(path: &str, o: &Others) -> String {
         o.cron
     } else if path.starts_with("/jobs/") {
         o.job
+    } else if path.starts_with("/runners/") {
+        o.runner
     } else if path.starts_with("/users/") {
         o.user
     } else {
@@ -491,6 +526,7 @@ async fn refused_requests_change_nothing() {
             db::list_databases(&conn, None).unwrap().len(),
             db::list_backups(&conn, None).unwrap().len(),
             db::list_users(&conn).unwrap().len(),
+            db::list_runners(&conn, None).unwrap().len(),
         )
     };
     let before = snapshot(&h);

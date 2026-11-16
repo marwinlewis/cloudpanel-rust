@@ -1332,6 +1332,142 @@ pub fn delete_wireguard_client(conn: &Connection, id: i64) -> rusqlite::Result<b
     Ok(conn.execute("DELETE FROM wireguard_clients WHERE id = ?1", params![id])? > 0)
 }
 
+// ---------- GitHub Actions runners ----------
+
+const RUNNER_COLS: &str = "r.id, r.site_id, s.domain, r.name, r.github_url, r.labels, r.runner_group,      r.system_user, r.dir, r.credential_id, r.deploy_token_hash, r.adopted, r.created_at";
+
+fn runner_row(r: &Row) -> rusqlite::Result<Runner> {
+    Ok(Runner {
+        id: r.get(0)?,
+        site_id: r.get(1)?,
+        site_domain: r.get(2)?,
+        name: r.get(3)?,
+        github_url: r.get(4)?,
+        labels: r.get(5)?,
+        runner_group: r.get(6)?,
+        system_user: r.get(7)?,
+        dir: r.get(8)?,
+        credential_id: r.get(9)?,
+        deploy_token_hash: r.get(10)?,
+        adopted: r.get(11)?,
+        created_at: r.get(12)?,
+    })
+}
+
+/// Every runner, or only those of one site.
+pub fn list_runners(conn: &Connection, site_id: Option<i64>) -> rusqlite::Result<Vec<Runner>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {RUNNER_COLS} FROM runners r LEFT JOIN sites s ON s.id = r.site_id
+         WHERE (?1 IS NULL OR r.site_id = ?1) ORDER BY r.name, r.id"
+    ))?;
+    let rows = stmt.query_map(params![site_id], runner_row)?;
+    rows.collect()
+}
+
+pub fn find_runner(conn: &Connection, id: i64) -> rusqlite::Result<Option<Runner>> {
+    conn.query_row(
+        &format!("SELECT {RUNNER_COLS} FROM runners r LEFT JOIN sites s ON s.id = r.site_id WHERE r.id = ?1"),
+        params![id],
+        runner_row,
+    )
+    .optional()
+}
+
+pub fn find_runner_by_deploy_token(conn: &Connection, hash: &str) -> rusqlite::Result<Option<Runner>> {
+    conn.query_row(
+        &format!(
+            "SELECT {RUNNER_COLS} FROM runners r LEFT JOIN sites s ON s.id = r.site_id WHERE r.deploy_token_hash = ?1"
+        ),
+        params![hash],
+        runner_row,
+    )
+    .optional()
+}
+
+pub struct NewRunner<'a> {
+    pub site_id: Option<i64>,
+    pub name: &'a str,
+    pub github_url: &'a str,
+    pub labels: &'a str,
+    pub runner_group: &'a str,
+    pub system_user: &'a str,
+    pub dir: &'a str,
+    pub credential_id: Option<i64>,
+    pub deploy_token_hash: Option<&'a str>,
+    pub adopted: bool,
+}
+
+pub fn create_runner(conn: &Connection, r: &NewRunner) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO runners (site_id, name, github_url, labels, runner_group, system_user, dir, credential_id,
+                              deploy_token_hash, adopted, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            r.site_id,
+            r.name,
+            r.github_url,
+            r.labels,
+            r.runner_group,
+            r.system_user,
+            r.dir,
+            r.credential_id,
+            r.deploy_token_hash,
+            r.adopted,
+            Utc::now()
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn set_runner_deploy_token(conn: &Connection, id: i64, hash: Option<&str>) -> rusqlite::Result<bool> {
+    Ok(conn.execute(
+        "UPDATE runners SET deploy_token_hash = ?2 WHERE id = ?1",
+        params![id, hash],
+    )? > 0)
+}
+
+pub fn delete_runner(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
+    Ok(conn.execute("DELETE FROM runners WHERE id = ?1", params![id])? > 0)
+}
+
+const CREDENTIAL_COLS: &str = "id, name, token_sealed, created_at";
+
+fn credential_row(r: &Row) -> rusqlite::Result<GithubCredential> {
+    Ok(GithubCredential {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        token_sealed: r.get(2)?,
+        created_at: r.get(3)?,
+    })
+}
+
+pub fn list_github_credentials(conn: &Connection) -> rusqlite::Result<Vec<GithubCredential>> {
+    let mut stmt = conn.prepare(&format!("SELECT {CREDENTIAL_COLS} FROM github_credentials ORDER BY name"))?;
+    let rows = stmt.query_map([], credential_row)?;
+    rows.collect()
+}
+
+pub fn find_github_credential(conn: &Connection, id: i64) -> rusqlite::Result<Option<GithubCredential>> {
+    conn.query_row(
+        &format!("SELECT {CREDENTIAL_COLS} FROM github_credentials WHERE id = ?1"),
+        params![id],
+        credential_row,
+    )
+    .optional()
+}
+
+pub fn create_github_credential(conn: &Connection, name: &str, token_sealed: &str) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO github_credentials (name, token_sealed, created_at) VALUES (?1, ?2, ?3)",
+        params![name, token_sealed, Utc::now()],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn delete_github_credential(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
+    Ok(conn.execute("DELETE FROM github_credentials WHERE id = ?1", params![id])? > 0)
+}
+
 // ---------- Object storage (Garage) ----------
 
 const STORAGE_BUCKET_COLS: &str = "b.id, b.garage_id, b.name, b.site_id, s.domain, b.created_at";

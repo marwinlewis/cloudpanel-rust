@@ -117,6 +117,7 @@ pub fn create_site_user(config: &Config, user: &str, domain: &str) -> Result<Sit
     }
     crate::fsutil::set_mode(&layout.home, 0o750).map_err(|e| e.to_string())?;
     chown_recursive(&layout.home, user, user)?;
+    ensure_ssh_dir(user, &layout.home)?;
     // Let nginx read static files through the site group.
     if cfg!(unix) {
         let web = if user_exists("www-data") { "www-data" } else { "nginx" };
@@ -125,6 +126,38 @@ pub fn create_site_user(config: &Config, user: &str, domain: &str) -> Result<Sit
         }
     }
     Ok(layout)
+}
+
+/// Make sure the user has a private `~/.ssh` (mode 700), for deploy keys and `known_hosts`.
+/// Done as the user: they own their home, so doing it as root could be redirected with a symlink.
+pub fn ensure_ssh_dir(user: &str, home: &Path) -> Result<(), String> {
+    if !cfg!(unix) {
+        let dir = home.join(".ssh");
+        return fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()));
+    }
+    let h = home.to_string_lossy();
+    let r = run_with(
+        "/bin/sh",
+        &["-c", "umask 077 && mkdir -p \"$HOME/.ssh\" && chmod 700 \"$HOME/.ssh\""],
+        &CmdOpts::default().user(user).env("HOME", &h).timeout(30),
+    );
+    r.into_result("sh", "/bin/sh is not available").map(|_| ())
+}
+
+/// Give every site user that has none a `~/.ssh` (sites created before the panel made one).
+/// Runs once at startup; a home that already has any `.ssh` entry is left alone.
+pub fn ensure_ssh_dirs(sites: &[crate::db::models::Site]) {
+    for site in sites {
+        let Some(home) = site.home_dir.as_deref() else { continue };
+        let home = Path::new(home);
+        if !home.is_dir() || fs::symlink_metadata(home.join(".ssh")).is_ok() {
+            continue;
+        }
+        match ensure_ssh_dir(&site.system_user, home) {
+            Ok(()) => info!("created {}/.ssh for {}", home.display(), site.domain),
+            Err(e) => tracing::warn!("could not create {}/.ssh for {}: {e}", home.display(), site.domain),
+        }
+    }
 }
 
 /// Extra SSH/SFTP account sharing the site owner's group and home.

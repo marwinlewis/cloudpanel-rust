@@ -10,6 +10,7 @@ pub mod download;
 pub mod error;
 pub mod file_handlers;
 pub mod firewall_handlers;
+pub mod runner_handlers;
 pub mod service_handlers;
 pub mod site_handlers;
 pub mod ssh_handlers;
@@ -20,6 +21,8 @@ pub mod wireguard_handlers;
 
 #[cfg(test)]
 mod security_tests;
+#[cfg(test)]
+mod runner_tests;
 #[cfg(test)]
 mod storage_tests;
 #[cfg(test)]
@@ -331,6 +334,25 @@ fn create_api_router(state: SharedState) -> Router {
             "/sites/:id/storage/keys/:kid",
             delete(storage_handlers::delete_site_key),
         )
+        // GitHub Actions runners
+        .route(
+            "/runners",
+            get(runner_handlers::list_runners).post(runner_handlers::create_runner),
+        )
+        .route("/runners/install", post(runner_handlers::install))
+        .route("/runners/scan", get(runner_handlers::scan))
+        .route("/runners/adopt", post(runner_handlers::adopt))
+        .route("/runners/:id", get(runner_handlers::get_runner))
+        .route("/runners/:id/logs", get(runner_handlers::runner_logs))
+        .route("/runners/:id/remove", post(runner_handlers::remove_runner))
+        .route("/runners/:id/deploy-token", post(runner_handlers::rotate_deploy_token))
+        .route("/runners/:id/:action", post(runner_handlers::runner_action))
+        .route(
+            "/github-credentials",
+            get(runner_handlers::list_credentials).post(runner_handlers::create_credential),
+        )
+        .route("/github-credentials/:id", delete(runner_handlers::delete_credential))
+        .route("/runner-hook/deploy", post(runner_handlers::hook_deploy))
         // Cron
         .route(
             "/cron/jobs",

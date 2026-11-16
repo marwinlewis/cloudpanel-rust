@@ -493,6 +493,76 @@ pub fn service_name(input: &str) -> VResult<String> {
     }
 }
 
+/// A GitHub Actions runner's name: also its directory under `~/actions-runner/`.
+pub fn runner_name(input: &str) -> VResult<String> {
+    let s = input.trim();
+    let ok = !s.is_empty()
+        && s.len() <= 64
+        && !s.starts_with('.')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+    if ok {
+        Ok(s.to_string())
+    } else {
+        Err("Runner names are 1-64 letters, digits, '.', '_' or '-', not starting with '.'".into())
+    }
+}
+
+/// Extra runner labels, comma separated. GitHub adds `self-hosted`, `Linux` and the CPU itself.
+pub fn runner_labels(input: &str) -> VResult<String> {
+    let labels: Vec<&str> = input.split(',').map(str::trim).filter(|l| !l.is_empty()).collect();
+    if labels.len() > 20 {
+        return Err("Use at most 20 labels".into());
+    }
+    for l in &labels {
+        if l.len() > 64 || !l.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
+            return Err(format!("'{l}' isn't a valid label: use letters, digits, '.', '_' or '-'"));
+        }
+    }
+    Ok(labels.join(","))
+}
+
+/// A runner group name (organization runners only). Empty means the default group.
+pub fn runner_group(input: &str) -> VResult<String> {
+    let s = input.trim();
+    if s.len() > 64 || !s.chars().all(|c| c.is_ascii_alphanumeric() || " ._-".contains(c)) {
+        return Err("Runner group names are up to 64 letters, digits, spaces, '.', '_' or '-'".into());
+    }
+    Ok(s.to_string())
+}
+
+/// `https://github.com/<owner>` (organization runner) or `https://github.com/<owner>/<repo>`
+/// (repository runner). Returns the normalized URL with the owner and the repository, if any.
+pub fn github_url(input: &str) -> VResult<(String, String, Option<String>)> {
+    let s = input.trim().trim_end_matches('/');
+    let s = s.strip_suffix(".git").unwrap_or(s);
+    let rest = s
+        .strip_prefix("https://github.com/")
+        .ok_or("Use the repository or organization URL, e.g. https://github.com/acme/app")?;
+    let parts: Vec<&str> = rest.split('/').collect();
+    let owner_ok = |o: &str| {
+        !o.is_empty()
+            && o.len() <= 39
+            && !o.starts_with('-')
+            && o.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    let repo_ok = |r: &str| {
+        !r.is_empty()
+            && r.len() <= 100
+            && r != "."
+            && r != ".."
+            && r.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+    };
+    match parts.as_slice() {
+        [o] if owner_ok(o) => Ok((format!("https://github.com/{o}"), o.to_string(), None)),
+        [o, r] if owner_ok(o) && repo_ok(r) => Ok((
+            format!("https://github.com/{o}/{r}"),
+            o.to_string(),
+            Some(r.to_string()),
+        )),
+        _ => Err("Use the repository or organization URL, e.g. https://github.com/acme/app".into()),
+    }
+}
+
 /// Docker image reference such as `nginx:1.27`, `ghcr.io/org/app@sha256:...`.
 pub fn image_ref(input: &str) -> VResult<String> {
     let s = input.trim();

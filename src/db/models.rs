@@ -377,3 +377,41 @@ pub struct WireguardClient {
     pub imported: bool,
     pub created_at: DateTime<Utc>,
 }
+
+/// A GitHub Actions self-hosted runner the panel manages.
+#[derive(Debug, Clone, Serialize)]
+pub struct Runner {
+    pub id: i64,
+    pub site_id: Option<i64>,
+    pub site_domain: Option<String>,
+    pub name: String,
+    /// `https://github.com/<owner>` or `https://github.com/<owner>/<repo>`.
+    pub github_url: String,
+    pub labels: String,
+    pub runner_group: String,
+    pub system_user: String,
+    pub dir: String,
+    pub credential_id: Option<i64>,
+    #[serde(skip_serializing)]
+    pub deploy_token_hash: Option<String>,
+    pub adopted: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Runner {
+    /// Organization runners serve every repository of the organization.
+    pub fn is_org(&self) -> bool {
+        self.github_url.trim_start_matches("https://github.com/").split('/').count() == 1
+    }
+}
+
+/// A GitHub token the panel asks for runner registration and removal tokens with.
+#[derive(Debug, Clone, Serialize)]
+pub struct GithubCredential {
+    pub id: i64,
+    pub name: String,
+    /// Encrypted with `secrets::seal`.
+    #[serde(skip_serializing)]
+    pub token_sealed: String,
+    pub created_at: DateTime<Utc>,
+}

@@ -221,6 +221,16 @@ pub fn deprovision(config: &Config, conn: &Connection, site: &Site, delete_files
     if let Err(e) = NginxService::remove_site(config, &site.domain) {
         warnings.push(format!("nginx: {e}"));
     }
+    // Runners first: they run as the site user, who may be deleted below. GitHub isn't told,
+    // as that needs a token; the runner shows offline there.
+    for r in db::list_runners(conn, Some(site.id))? {
+        super::runners::remove_unit(config, r.id);
+        db::delete_runner(conn, r.id)?;
+        warnings.push(format!(
+            "runner {}: removed from this server; delete it in GitHub as well",
+            r.name
+        ));
+    }
     apps::remove(config, site);
     if let Err(e) = super::php::remove(site) {
         warnings.push(format!("php: {e}"));

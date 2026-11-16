@@ -331,6 +331,8 @@ dialog.wide { width: min(880px, calc(100vw - 32px)); }
 .drawer .dialog-body { flex: 1; }
 .dialog-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 20px; border-top: 1px solid var(--border); background: var(--surface); }
 .logs { margin: 0; background: #0b0b0e; color: #d4d4d8; padding: 14px; border-radius: var(--radius-sm); min-height: 300px; max-height: calc(100vh - 220px); overflow: auto; white-space: pre-wrap; word-break: break-all; line-height: 1.55; }
+.logs.snippet { min-height: 0; max-height: none; }
+.warn-text { color: var(--warn); }
 
 /* ---------- Menu ---------- */
 .menu { position: fixed; z-index: 60; min-width: 180px; padding: 4px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow-lg); }

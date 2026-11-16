@@ -277,4 +277,29 @@ pub const MIGRATIONS: &[&str] = &[
     ALTER TABLE sites ADD COLUMN maintenance_message TEXT NOT NULL DEFAULT '';
     ALTER TABLE sites ADD COLUMN maintenance_allow TEXT NOT NULL DEFAULT '';
     "#,
+    // 12: GitHub Actions self-hosted runners, and GitHub tokens the panel registers them with.
+    // A runner without a site was adopted from a user that owns no site; only admins see it.
+    r#"
+    CREATE TABLE github_credentials (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        token_sealed TEXT NOT NULL,
+        created_at DATETIME NOT NULL
+    );
+    CREATE TABLE runners (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        site_id INTEGER REFERENCES sites(id) ON DELETE SET NULL,
+        name TEXT NOT NULL,
+        github_url TEXT NOT NULL,
+        labels TEXT NOT NULL DEFAULT '',
+        runner_group TEXT NOT NULL DEFAULT '',
+        system_user TEXT NOT NULL,
+        dir TEXT NOT NULL UNIQUE,
+        credential_id INTEGER REFERENCES github_credentials(id) ON DELETE SET NULL,
+        deploy_token_hash TEXT UNIQUE,
+        adopted BOOLEAN NOT NULL DEFAULT 0,
+        created_at DATETIME NOT NULL
+    );
+    CREATE INDEX runners_site ON runners(site_id);
+    "#,
 ];

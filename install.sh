@@ -25,6 +25,9 @@
 #   --no-wireguard     Don't install WireGuard, and don't ask
 #   --with-garage      Install Garage S3 object storage, managed from the panel (asked if not given)
 #   --no-garage        Don't install Garage, and don't ask
+#   --with-runners     Download the GitHub Actions runner release for the panel's Runners page
+#                      (asked interactively if not given)
+#   --no-runners       Don't install GitHub runners, and don't ask
 #   --with-mail        Install the email sending service: SMTP and an HTTP API like Resend's, which
 #                      Gmail's "Send mail as" can use (asked interactively if not given)
 #   --no-mail          Don't install the email service, and don't ask
@@ -61,6 +64,8 @@ WITH_WIREGUARD=0
 WG_CHOSEN=0
 WITH_GARAGE=0
 GARAGE_CHOSEN=0
+WITH_RUNNERS=0
+RUNNERS_CHOSEN=0
 WITH_MAIL=0
 MAIL_CHOSEN=0
 MAIL_HOST=""
@@ -128,6 +133,8 @@ CloudPanel installer (Debian 11/12/13, Ubuntu 22.04/24.04)
   --no-wireguard     Don't install WireGuard, and don't ask
   --with-garage      Install Garage S3 object storage (asked interactively if omitted)
   --no-garage        Don't install Garage, and don't ask
+  --with-runners     Install GitHub Actions self-hosted runners (asked interactively if omitted)
+  --no-runners       Don't install GitHub runners, and don't ask
   --with-mail        Install the email sending service (SMTP + API; asked interactively if omitted)
   --no-mail          Don't install the email service, and don't ask
   --mail-hostname H  Mail hostname, e.g. mail.example.com
@@ -176,6 +183,8 @@ parse_args() {
       --no-wireguard) WITH_WIREGUARD=0; WG_CHOSEN=1 ;;
       --with-garage) WITH_GARAGE=1; GARAGE_CHOSEN=1 ;;
       --no-garage) WITH_GARAGE=0; GARAGE_CHOSEN=1 ;;
+      --with-runners) WITH_RUNNERS=1; RUNNERS_CHOSEN=1 ;;
+      --no-runners) WITH_RUNNERS=0; RUNNERS_CHOSEN=1 ;;
       --with-mail) WITH_MAIL=1; MAIL_CHOSEN=1 ;;
       --no-mail) WITH_MAIL=0; MAIL_CHOSEN=1 ;;
       --mail-hostname) MAIL_HOST="${2:?--mail-hostname needs a value}"; shift ;;
@@ -546,6 +555,49 @@ install_garage() {
   if ! "$BIN" garage-install; then
     warn "Garage could not be installed. Install it later from Object Storage in the panel."
     WITH_GARAGE=0
+  fi
+}
+
+# Ask whether to set up GitHub Actions runners when no flag was given. Once set up it stays: a
+# re-run fetches the runner release this version of the panel pins, unless --no-runners says not to.
+choose_runners() {
+  if [ "$RUNNERS_CHOSEN" -eq 1 ]; then
+    return
+  fi
+  RUNNERS_CHOSEN=1
+  if ls /var/cache/cloudpanel/runners/actions-runner-linux-*.tar.gz >/dev/null 2>&1; then
+    WITH_RUNNERS=1
+    return
+  fi
+  if [ -f "$ENV_FILE" ] && grep -q '^CLOUDPANEL_RUNNERS=' "$ENV_FILE"; then
+    if grep -q '^CLOUDPANEL_RUNNERS=1' "$ENV_FILE"; then
+      WITH_RUNNERS=1
+    fi
+    return
+  fi
+  case "$(uname -m)" in
+    x86_64|aarch64) ;;
+    *) return ;;
+  esac
+  local answer=""
+  if { exec 3</dev/tty; } 2>/dev/null; then
+    printf '\n%sSet up GitHub Actions self-hosted runners (run workflows here and deploy your sites from them)?%s [y/N]: ' "$C_BOLD" "$C_RST"
+    read -r answer <&3 || answer=""
+    exec 3<&-
+  fi
+  case "$answer" in
+    [yY]*) WITH_RUNNERS=1 ;;
+  esac
+}
+
+# The panel binary downloads GitHub's runner release, checks it against the SHA-256 it was built
+# with, and installs the libraries it needs. Runners themselves are added per site in the panel.
+# A failure here leaves the panel working; runners can be set up from the panel later.
+install_runners() {
+  log "Setting up GitHub Actions runners"
+  if ! "$BIN" runners-install; then
+    warn "The GitHub runner release could not be installed. Install it later from Runners in the panel."
+    WITH_RUNNERS=0
   fi
 }
 
@@ -943,6 +995,11 @@ EOF
     printf 'CLOUDPANEL_GARAGE=%s
 ' "$WITH_GARAGE" >> "$ENV_FILE"
   fi
+  if grep -q '^CLOUDPANEL_RUNNERS=' "$ENV_FILE"; then
+    sed -i "s|^CLOUDPANEL_RUNNERS=.*|CLOUDPANEL_RUNNERS=${WITH_RUNNERS}|" "$ENV_FILE"
+  else
+    printf 'CLOUDPANEL_RUNNERS=%s\n' "$WITH_RUNNERS" >> "$ENV_FILE"
+  fi
   if grep -q '^CLOUDPANEL_MAIL=' "$ENV_FILE"; then
     sed -i "s|^CLOUDPANEL_MAIL=.*|CLOUDPANEL_MAIL=${WITH_MAIL}|" "$ENV_FILE"
   else
@@ -1087,6 +1144,9 @@ print_summary() {
     printf '  Storage   Garage S3 on 127.0.0.1:3900; create buckets under Object Storage in the panel
 '
   fi
+  if [ "$WITH_RUNNERS" -eq 1 ]; then
+    printf '  Runners   GitHub Actions runner release ready; add runners per site under Runners in the panel\n'
+  fi
   if [ "$WITH_MAIL" -eq 1 ]; then
     printf '  Mail      SMTP on %s:587 and :465, API at https://%s/emails
 ' "$MAIL_HOST" "$MAIL_HOST"
@@ -1125,6 +1185,9 @@ uninstall() {
   else
     info "Data kept in $DATA_DIR and $CONF_DIR (use --uninstall --purge to delete)"
   fi
+  if ls /etc/systemd/system/cloudpanel-runner-*.service >/dev/null 2>&1; then
+    info "GitHub runner services (cloudpanel-runner-*) and their folders in site homes were left in place"
+  fi
   if [ -d /var/lib/garage ]; then
     info "Object storage data in /var/lib/garage and its config in /etc/garage were left in place"
   fi
@@ -1144,6 +1207,7 @@ main() {
   choose_php
   choose_wireguard
   choose_garage
+  choose_runners
   choose_mail
   install_packages
   install_databases
@@ -1167,6 +1231,9 @@ main() {
   install_service
   if [ "$WITH_GARAGE" -eq 1 ]; then
     install_garage
+  fi
+  if [ "$WITH_RUNNERS" -eq 1 ]; then
+    install_runners
   fi
   if [ "$WITH_MAIL" -eq 1 ]; then
     install_mail
