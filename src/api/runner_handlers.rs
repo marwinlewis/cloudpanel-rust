@@ -67,7 +67,9 @@ fn pasted_token(input: Option<&str>) -> ApiResult<Option<String>> {
         return Ok(None);
     };
     if t.len() > 200 || !t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-        return Err(ApiError::BadRequest("That doesn't look like a token from GitHub".into()));
+        return Err(ApiError::BadRequest(
+            "That doesn't look like a token from GitHub".into(),
+        ));
     }
     Ok(Some(t.to_string()))
 }
@@ -129,7 +131,10 @@ pub async fn list_runners(user: AuthUser, State(state): State<SharedState>) -> A
         .iter()
         .map(|s| json!({ "id": s.id, "domain": s.domain, "has_user": s.home_dir.is_some(), "system_user": s.system_user }))
         .collect();
-    let credentials: Vec<Value> = creds.iter().map(|c| json!({ "id": c.id, "name": c.name, "created_at": c.created_at })).collect();
+    let credentials: Vec<Value> = creds
+        .iter()
+        .map(|c| json!({ "id": c.id, "name": c.name, "created_at": c.created_at }))
+        .collect();
     Ok(Json(json!({
         "installed": installed,
         "can_install": can_install,
@@ -224,7 +229,10 @@ pub async fn install(admin: AdminUser, State(state): State<SharedState>) -> ApiR
         if r.success() {
             Ok(())
         } else {
-            Err(format!("Installing the runner release failed (exit code {})", r.code.unwrap_or(-1)))
+            Err(format!(
+                "Installing the runner release failed (exit code {})",
+                r.code.unwrap_or(-1)
+            ))
         }
     })
     .map_err(ApiError::internal)?;
@@ -309,7 +317,9 @@ pub async fn create_runner(
                 return Err(ApiError::BadRequest(format!("{dir} can't be used for a runner")));
             }
             if db::list_runners(conn, None)?.iter().any(|r| r.dir == dir) {
-                return Err(ApiError::Conflict(format!("This site already has a runner named {name}")));
+                return Err(ApiError::Conflict(format!(
+                    "This site already has a runner named {name}"
+                )));
             }
             let pat = cred.map(|c| credential_token(&config, conn, c)).transpose()?;
             audit::record(conn, &actor, "runner.create", Some(&site.domain), Some(&name));
@@ -365,7 +375,12 @@ pub async fn create_runner(
             },
             Some(&deploy_token),
         )?;
-        log.line(&format!("Runner {} is running as {} ({}).", r.name, r.system_user, runners::unit_name(r.id)));
+        log.line(&format!(
+            "Runner {} is running as {} ({}).",
+            r.name,
+            r.system_user,
+            runners::unit_name(r.id)
+        ));
         Ok(())
     })
     .map_err(ApiError::internal)?;
@@ -405,7 +420,9 @@ pub async fn runner_action(
     let config = state.config.clone();
     blocking(move || {
         if !runners::unit_path(&config, r.id).exists() && !cfg!(test) {
-            return Err(ApiError::BadRequest("This runner has no unit; remove it and add it again".into()));
+            return Err(ApiError::BadRequest(
+                "This runner has no unit; remove it and add it again".into(),
+            ));
         }
         runners::act(r.id, act).map_err(ApiError::Unprocessable)
     })
@@ -595,34 +612,40 @@ pub async fn adopt(
     let config = state.config.clone();
     let pool = state.pool.clone();
     let target = found.name.clone();
-    let job_id = crate::jobs::spawn(&state.pool, "runner.adopt", Some(&target), Some(admin.0.id), move |log| {
-        runners::adopt(&config, &found, &|l| log.line(l))?;
-        let (url, _, _) = validate::github_url(&found.github_url)?;
-        let deploy = found.site_id.map(|_| runners::new_deploy_token());
-        let r = finish(
-            &pool,
-            &config,
-            &NewRunner {
-                site_id: found.site_id,
-                name: &found.name,
-                github_url: &url,
-                labels: "",
-                runner_group: "",
-                system_user: &found.user,
-                dir: &found.dir,
-                credential_id: None,
-                deploy_token_hash: deploy.as_ref().map(|(_, h)| h.as_str()),
-                adopted: true,
-            },
-            deploy.as_ref().map(|(t, _)| t.as_str()),
-        )?;
-        log.line(&format!(
-            "Runner {} is now managed by the panel ({}).",
-            r.name,
-            runners::unit_name(r.id)
-        ));
-        Ok(())
-    })
+    let job_id = crate::jobs::spawn(
+        &state.pool,
+        "runner.adopt",
+        Some(&target),
+        Some(admin.0.id),
+        move |log| {
+            runners::adopt(&config, &found, &|l| log.line(l))?;
+            let (url, _, _) = validate::github_url(&found.github_url)?;
+            let deploy = found.site_id.map(|_| runners::new_deploy_token());
+            let r = finish(
+                &pool,
+                &config,
+                &NewRunner {
+                    site_id: found.site_id,
+                    name: &found.name,
+                    github_url: &url,
+                    labels: "",
+                    runner_group: "",
+                    system_user: &found.user,
+                    dir: &found.dir,
+                    credential_id: None,
+                    deploy_token_hash: deploy.as_ref().map(|(_, h)| h.as_str()),
+                    adopted: true,
+                },
+                deploy.as_ref().map(|(t, _)| t.as_str()),
+            )?;
+            log.line(&format!(
+                "Runner {} is now managed by the panel ({}).",
+                r.name,
+                runners::unit_name(r.id)
+            ));
+            Ok(())
+        },
+    )
     .map_err(ApiError::internal)?;
     Ok(Json(json!({ "job_id": job_id })))
 }
@@ -649,7 +672,9 @@ pub async fn create_credential(
 ) -> ApiResult<impl IntoResponse> {
     let name = p.name.trim().to_string();
     if name.is_empty() || name.len() > 64 || name.chars().any(char::is_control) {
-        return Err(ApiError::BadRequest("Give the token a name of up to 64 characters".into()));
+        return Err(ApiError::BadRequest(
+            "Give the token a name of up to 64 characters".into(),
+        ));
     }
     let token = p.token.trim().to_string();
     if token.len() < 20 || token.len() > 255 || !token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -660,7 +685,10 @@ pub async fn create_credential(
     let sealed = secrets::encrypt(&state.config.etc_dir, &token).map_err(ApiError::internal)?;
     let id = state
         .db(move |conn| {
-            if db::list_github_credentials(conn)?.iter().any(|c| c.name.eq_ignore_ascii_case(&name)) {
+            if db::list_github_credentials(conn)?
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(&name))
+            {
                 return Err(ApiError::Conflict(format!("A token named {name} already exists")));
             }
             let id = db::create_github_credential(conn, &name, &sealed)?;
@@ -778,7 +806,10 @@ pub async fn hook_deploy(
     })
     .map_err(ApiError::internal)?;
     if !p.wait {
-        return Ok((StatusCode::ACCEPTED, Json(json!({ "job_id": job_id, "status": "running" }))));
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({ "job_id": job_id, "status": "running" })),
+        ));
     }
     let deadline = Instant::now() + Duration::from_secs(30 * 60);
     loop {

@@ -401,7 +401,11 @@ pub struct Runner {
 impl Runner {
     /// Organization runners serve every repository of the organization.
     pub fn is_org(&self) -> bool {
-        self.github_url.trim_start_matches("https://github.com/").split('/').count() == 1
+        self.github_url
+            .trim_start_matches("https://github.com/")
+            .split('/')
+            .count()
+            == 1
     }
 }
 

@@ -156,28 +156,51 @@ fn install_dependencies(config: &Config, tarball: &Path, log: &dyn Fn(&str)) -> 
     let opts = CmdOpts::default()
         .timeout(15 * 60)
         .env("DEBIAN_FRONTEND", "noninteractive");
-    let result = stream(log, "tar", &["-xzf", &t, "-C", &d, "./bin/installdependencies.sh"], &opts)
-        .and_then(|_| {
-            log("Installing the runner's system libraries");
-            stream(log, "bash", &[&format!("{d}/bin/installdependencies.sh")], &opts)
-        })
-        .or_else(|e| {
-            log(&format!("{e}; installing the libraries with apt instead"));
+    let result = stream(
+        log,
+        "tar",
+        &["-xzf", &t, "-C", &d, "./bin/installdependencies.sh"],
+        &opts,
+    )
+    .and_then(|_| {
+        log("Installing the runner's system libraries");
+        stream(log, "bash", &[&format!("{d}/bin/installdependencies.sh")], &opts)
+    })
+    .or_else(|e| {
+        log(&format!("{e}; installing the libraries with apt instead"));
+        stream(
+            log,
+            "apt-get",
+            &[
+                "install",
+                "-y",
+                "-q",
+                "--no-install-recommends",
+                "libkrb5-3",
+                "zlib1g",
+                "libicu-dev",
+                "libssl3t64",
+            ],
+            &opts,
+        )
+        .or_else(|_| {
             stream(
                 log,
                 "apt-get",
-                &["install", "-y", "-q", "--no-install-recommends", "libkrb5-3", "zlib1g", "libicu-dev", "libssl3t64"],
+                &[
+                    "install",
+                    "-y",
+                    "-q",
+                    "--no-install-recommends",
+                    "libkrb5-3",
+                    "zlib1g",
+                    "libicu-dev",
+                    "libssl3",
+                ],
                 &opts,
             )
-            .or_else(|_| {
-                stream(
-                    log,
-                    "apt-get",
-                    &["install", "-y", "-q", "--no-install-recommends", "libkrb5-3", "zlib1g", "libicu-dev", "libssl3"],
-                    &opts,
-                )
-            })
-        });
+        })
+    });
     let _ = std::fs::remove_dir_all(&tmp);
     result
 }
@@ -192,12 +215,8 @@ pub async fn install(config: &Config, log: &dyn Fn(&str)) -> Result<(), String> 
     if !crate::fsutil::running_as_root() {
         return Err("Installing GitHub runners needs root".into());
     }
-    let (_, sha) = target().ok_or_else(|| {
-        format!(
-            "GitHub has no runner release for this CPU ({})",
-            std::env::consts::ARCH
-        )
-    })?;
+    let (_, sha) =
+        target().ok_or_else(|| format!("GitHub has no runner release for this CPU ({})", std::env::consts::ARCH))?;
     let path = tarball(config).ok_or("Unsupported CPU")?;
     std::fs::create_dir_all(&config.runner_cache_dir).map_err(|e| e.to_string())?;
     crate::fsutil::set_mode(&config.runner_cache_dir, 0o755).map_err(|e| e.to_string())?;
@@ -213,7 +232,9 @@ pub async fn install(config: &Config, log: &dyn Fn(&str)) -> Result<(), String> 
             }
         }
     }
-    log(&format!("GitHub Actions runner {VERSION} is ready. Create runners on the Runners page."));
+    log(&format!(
+        "GitHub Actions runner {VERSION} is ready. Create runners on the Runners page."
+    ));
     Ok(())
 }
 
@@ -556,9 +577,9 @@ pub fn unpack_and_register(
     reg: &Registration,
     log: &dyn Fn(&str),
 ) -> Result<(), String> {
-    let tarball = tarball(config).filter(|p| p.is_file()).ok_or(
-        "The runner release is not installed. An administrator can install it on the Runners page.",
-    )?;
+    let tarball = tarball(config)
+        .filter(|p| p.is_file())
+        .ok_or("The runner release is not installed. An administrator can install it on the Runners page.")?;
     if Path::new(dir).exists() {
         return Err(format!("{dir} already exists. Choose another runner name."));
     }
@@ -748,7 +769,9 @@ pub fn scan(config: &Config, managed_dirs: &[String]) -> Vec<Found> {
             if !(name.starts_with("actions.runner.") && name.ends_with(".service")) {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+            let Ok(text) = std::fs::read_to_string(e.path()) else {
+                continue;
+            };
             if let Some(wd) = unit_workdir(&text) {
                 if let Some(f) = inspect(Path::new(&wd), Some(name.trim_end_matches(".service").to_string())) {
                     add(f);
@@ -767,8 +790,10 @@ pub fn scan(config: &Config, managed_dirs: &[String]) -> Vec<Found> {
             let name = e.file_name();
             let name = name.to_string_lossy();
             // Runners never live in these, and they can be huge.
-            if matches!(name.as_ref(), "node_modules" | ".git" | "_work" | "htdocs" | "logs" | "databases" | "bin" | "externals")
-                || name.starts_with("bin.")
+            if matches!(
+                name.as_ref(),
+                "node_modules" | ".git" | "_work" | "htdocs" | "logs" | "databases" | "bin" | "externals"
+            ) || name.starts_with("bin.")
                 || name.starts_with("externals.")
             {
                 if p.join(".runner").is_file() {

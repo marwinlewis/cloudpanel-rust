@@ -1442,7 +1442,9 @@ fn credential_row(r: &Row) -> rusqlite::Result<GithubCredential> {
 }
 
 pub fn list_github_credentials(conn: &Connection) -> rusqlite::Result<Vec<GithubCredential>> {
-    let mut stmt = conn.prepare(&format!("SELECT {CREDENTIAL_COLS} FROM github_credentials ORDER BY name"))?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {CREDENTIAL_COLS} FROM github_credentials ORDER BY name"
+    ))?;
     let rows = stmt.query_map([], credential_row)?;
     rows.collect()
 }

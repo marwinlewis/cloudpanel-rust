@@ -20,9 +20,9 @@ pub mod user_handlers;
 pub mod wireguard_handlers;
 
 #[cfg(test)]
-mod security_tests;
-#[cfg(test)]
 mod runner_tests;
+#[cfg(test)]
+mod security_tests;
 #[cfg(test)]
 mod storage_tests;
 #[cfg(test)]

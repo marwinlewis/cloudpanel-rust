@@ -83,7 +83,8 @@ async fn creating_a_runner_is_checked_before_anything_runs() {
     let other = site(&h, "other.example.com");
     let mgr = h.login("manager").await;
     let body = |site_id: i64, extra: Value| {
-        let mut b = json!({"site_id": site_id, "url": "https://github.com/acme/app", "token": "AABBCCDDEEFF0011223344"});
+        let mut b =
+            json!({"site_id": site_id, "url": "https://github.com/acme/app", "token": "AABBCCDDEEFF0011223344"});
         for (k, v) in extra.as_object().unwrap() {
             b[k] = v.clone();
         }
@@ -91,13 +92,19 @@ async fn creating_a_runner_is_checked_before_anything_runs() {
     };
     let cases = [
         (body(other, json!({})), StatusCode::NOT_FOUND),
-        (body(mine, json!({"url": "https://gitlab.com/acme/app"})), StatusCode::BAD_REQUEST),
+        (
+            body(mine, json!({"url": "https://gitlab.com/acme/app"})),
+            StatusCode::BAD_REQUEST,
+        ),
         (body(mine, json!({"token": null})), StatusCode::BAD_REQUEST),
         (body(mine, json!({"token": "bad token!"})), StatusCode::BAD_REQUEST),
         (body(mine, json!({"labels": "ok,not ok"})), StatusCode::BAD_REQUEST),
         (body(mine, json!({"name": "../escape"})), StatusCode::BAD_REQUEST),
         // Stored tokens are the administrators'.
-        (body(mine, json!({"token": null, "credential_id": 1})), StatusCode::FORBIDDEN),
+        (
+            body(mine, json!({"token": null, "credential_id": 1})),
+            StatusCode::FORBIDDEN,
+        ),
         // The test sites run as `cloudpanel` with no home of their own.
         (body(mine, json!({})), StatusCode::BAD_REQUEST),
     ];
@@ -185,10 +192,19 @@ async fn the_deploy_hook_only_deploys_the_runners_own_site() {
     let restart = json!({"action": "restart"});
     // Without a bearer token the CSRF guard stops it first.
     assert_eq!(hook(&h, None, restart.clone()).await.0, StatusCode::BAD_REQUEST);
-    assert_eq!(hook(&h, Some("cpr_nope"), restart.clone()).await.0, StatusCode::UNAUTHORIZED);
-    assert_eq!(hook(&h, Some(&unlinked), restart.clone()).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        hook(&h, Some("cpr_nope"), restart.clone()).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        hook(&h, Some(&unlinked), restart.clone()).await.0,
+        StatusCode::UNAUTHORIZED
+    );
     // A panel session isn't a deploy token.
-    assert_eq!(hook(&h, Some(session), restart.clone()).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        hook(&h, Some(session), restart.clone()).await.0,
+        StatusCode::UNAUTHORIZED
+    );
     assert_eq!(
         hook(&h, Some(&token), json!({"action": "rm -rf"})).await.0,
         StatusCode::BAD_REQUEST
@@ -216,7 +232,10 @@ async fn rotating_the_deploy_token_retires_the_old_one() {
         .call("POST", &format!("/runners/{id}/deploy-token"), Some(&mgr), None, true)
         .await;
     // Writing the unit fails without a real runner directory; the token is replaced first.
-    assert!(s == StatusCode::NO_CONTENT || s == StatusCode::UNPROCESSABLE_ENTITY, "{s} {v}");
+    assert!(
+        s == StatusCode::NO_CONTENT || s == StatusCode::UNPROCESSABLE_ENTITY,
+        "{s} {v}"
+    );
     assert_eq!(hook(&h, Some(&old), json!({})).await.0, StatusCode::UNAUTHORIZED);
 }
 
@@ -262,18 +281,24 @@ async fn fake_github() -> String {
 async fn tokens_come_from_githubs_runner_api() {
     let api = fake_github().await;
     assert_eq!(
-        runners::registration_token(&api, "good-pat", "https://github.com/acme/app").await.unwrap(),
+        runners::registration_token(&api, "good-pat", "https://github.com/acme/app")
+            .await
+            .unwrap(),
         "REGTOKEN123"
     );
     assert_eq!(
-        runners::removal_token(&api, "good-pat", "https://github.com/acme").await.unwrap(),
+        runners::removal_token(&api, "good-pat", "https://github.com/acme")
+            .await
+            .unwrap(),
         "REMOVE456"
     );
     let e = runners::registration_token(&api, "bad", "https://github.com/acme/app")
         .await
         .unwrap_err();
     assert!(e.contains("401"), "{e}");
-    let list = runners::list_remote(&api, "good-pat", "https://github.com/acme/app").await.unwrap();
+    let list = runners::list_remote(&api, "good-pat", "https://github.com/acme/app")
+        .await
+        .unwrap();
     assert_eq!(list[0].name, "mine-1");
     assert_eq!(list[0].status, "online");
     assert!(list[0].busy);

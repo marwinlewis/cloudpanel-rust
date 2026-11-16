@@ -515,7 +515,9 @@ pub fn runner_labels(input: &str) -> VResult<String> {
     }
     for l in &labels {
         if l.len() > 64 || !l.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
-            return Err(format!("'{l}' isn't a valid label: use letters, digits, '.', '_' or '-'"));
+            return Err(format!(
+                "'{l}' isn't a valid label: use letters, digits, '.', '_' or '-'"
+            ));
         }
     }
     Ok(labels.join(","))
