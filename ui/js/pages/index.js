@@ -14,6 +14,7 @@ import { renderAlerts } from './alerts.js';
 import { renderVpn } from './vpn.js';
 import { renderStorage } from './storage.js';
 import { renderRunners } from './runners.js';
+import { renderEmail } from './email.js';
 // Site detail tabs register themselves.
 import './site-files.js';
 import './site-databases.js';
@@ -29,6 +30,7 @@ export const ROUTES = {
   firewall: { title: 'Firewall', render: renderFirewall, icon: 'shield', section: 'Server', admin: true },
   vpn: { title: 'WireGuard VPN', nav: 'VPN', render: renderVpn, icon: 'vpn', section: 'Server', admin: true },
   storage: { title: 'Object Storage', nav: 'Storage', render: renderStorage, icon: 'layers', section: 'Server', admin: true },
+  email: { title: 'Email', render: renderEmail, icon: 'mail', section: 'Server', admin: true },
   runners: { title: 'GitHub runners', nav: 'Runners', render: renderRunners, icon: 'git', section: 'Server' },
   security: { title: 'Security', render: renderSecurity, icon: 'lock', section: 'Server', admin: true },
   cron: { title: 'Cron jobs', render: renderCron, icon: 'clock', section: 'Server' },
@@ -39,4 +41,4 @@ export const ROUTES = {
   settings: { title: 'Settings', render: renderSettings, icon: 'settings', section: 'Admin' },
 };
 
-export const NAV_ORDER = ['overview', 'sites', 'services', 'firewall', 'vpn', 'storage', 'runners', 'security', 'cron', 'docker', 'users', 'events', 'alerts', 'settings'];
+export const NAV_ORDER = ['overview', 'sites', 'services', 'firewall', 'vpn', 'storage', 'email', 'runners', 'security', 'cron', 'docker', 'users', 'events', 'alerts', 'settings'];

@@ -214,18 +214,21 @@ pub async fn update_site(
                         "That port is used by the control panel itself".into(),
                     ));
                 }
-                // nginx would forward this site's visitors to whatever listens there. For a site
-                // manager that mustn't be another site's app, which would skip that site's basic
-                // auth, or a system service. Admins can point several domains at one container.
-                if !user.is_admin() && port != previous.target_port.unwrap_or(0) {
-                    if port < 1024 {
+                // nginx would forward this site's visitors to whatever listens there. That mustn't
+                // be another site's app, which would also skip that site's basic auth, and for a
+                // site manager not a system service either. Keeping the current port is always fine.
+                if port != previous.target_port.unwrap_or(0) {
+                    if !user.is_admin() && port < 1024 {
                         return Err(ApiError::BadRequest("Choose an app port from 1024 up".into()));
                     }
-                    if db::list_sites(conn)?
-                        .iter()
-                        .any(|s| s.id != site.id && s.target_port == Some(port))
-                    {
-                        return Err(ApiError::BadRequest("That port belongs to another site".into()));
+                    let sites = db::list_sites(conn)?;
+                    if let Some(owner) = crate::services::sites::port_owner(&sites, port, Some(site.id)) {
+                        // Only an admin may learn which site that is.
+                        return Err(ApiError::BadRequest(if user.is_admin() {
+                            format!("Port {port} is already used by {}", owner.domain)
+                        } else {
+                            "That port belongs to another site".into()
+                        }));
                     }
                 }
                 site.target_port = Some(port);

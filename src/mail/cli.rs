@@ -1,6 +1,6 @@
 //! `cloudpanel mail-*`: setting up and managing the email service from the shell (as root).
 
-use super::{dkim, dns, events, install, keys, store, MailConfig};
+use super::{install, manage, store, MailConfig};
 use crate::config::Config;
 use clap::Subcommand;
 
@@ -111,6 +111,9 @@ pub enum MailCommand {
     },
     /// Check the email service: units, ports, outbound port 25, domains
     MailStatus,
+    /// Rewrite Postfix's forwarding tables from the database (used by the panel)
+    #[command(hide = true)]
+    MailPostfixSync,
 }
 
 type R = Result<(), String>;
@@ -124,25 +127,17 @@ fn audit(config: &Config, action: &str, target: Option<&str>) {
 }
 
 fn open(mc: &MailConfig) -> Result<rusqlite::Connection, String> {
-    store::open(&mc.db_path()).map_err(|e| format!("Could not open {}: {e}", mc.db_path().display()))
+    Ok(manage::open(mc)?)
 }
 
-fn print_records(domain: &str, host: &str, dkim_public: &str) {
+fn print_records(domain: &str, records: &[manage::RecordOut], host: &str) {
     println!("Add these DNS records for {domain}:\n");
-    for r in dns::records(domain, host, dkim_public) {
+    for r in records {
         let prio = r.priority.map(|p| format!(" (priority {p})")).unwrap_or_default();
         println!("  {} {}{prio}\n    {}\n    # {}\n", r.kind, r.name, r.value, r.purpose);
     }
     println!("Also set the reverse DNS (PTR) of this server's IP to {host} at your hosting provider.");
     println!("Then run: cloudpanel mail-domain-verify --domain {domain}");
-}
-
-fn clean_domain(d: &str) -> Result<String, String> {
-    crate::validate::domain(&d.trim().to_ascii_lowercase()).map_err(|e| e.to_string())
-}
-
-fn clean_address(a: &str) -> Result<String, String> {
-    crate::validate::email(&a.trim().to_ascii_lowercase()).map_err(|e| e.to_string())
 }
 
 fn pad(s: &str, n: usize) -> String {
@@ -171,19 +166,13 @@ async fn run_inner(config: &Config, mc: &MailConfig, cmd: MailCommand) -> R {
             email,
             self_signed,
         } => {
-            let hostname = clean_domain(&hostname)?;
-            let email = email.map(|e| clean_address(&e)).transpose()?;
+            let hostname = manage::clean_domain(&hostname)?;
+            let email = email.map(|e| manage::clean_address(&e)).transpose()?;
             if let Ok(pool) = crate::db::init_db(&config.db_path) {
                 if let Ok(conn) = pool.get() {
                     let sites = crate::db::list_sites(&conn).unwrap_or_default();
-                    if let Some(site) = crate::services::panel_cert::site_on_hostname(&sites, &hostname) {
-                        return Err(format!("The site {site} already answers on {hostname}. Use a dedicated name such as mail.{hostname}."));
-                    }
-                    if crate::services::panel_cert::load(&conn)
-                        .is_some_and(|t| t.hostname.eq_ignore_ascii_case(&hostname))
-                    {
-                        return Err(format!("{hostname} is the panel's own hostname"));
-                    }
+                    let panel = crate::services::panel_cert::load(&conn).map(|t| t.hostname);
+                    manage::check_hostname_free(&sites, panel.as_deref(), &hostname)?;
                 }
             }
             let opts = install::InstallOptions {
@@ -209,61 +198,36 @@ async fn run_inner(config: &Config, mc: &MailConfig, cmd: MailCommand) -> R {
         }
         MailCommand::MailServe => super::serve::run(mc.clone()).await,
         MailCommand::MailCertSync => install::sync_cert(mc),
+        MailCommand::MailPostfixSync => install::sync_postfix(&open(mc)?),
         MailCommand::MailDomainAdd { domain } => {
-            let domain = clean_domain(&domain)?;
             let conn = open(mc)?;
-            if store::get_domain(&conn, &domain).map_err(|e| e.to_string())?.is_some() {
-                return Err(format!(
-                    "{domain} is already a sending domain. Its records: cloudpanel mail-dns --domain {domain}"
-                ));
-            }
-            let path = mc.dkim_key_path(&domain);
-            let pem = match std::fs::read_to_string(&path) {
-                Ok(p) => p,
-                Err(_) => {
-                    let p = dkim::generate_key_pem()?;
-                    std::fs::create_dir_all(mc.dkim_dir()).map_err(|e| e.to_string())?;
-                    install::write_owned(&path, p.as_bytes(), 0o600)?;
-                    p
-                }
-            };
-            let public = dkim::public_key_b64(&pem)?;
-            store::add_domain(&conn, &domain, &public).map_err(|e| e.to_string())?;
-            audit(config, "mail.domain_add", Some(&domain));
-            print_records(&domain, &mc.hostname, &public);
+            let d = manage::add_domain(&conn, mc, &domain)?;
+            audit(config, "mail.domain_add", Some(&d.name));
+            print_records(&d.name, &manage::records(mc, &d), &mc.hostname);
             Ok(())
         }
         MailCommand::MailDns { domain } => {
-            let domain = clean_domain(&domain)?;
-            let d = store::get_domain(&open(mc)?, &domain)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("{domain} isn't a sending domain"))?;
-            print_records(&domain, &mc.hostname, &d.dkim_public);
+            let recs = manage::domain_records(&open(mc)?, mc, &domain)?;
+            let domain = manage::clean_domain(&domain)?;
+            print_records(&domain, &recs, &mc.hostname);
             Ok(())
         }
         MailCommand::MailDomainVerify { domain, force } => {
-            let domain = clean_domain(&domain)?;
-            let conn = open(mc)?;
-            let d = store::get_domain(&conn, &domain)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("{domain} isn't a sending domain"))?;
+            let mc2 = mc.clone();
+            let v = tokio::task::spawn_blocking(move || -> Result<manage::Verification, String> {
+                Ok(manage::verify_domain(&open(&mc2)?, &mc2, &domain, force)?)
+            })
+            .await
+            .map_err(|e| e.to_string())??;
             if force {
-                store::set_domain_verified(&conn, &domain, true).map_err(|e| e.to_string())?;
-                audit(config, "mail.domain_verify", Some(&domain));
-                println!("{domain} marked verified without a DNS check.");
+                audit(config, "mail.domain_verify", Some(&v.domain));
+                println!("{} marked verified without a DNS check.", v.domain);
                 return Ok(());
             }
-            let (host, public, dom) = (mc.hostname.clone(), d.dkim_public.clone(), domain.clone());
-            let checks = tokio::task::spawn_blocking(move || dns::check(&dom, &host, &public))
-                .await
-                .map_err(|e| e.to_string())?;
-            let mut required_ok = true;
-            for c in &checks {
-                let required =
-                    c.record.name.contains("._domainkey.") || (c.record.kind == "TXT" && c.record.name == domain);
+            for c in &v.checks {
                 let mark = if c.ok {
                     "ok     "
-                } else if required {
+                } else if c.record.required {
                     "MISSING"
                 } else {
                     "missing"
@@ -275,15 +239,16 @@ async fn run_inner(config: &Config, mc: &MailConfig, cmd: MailCommand) -> R {
                         println!("        have: {f}");
                     }
                 }
-                required_ok &= c.ok || !required;
             }
-            store::set_domain_verified(&conn, &domain, required_ok).map_err(|e| e.to_string())?;
-            if required_ok {
-                audit(config, "mail.domain_verify", Some(&domain));
-                println!("\n{domain} is verified and can send.");
+            if v.verified {
+                audit(config, "mail.domain_verify", Some(&v.domain));
+                println!("\n{} is verified and can send.", v.domain);
                 Ok(())
             } else {
-                Err(format!("\n{domain} isn't verified yet: DKIM and SPF are required. DNS changes can take a while to show up."))
+                Err(format!(
+                    "\n{} isn't verified yet: DKIM and SPF are required. DNS changes can take a while to show up.",
+                    v.domain
+                ))
             }
         }
         MailCommand::MailDomainList => {
@@ -300,24 +265,17 @@ async fn run_inner(config: &Config, mc: &MailConfig, cmd: MailCommand) -> R {
             Ok(())
         }
         MailCommand::MailDomainRemove { domain } => {
-            let domain = clean_domain(&domain)?;
             let conn = open(mc)?;
-            if !store::remove_domain(&conn, &domain).map_err(|e| e.to_string())? {
-                return Err(format!("{domain} isn't a sending domain"));
-            }
-            let _ = std::fs::remove_file(mc.dkim_key_path(&domain));
-            let mut removed = 0;
-            for f in store::list_forwards(&conn).map_err(|e| e.to_string())? {
-                if super::domain_of(&f.address).as_deref() == Some(domain.as_str()) {
-                    store::remove_forward(&conn, &f.address).map_err(|e| e.to_string())?;
-                    removed += 1;
-                }
-            }
-            if removed > 0 {
+            let r = manage::remove_domain(&conn, mc, &domain)?;
+            if r.needs_postfix_sync() {
                 install::sync_postfix(&conn)?;
             }
+            let domain = manage::clean_domain(&domain)?;
             audit(config, "mail.domain_remove", Some(&domain));
-            println!("Removed {domain} ({removed} forward(s)). Remove its DNS records too.");
+            println!(
+                "Removed {domain} ({} forward(s), {} key(s)). Remove its DNS records too.",
+                r.forwards_removed, r.keys_revoked
+            );
             Ok(())
         }
         MailCommand::MailKeyCreate {
@@ -326,31 +284,11 @@ async fn run_inner(config: &Config, mc: &MailConfig, cmd: MailCommand) -> R {
             permission,
             hourly_limit,
         } => {
-            let name = name.trim().to_string();
-            if name.is_empty() || name.len() > 64 {
-                return Err("--name must be 1-64 characters".into());
-            }
             let conn = open(mc)?;
-            let domain = match domain {
-                Some(d) => {
-                    let d = clean_domain(&d)?;
-                    if store::get_domain(&conn, &d).map_err(|e| e.to_string())?.is_none() {
-                        return Err(format!(
-                            "{d} isn't a sending domain. Add it first: cloudpanel mail-domain-add --domain {d}"
-                        ));
-                    }
-                    Some(d)
-                }
-                None => None,
-            };
-            if hourly_limit == 0 {
-                return Err("--hourly-limit must be at least 1".into());
-            }
-            let (key, full) = keys::generate(&name, &permission, domain.clone(), hourly_limit);
-            store::add_key(&conn, &key).map_err(|e| e.to_string())?;
+            let (key, full) = manage::create_key(&conn, &name, domain.as_deref(), &permission, hourly_limit)?;
             audit(config, "mail.key_create", Some(&key.id));
             let host = &mc.hostname;
-            let from = domain.as_deref().unwrap_or("example.com");
+            let from = key.domain.as_deref().unwrap_or("example.com");
             println!("API key (shown once, store it now):\n\n  {full}\n");
             println!("Gmail > Settings > Accounts > Send mail as > Add another email address:");
             println!("  SMTP server  {host}");
@@ -387,40 +325,19 @@ async fn run_inner(config: &Config, mc: &MailConfig, cmd: MailCommand) -> R {
             Ok(())
         }
         MailCommand::MailKeyRevoke { id } => {
-            let conn = open(mc)?;
-            if !store::remove_key(&conn, id.trim()).map_err(|e| e.to_string())? {
-                return Err(format!("No key with id {id}"));
-            }
-            audit(config, "mail.key_revoke", Some(&id));
-            println!("Key {id} revoked. Clients using it can no longer send.");
+            manage::revoke_key(&open(mc)?, &id)?;
+            audit(config, "mail.key_revoke", Some(id.trim()));
+            println!("Key {} revoked. Clients using it can no longer send.", id.trim());
             Ok(())
         }
         MailCommand::MailForwardAdd { address, to } => {
-            let address = clean_address(&address)?;
-            let to = clean_address(&to)?;
-            if address == to {
-                return Err("An address can't forward to itself".into());
-            }
             let conn = open(mc)?;
-            let domain = super::domain_of(&address).unwrap_or_default();
-            if store::get_domain(&conn, &domain).map_err(|e| e.to_string())?.is_none() {
-                return Err(format!(
-                    "{domain} isn't a sending domain. Add it first: cloudpanel mail-domain-add --domain {domain}"
-                ));
-            }
-            if store::list_forwards(&conn)
-                .map_err(|e| e.to_string())?
-                .iter()
-                .any(|f| f.address == to)
-            {
-                return Err(format!("{to} is itself forwarded; pick the final mailbox"));
-            }
-            store::add_forward(&conn, &address, &to).map_err(|e| e.to_string())?;
+            let f = manage::add_forward(&conn, &address, &to)?;
             install::sync_postfix(&conn)?;
-            audit(config, "mail.forward_add", Some(&address));
+            audit(config, "mail.forward_add", Some(&f.address));
             println!(
-                "Mail to {address} now goes to {to}. The domain's MX record must point to {}.",
-                mc.hostname
+                "Mail to {} now goes to {}. The domain's MX record must point to {}.",
+                f.address, f.forward_to, mc.hostname
             );
             Ok(())
         }
@@ -431,42 +348,23 @@ async fn run_inner(config: &Config, mc: &MailConfig, cmd: MailCommand) -> R {
             Ok(())
         }
         MailCommand::MailForwardRemove { address } => {
-            let address = clean_address(&address)?;
             let conn = open(mc)?;
-            if !store::remove_forward(&conn, &address).map_err(|e| e.to_string())? {
-                return Err(format!("No forward for {address}"));
-            }
+            let address = manage::remove_forward(&conn, &address)?;
             install::sync_postfix(&conn)?;
             audit(config, "mail.forward_remove", Some(&address));
             println!("Mail to {address} is no longer accepted.");
             Ok(())
         }
         MailCommand::MailWebhookAdd { url, events: kinds } => {
-            let parsed = reqwest::Url::parse(url.trim()).map_err(|_| format!("Invalid URL {url}"))?;
-            let local = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
-            if parsed.scheme() != "https" && !(parsed.scheme() == "http" && local) {
-                return Err("Webhook URLs must use https (http only for localhost)".into());
-            }
             let kinds: Vec<String> = kinds
                 .unwrap_or_default()
                 .split(',')
                 .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
                 .collect();
-            if let Some(bad) = kinds.iter().find(|k| !events::EVENT_TYPES.contains(&k.as_str())) {
-                return Err(format!("Unknown event {bad}. Use: {}", events::EVENT_TYPES.join(", ")));
-            }
-            let hook = store::Webhook {
-                id: super::new_id(),
-                url: parsed.to_string(),
-                events: kinds,
-                secret: events::new_secret(),
-                created_at: super::now(),
-            };
-            store::add_webhook(&open(mc)?, &hook).map_err(|e| e.to_string())?;
+            let (hook, secret) = manage::add_webhook(&open(mc)?, &url, &kinds)?;
             audit(config, "mail.webhook_add", Some(&hook.url));
             println!("Webhook {} added.", hook.id);
-            println!("Signing secret (shown once): {}", hook.secret);
+            println!("Signing secret (shown once): {secret}");
             println!("Requests carry svix-id, svix-timestamp and svix-signature headers, as Resend's do.");
             Ok(())
         }
@@ -482,19 +380,16 @@ async fn run_inner(config: &Config, mc: &MailConfig, cmd: MailCommand) -> R {
             Ok(())
         }
         MailCommand::MailWebhookRemove { id } => {
-            if !store::remove_webhook(&open(mc)?, id.trim()).map_err(|e| e.to_string())? {
-                return Err(format!("No webhook with id {id}"));
-            }
-            audit(config, "mail.webhook_remove", Some(&id));
-            println!("Webhook {id} removed.");
+            manage::remove_webhook(&open(mc)?, &id)?;
+            audit(config, "mail.webhook_remove", Some(id.trim()));
+            println!("Webhook {} removed.", id.trim());
             Ok(())
         }
         MailCommand::MailLog { limit, status, id } => {
             let conn = open(mc)?;
             if let Some(id) = id {
-                let m = store::get_message(&conn, &id)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| format!("No email {id}"))?;
+                let d = manage::message(&conn, &id)?;
+                let m = &d.message;
                 println!(
                     "{}  {}  {} -> {}  {:?}",
                     m.created_at,
@@ -508,7 +403,7 @@ async fn run_inner(config: &Config, mc: &MailConfig, cmd: MailCommand) -> R {
                     m.message_id,
                     m.queue_id.as_deref().unwrap_or("-")
                 );
-                for e in store::events_for(&conn, &m.id).map_err(|e| e.to_string())? {
+                for e in d.events {
                     println!(
                         "  {} {} {} {}",
                         e.created_at,
@@ -519,7 +414,7 @@ async fn run_inner(config: &Config, mc: &MailConfig, cmd: MailCommand) -> R {
                 }
                 return Ok(());
             }
-            for m in store::list_messages(&conn, limit.min(1000), status.as_deref()).map_err(|e| e.to_string())? {
+            for m in manage::messages(&conn, limit, status.as_deref())? {
                 println!(
                     "{}  {}  {}  {} -> {}  {}",
                     m.created_at,
@@ -533,43 +428,34 @@ async fn run_inner(config: &Config, mc: &MailConfig, cmd: MailCommand) -> R {
             Ok(())
         }
         MailCommand::MailStatus => {
-            use crate::services::cmd::{run_with, CmdOpts};
-            let active = |u: &str| {
-                run_with("systemctl", &["is-active", u], &CmdOpts::default())
-                    .stdout
-                    .trim()
-                    .to_string()
-            };
-            println!("Hostname          {}", mc.hostname);
-            println!("{}  {}", pad(super::UNIT, 16), active(super::UNIT));
-            println!("{}  {}", pad("postfix", 16), active("postfix"));
-            println!("{}  {}", pad("postsrsd", 16), active("postsrsd"));
-            for (name, addr) in [
-                ("SMTP 587", "127.0.0.1:587"),
-                ("SMTPS 465", "127.0.0.1:465"),
-                ("Inbound 25", "127.0.0.1:25"),
-                ("API", mc.http_addr.as_str()),
-            ] {
-                let up = addr.parse().ok().is_some_and(|a| {
-                    std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_secs(2)).is_ok()
-                });
-                println!("{}  {}", pad(name, 16), if up { "listening" } else { "NOT listening" });
+            let mc2 = mc.clone();
+            let s = tokio::task::spawn_blocking(move || -> Result<manage::Status, String> {
+                Ok(manage::status(&open(&mc2)?, &mc2)?)
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            println!("Hostname          {}", s.hostname);
+            for (unit, state) in &s.units {
+                println!("{}  {state}", pad(unit, 16));
             }
-            let out25 = tokio::task::spawn_blocking(install::outbound_25_open)
-                .await
-                .unwrap_or(false);
-            println!("{}  {}", pad("Outbound 25", 16), if out25 { "open" } else { "BLOCKED" });
-            if !out25 {
+            for p in &s.ports {
+                println!(
+                    "{}  {}",
+                    pad(p.name, 16),
+                    if p.listening { "listening" } else { "NOT listening" }
+                );
+            }
+            println!(
+                "{}  {}",
+                pad("Outbound 25", 16),
+                if s.outbound_25 { "open" } else { "BLOCKED" }
+            );
+            if !s.outbound_25 {
                 println!("\n{}", install::PORT_25_WARNING);
             }
-            let conn = open(mc)?;
-            let domains = store::list_domains(&conn).map_err(|e| e.to_string())?;
             println!(
                 "\nDomains: {} ({} verified), keys: {}, forwards: {}",
-                domains.len(),
-                domains.iter().filter(|d| d.verified).count(),
-                store::list_keys(&conn).map_err(|e| e.to_string())?.len(),
-                store::list_forwards(&conn).map_err(|e| e.to_string())?.len()
+                s.domains, s.verified_domains, s.keys, s.forwards
             );
             Ok(())
         }

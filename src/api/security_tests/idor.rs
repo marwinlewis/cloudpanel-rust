@@ -459,9 +459,9 @@ async fn a_site_manager_can_still_move_their_app_to_a_free_port_or_keep_its_own(
     }
 }
 
-/// Several domains in front of one container is a normal thing for an admin to set up.
+/// Each port belongs to one site, for admins too; the error names the site that has it.
 #[tokio::test]
-async fn an_admin_can_point_two_sites_at_one_port() {
+async fn an_admin_cannot_point_two_sites_at_one_port() {
     let h = super::super::tests::harness();
     let mine = site_id(&h, "mine.example.com");
     let theirs = site_id(&h, "other.example.com");
@@ -480,5 +480,28 @@ async fn an_admin_can_point_two_sites_at_one_port() {
             true,
         )
         .await;
-    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v.to_string().contains("other.example.com"), "{v}");
+    let stored = db::find_site_by_id(&h.pool.get().unwrap(), mine).unwrap().unwrap();
+    assert_eq!(stored.target_port, Some(3000));
+}
+
+/// A new site can't take a port another site's app already uses.
+#[tokio::test]
+async fn a_new_site_cannot_take_a_port_another_site_uses() {
+    let h = super::super::tests::harness();
+    let cookie = h.login("admin").await;
+    let (s, v, _) = h
+        .call(
+            "POST",
+            "/docker/containers/abc123def456/proxy-site",
+            Some(&cookie),
+            Some(json!({"domain": "new.example.com", "host_port": 3000})),
+            true,
+        )
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(v.to_string().contains("Port 3000 is already used by"), "{v}");
+    let conn = h.pool.get().unwrap();
+    assert!(!db::list_sites(&conn).unwrap().iter().any(|s| s.domain == "new.example.com"));
 }

@@ -6,6 +6,8 @@
 #   mail-e2e.sh reinstall      Running install.sh again keeps the service, keys and data
 #   mail-e2e.sh uninstall      install.sh --uninstall removes the service
 #   mail-e2e.sh not-installed  A server installed without --with-mail has none of it
+#   mail-e2e.sh panel          Then install it from the panel's API and manage domains, addresses,
+#                              keys and webhooks there; send with the key, revoke it
 #
 # Mail "to the internet" goes to a local sink on 127.0.0.1:2525 (relayhost), which saves each
 # message with its envelope in /var/tmp/sink.
@@ -253,14 +255,87 @@ not_installed() {
   finish
 }
 
+# ---------- The panel's API ----------
+API=https://127.0.0.1:8443/api
+JAR=/var/tmp/cp.jar
+call() { # method path [json]
+  local m=$1 p=$2 d=${3:-}
+  if [ -n "$d" ]; then
+    curl -sk -b $JAR -c $JAR -X "$m" -H 'X-Requested-With: cloudpanel' -H 'Content-Type: application/json' -d "$d" "$API$p"
+  else
+    curl -sk -b $JAR -c $JAR -X "$m" -H 'X-Requested-With: cloudpanel' "$API$p"
+  fi
+}
+code() { # method path [json] -> HTTP status, body in /var/tmp/body
+  local m=$1 p=$2 d=${3:-}
+  curl -sk -o /var/tmp/body -w '%{http_code}' -b $JAR -c $JAR -X "$m" -H 'X-Requested-With: cloudpanel'     -H 'Content-Type: application/json' ${d:+-d "$d"} "$API$p"
+}
+j() { python3 -c "import sys,json;d=json.load(sys.stdin);print($1)"; }
+login() {
+  rm -f $JAR
+  local pw
+  pw=$(cat /var/lib/cloudpanel/initial_admin_password)
+  call POST /auth/login "{\"username\":\"admin\",\"password\":\"$pw\"}" >/dev/null
+  retry '[ "$(call GET /auth/me | j "d[\"username\"]" 2>/dev/null)" = admin ]' || bad "login"
+}
+run_job() { # path json -> status; output in /var/tmp/job.out
+  local r id status=running
+  r=$(call POST "$1" "$2")
+  id=$(echo "$r" | j 'd["job_id"]') || { echo "no job: $r" >/var/tmp/job.out; echo failed; return; }
+  for _ in $(seq 1 1200); do
+    call GET "/jobs/$id" >/var/tmp/job.json
+    status=$(j 'd["status"]' </var/tmp/job.json)
+    [ "$status" != running ] && break
+    sleep 1
+  done
+  j 'd["output"]' </var/tmp/job.json >/var/tmp/job.out
+  echo "$status"
+}
+
+panel() {
+  echo "== Installing and managing it from the panel"
+  login
+  check "the Email page says it isn't installed" '[ "$(call GET /mail | j "d[\"installed\"]")" = False ]'
+  check "an invalid hostname is refused" '[ "$(code POST /mail/install "{\"hostname\":\"not a host\"}")" = 400 ]'
+  local st
+  st=$(run_job /mail/install '{"hostname":"mail.test","self_signed":true}')
+  check "installed from the panel (job $st)" '[ "$st" = succeeded ]' || tail -30 /var/tmp/job.out
+  check "cloudpanel-mail is active" 'retry "systemctl is-active --quiet cloudpanel-mail"'
+  check "587 is served by the service" 'retry "listening 587"'
+  start_helpers
+  postconf -e 'relayhost = [127.0.0.1]:2525' && postfix reload >/dev/null 2>&1
+
+  check "add a domain, with its DNS records" '[ "$(code POST /mail/domains "{\"domain\":\"panel.test\"}")" = 201 ] && grep -q "cloudpanel._domainkey.panel.test" /var/tmp/body'
+  check "its DKIM key belongs to the service" '[ "$(stat -c "%U %a" /var/lib/cloudpanel-mail/dkim/panel.test.pem)" = "cloudpanel-mail 600" ]'
+  check "verify (forced: no public DNS here)" '[ "$(code POST /mail/domains/panel.test/verify "{\"force\":true}")" = 200 ] && grep -q "\"verified\":true" /var/tmp/body'
+  check "add an address: Postfix is updated from the sandbox" '[ "$(code POST /mail/forwards "{\"address\":\"hi@panel.test\",\"to\":\"inbox@remote.test\"}")" = 201 ] && grep -q "hi@panel.test inbox@remote.test" /etc/postfix/cloudpanel_virtual'
+  check "add a webhook" '[ "$(code POST /mail/webhooks "{\"url\":\"http://127.0.0.1:9099/hook\"}")" = 201 ]'
+  code POST /mail/keys '{"name":"panel","domain":"panel.test"}' >/dev/null
+  local key id
+  key=$(j 'd["secret"]' </var/tmp/body)
+  id=$(j 'd["key"]["id"]' </var/tmp/body)
+  check "create a key (shown once)" '[ "${key#cp_}" != "$key" ] && ! call GET /mail | grep -q "$key"'
+  check "the database files still belong to the service" '[ -z "$(find /var/lib/cloudpanel-mail -maxdepth 1 -name "mail.db*" ! -user cloudpanel-mail)" ]'
+  check "the key sends over 587" '[ "$(smtp_send starttls cloudpanel "$key" hi@panel.test p@remote.test)" = SENT ]'
+  check "the service logged it after the panel's writes" 'retry "call GET /mail/log | grep -q p@remote.test"'
+  check "mail-status from the panel" '[ "$(code GET /mail/status)" = 200 ] && grep -q "\"cloudpanel-mail.service\",\"active\"" /var/tmp/body'
+  check "revoke the key" '[ "$(code DELETE "/mail/keys/$id")" = 200 ]'
+  check "the revoked key can't send" '[ "$(smtp_send starttls cloudpanel "$key" hi@panel.test q@remote.test | cut -d" " -f1)" = REFUSED ]'
+  check "remove the address: Postfix forgets it" '[ "$(code DELETE /mail/forwards/hi@panel.test)" = 200 ] && ! grep -q "hi@panel.test" /etc/postfix/cloudpanel_virtual'
+  check "remove the domain" '[ "$(code DELETE /mail/domains/panel.test)" = 200 ]'
+  check "the panel audited it" '[ "$(code GET "/events?limit=200")" = 200 ] && grep -q mail.forward_add /var/tmp/body'
+  finish
+}
+
 case "${1:-}" in
   installed) installed ;;
   send) send ;;
   reinstall) reinstall ;;
   uninstall) uninstall ;;
   not-installed) not_installed ;;
+  panel) panel ;;
   *)
-    echo "usage: $0 installed|send|reinstall|uninstall|not-installed"
+    echo "usage: $0 installed|send|reinstall|uninstall|not-installed|panel"
     exit 2
     ;;
 esac

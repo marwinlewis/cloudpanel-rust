@@ -17,6 +17,8 @@ pub const MANAGED: &[(&str, &str)] = &[
     ("mongod", "MongoDB database"),
     ("ufw", "Firewall"),
     ("garage", "Object storage (S3)"),
+    ("cloudpanel-mail", "Email sending service"),
+    ("postfix", "Mail transfer agent"),
 ];
 
 #[derive(Serialize, Clone)]

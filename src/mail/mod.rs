@@ -11,8 +11,8 @@
 //! happened to every message and calls webhooks.
 //!
 //! The service's database lives in its own directory, owned by its user, so the root panel's
-//! database and secret key never have to be readable by the internet-facing process. Management is
-//! CLI-only (`cloudpanel mail-*`, run as root).
+//! database and secret key never have to be readable by the internet-facing process. It is managed
+//! from the panel's Email page or the CLI (`cloudpanel mail-*`, run as root), both through [`manage`].
 
 pub mod cli;
 pub mod dkim;
@@ -21,6 +21,7 @@ pub mod events;
 pub mod http;
 pub mod install;
 pub mod keys;
+pub mod manage;
 pub mod message;
 pub mod send;
 pub mod serve;

@@ -10,6 +10,7 @@ pub mod download;
 pub mod error;
 pub mod file_handlers;
 pub mod firewall_handlers;
+pub mod mail_handlers;
 pub mod runner_handlers;
 pub mod service_handlers;
 pub mod site_handlers;
@@ -19,6 +20,8 @@ pub mod system_handlers;
 pub mod user_handlers;
 pub mod wireguard_handlers;
 
+#[cfg(test)]
+mod mail_tests;
 #[cfg(test)]
 mod runner_tests;
 #[cfg(test)]
@@ -334,6 +337,23 @@ fn create_api_router(state: SharedState) -> Router {
             "/sites/:id/storage/keys/:kid",
             delete(storage_handlers::delete_site_key),
         )
+        // Email sending service
+        .route("/mail", get(mail_handlers::get_mail))
+        .route("/mail/status", get(mail_handlers::get_status))
+        .route("/mail/install", post(mail_handlers::install))
+        .route("/mail/uninstall", post(mail_handlers::uninstall))
+        .route("/mail/domains", post(mail_handlers::add_domain))
+        .route("/mail/domains/:domain", delete(mail_handlers::remove_domain))
+        .route("/mail/domains/:domain/dns", get(mail_handlers::domain_dns))
+        .route("/mail/domains/:domain/verify", post(mail_handlers::verify_domain))
+        .route("/mail/forwards", post(mail_handlers::add_forward))
+        .route("/mail/forwards/:address", delete(mail_handlers::remove_forward))
+        .route("/mail/keys", post(mail_handlers::create_key))
+        .route("/mail/keys/:id", delete(mail_handlers::revoke_key))
+        .route("/mail/webhooks", post(mail_handlers::add_webhook))
+        .route("/mail/webhooks/:id", delete(mail_handlers::remove_webhook))
+        .route("/mail/log", get(mail_handlers::list_log))
+        .route("/mail/log/:id", get(mail_handlers::get_message))
         // GitHub Actions runners
         .route(
             "/runners",

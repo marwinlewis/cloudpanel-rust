@@ -29,6 +29,13 @@ pub struct SiteInput {
     pub maintenance_mode: bool,
 }
 
+/// The site, other than `except`, whose app already listens on `port`. Each port belongs to one site.
+pub fn port_owner(sites: &[Site], port: u16, except: Option<i64>) -> Option<&Site> {
+    sites
+        .iter()
+        .find(|s| Some(s.id) != except && s.target_port == Some(port))
+}
+
 /// Resolve the two www request fields, where omitted means redirect, the default for new sites.
 pub fn www_choice(include_www: Option<bool>, www_redirect: Option<bool>) -> (bool, bool) {
     let include = include_www.unwrap_or(true);
@@ -90,6 +97,15 @@ pub fn provision(config: &Config, conn: &Connection, input: SiteInput) -> ApiRes
         if existing.iter().any(|s| s.domain == naked && s.include_www) {
             return Err(ApiError::Conflict(format!(
                 "{domain} is already handled by the site for {naked}"
+            )));
+        }
+    }
+    // nginx would send this site's visitors to the other site's app.
+    if let Some(port) = target_port {
+        if let Some(owner) = port_owner(&existing, port, None) {
+            return Err(ApiError::Conflict(format!(
+                "Port {port} is already used by {}",
+                owner.domain
             )));
         }
     }

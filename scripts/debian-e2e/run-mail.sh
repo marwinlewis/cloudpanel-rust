@@ -4,6 +4,7 @@
 #   server   Installed with --with-mail: send over SMTP and the API, DKIM, delivery tracking,
 #            webhooks, refusals and forwarding, then a second install and an uninstall.
 #   fresh    Installed without it, and without a terminal: nothing mail-related is installed.
+#            Then it is installed and managed from the panel's API (the Email page).
 #
 #   scripts/debian-e2e/run-mail.sh          Run everything, remove the containers
 #   scripts/debian-e2e/run-mail.sh --keep   Keep them afterwards
@@ -115,6 +116,7 @@ wait "$fresh_install" || {
   exit 1
 }
 t "$fresh" not-installed
+t "$fresh" panel
 
 [ "$status" = 0 ] && echo "==> All mail checks passed" || echo "==> Some mail checks failed"
 exit "$status"
