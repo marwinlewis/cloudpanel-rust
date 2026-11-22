@@ -768,8 +768,10 @@ export function sslDialog(site, done) {
 // ---------- Logs ----------
 
 function tabLogs(el, { site }) {
+  const usesPm2 = HAS_APP.has(site.site_type) && site.app_manager === 'pm2';
   const kinds = [['access', 'Access log'], ['error', 'Error log']];
-  if (HAS_APP.has(site.site_type)) kinds.push(['app', 'App output']);
+  if (usesPm2) kinds.unshift(['pm2', 'PM2 logs']);
+  else if (HAS_APP.has(site.site_type)) kinds.push(['app', 'App output']);
   const kind = h('select', { class: 'input', 'aria-label': 'Log' }, kinds.map(([v, t]) => h('option', { value: v, text: t })));
   const lines = h('select', { class: 'input', 'aria-label': 'Lines' }, [100, 500, 2000].map((n) => h('option', { value: n, text: `Last ${n} lines`, selected: n === 500 })));
   kind.style.width = 'auto'; lines.style.width = 'auto';

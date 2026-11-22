@@ -602,7 +602,10 @@ pub async fn get_site_logs(
                     Ok(crate::fsutil::tail_file(&path, lines).unwrap_or_else(|_| String::new()))
                 }
                 "app" => apps::logs(&site, lines).map_err(ApiError::Unprocessable),
-                _ => Err(ApiError::BadRequest("kind must be access, error or app".into())),
+                // Only the PM2 log files: `app` falls back to the daemon unit's journal when they are empty.
+                "pm2" if site.uses_pm2() => pm2::logs(&site, lines).map_err(ApiError::Unprocessable),
+                "pm2" => Err(ApiError::BadRequest("This site does not run under PM2".into())),
+                _ => Err(ApiError::BadRequest("kind must be access, error, app or pm2".into())),
             }
         })
         .await?;
