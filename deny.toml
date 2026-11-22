@@ -17,6 +17,9 @@ ignore = [
     # Unmaintained, not vulnerable. Also pulled in by axum-server. Replace with rustls-pki-types' PEM
     # parsing when axum-server drops it.
     { id = "RUSTSEC-2025-0134", reason = "unmaintained only; also a dependency of axum-server" },
+    # chrono: unmaintained, no known vulnerability and no replacement release. Used across the
+    # codebase and through rusqlite's `chrono` feature. Remove once it is replaced (e.g. by jiff).
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained only; replacing chrono is a separate change" },
 ]
 
 [licenses]

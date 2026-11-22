@@ -503,5 +503,8 @@ async fn a_new_site_cannot_take_a_port_another_site_uses() {
     assert_eq!(s, StatusCode::CONFLICT, "{v}");
     assert!(v.to_string().contains("Port 3000 is already used by"), "{v}");
     let conn = h.pool.get().unwrap();
-    assert!(!db::list_sites(&conn).unwrap().iter().any(|s| s.domain == "new.example.com"));
+    assert!(!db::list_sites(&conn)
+        .unwrap()
+        .iter()
+        .any(|s| s.domain == "new.example.com"));
 }
