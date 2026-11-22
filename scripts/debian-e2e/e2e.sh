@@ -89,6 +89,8 @@ before_reboot() {
   check "create site ($R)" '[ -n "$PRE" ]'
   check "new Node.js site defaults to PM2" '[ "$(echo "$R" | j "d[\"app_manager\"]")" = pm2 ]'
   check "new site redirects www by default" '[ "$(echo "$R" | j "d[\"include_www\"] and d[\"www_redirect\"]")" = True ]'
+  check "new site starts behind the maintenance page" '[ "$(echo "$R" | j "d[\"maintenance_mode\"]")" = True ] && [ "$(host_code pre.test.local)" = 503 ]'
+  check "maintenance can be turned off" '[ "$(call PUT /sites/$PRE/maintenance "{\"enabled\":false}" | j "d[\"maintenance_mode\"]")" = False ]'
   JOB=$(echo "$R" | j 'd.get("runtime_job_id") or ""')
   if [ -n "$JOB" ]; then
     # The job installs Node.js and PM2. Wait for it before anything else uses them.
@@ -247,7 +249,7 @@ EOF
   check "only one process serves the port" '[ "$(ss -ltnH "sport = :3101" | wc -l)" = 1 ]'
 
   echo "== Taking over a PM2 daemon started by hand"
-  R=$(call POST /sites '{"domain":"hand.test.local","site_type":"nodejs","target_port":3102,"app_manager":"systemd","include_www":false}')
+  R=$(call POST /sites '{"domain":"hand.test.local","maintenance_mode":false,"site_type":"nodejs","target_port":3102,"app_manager":"systemd","include_www":false}')
   HAND=$(echo "$R" | j 'd.get("id","")')
   H=/home/hand-test/htdocs/hand.test.local
   write_server "$H"
@@ -272,7 +274,7 @@ EOF
   check "app survives the old session ending" '[ "$(host_code hand.test.local)" = 200 ]'
 
   echo "== Install and build from source"
-  R=$(call POST /sites '{"domain":"src.test.local","site_type":"nodejs","target_port":3103}')
+  R=$(call POST /sites '{"domain":"src.test.local","maintenance_mode":false,"site_type":"nodejs","target_port":3103}')
   SRC=$(echo "$R" | j 'd.get("id","")')
   S=/home/src-test/htdocs/src.test.local
   write_server "$S"
@@ -322,7 +324,7 @@ EOF
   check "build says there is no script (status $s)" '[ "$s" = failed ] && grep -q "no build script" /var/tmp/job.out'
 
   echo "== A crash loop is visible, and install brings the app back"
-  R=$(call POST /sites '{"domain":"dep.test.local","site_type":"nodejs","target_port":3104,"app_command":"server.js"}')
+  R=$(call POST /sites '{"domain":"dep.test.local","maintenance_mode":false,"site_type":"nodejs","target_port":3104,"app_command":"server.js"}')
   DEP=$(echo "$R" | j 'd.get("id","")')
   D=/home/dep-test/htdocs/dep.test.local
   cat >"$D/server.js" <<'EOF'
@@ -338,7 +340,7 @@ EOF
   checkr "install brings the app back with no manual restart" 'host_get dep.test.local | grep -q "dep ok"'
 
   echo "== Python stays on systemd"
-  R=$(call POST /sites '{"domain":"py.test.local","site_type":"python","target_port":3105,"app_command":"python3 -m http.server $PORT --bind 127.0.0.1"}')
+  R=$(call POST /sites '{"domain":"py.test.local","maintenance_mode":false,"site_type":"python","target_port":3105,"app_command":"python3 -m http.server $PORT --bind 127.0.0.1"}')
   PY=$(echo "$R" | j 'd.get("id","")')
   check "Python defaults to systemd" '[ "$(echo "$R" | j "d[\"app_manager\"]")" = systemd ]'
   check "PM2 is refused for Python" '[ "$(code PUT /sites/$PY/app "{\"command\":\"x\",\"enabled\":true,\"manager\":\"pm2\"}")" = 400 ]'
@@ -366,7 +368,7 @@ EOF
   check "first save clears the database copy" '[ -z "$(call GET /sites/$PY/app/env | j "d[\"imported_keys\"] or \"\"")" ]'
 
   echo "== www redirect"
-  WWW=$(create '{"domain":"site.test.local","site_type":"static"}')
+  WWW=$(create '{"domain":"site.test.local","maintenance_mode":false,"site_type":"static"}')
   C=/var/tmp/cert
   mkdir -p $C
   make_cert() { # name, SANs
@@ -407,11 +409,11 @@ EOF
   check "nginx config is valid when off" 'nginx -t -q 2>/dev/null'
 
   echo "== www edge cases"
-  R=$(call POST /sites '{"domain":"www.prefixed.test.local","site_type":"static"}')
+  R=$(call POST /sites '{"domain":"www.prefixed.test.local","maintenance_mode":false,"site_type":"static"}')
   check "a www. domain gets no www.www." '[ "$(echo "$R" | j "d[\"include_www\"]")" = False ]'
-  R=$(call POST /sites '{"domain":"prefixed.test.local","site_type":"static"}')
+  R=$(call POST /sites '{"domain":"prefixed.test.local","maintenance_mode":false,"site_type":"static"}')
   check "the naked domain leaves an existing www site alone" '[ "$(echo "$R" | j "d[\"include_www\"]")" = False ]'
-  R=$(call POST /sites '{"domain":"taken.test.local","site_type":"static"}')
+  R=$(call POST /sites '{"domain":"taken.test.local","maintenance_mode":false,"site_type":"static"}')
   check "a www site is refused when the naked site handles it" '[ "$(code POST /sites "{\"domain\":\"www.taken.test.local\",\"site_type\":\"static\"}")" = 409 ]'
   check "nginx config is valid after all of that" 'nginx -t -q 2>/dev/null'
 
