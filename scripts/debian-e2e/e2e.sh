@@ -211,7 +211,9 @@ EOF
   as_user pre-test sh -c 'echo marker-log-line >> $PM2_HOME/logs/pre.test.local-out.log'
   check "logs come from PM2 log files" 'call GET "/sites/$PRE/app/logs?lines=20" | grep -q marker-log-line'
   check "the Logs tab reads them too" 'call GET "/sites/$PRE/logs?kind=app&lines=20" | grep -q marker-log-line'
+  check "the Logs tab's PM2 view reads them" 'call GET "/sites/$PRE/logs?kind=pm2&lines=20" | grep -q marker-log-line'
   check "flush empties them" 'call POST /sites/$PRE/app/flush | grep -q active_state && ! call GET "/sites/$PRE/app/logs?lines=20" | grep -q marker-log-line'
+  check "the PM2 view never falls back to the daemon's journal" '[ "$(call GET "/sites/$PRE/logs?kind=pm2&lines=200" | j "d[\"logs\"]" | grep -c "systemd\[")" = 0 ]'
   check "site stays up after flush" '[ "$(host_code pre.test.local)" = 200 ]'
 
   echo "== PM2: ecosystem file"
@@ -341,6 +343,7 @@ EOF
   check "Python defaults to systemd" '[ "$(echo "$R" | j "d[\"app_manager\"]")" = systemd ]'
   check "PM2 is refused for Python" '[ "$(code PUT /sites/$PY/app "{\"command\":\"x\",\"enabled\":true,\"manager\":\"pm2\"}")" = 400 ]'
   checkr "Python app answers" '[ "$(host_code py.test.local)" = 200 ]'
+  check "PM2 logs are refused for a systemd site" '[ "$(code GET "/sites/$PY/logs?kind=pm2")" = 400 ]'
   printf 'E2E_SECRET=py-8\n' >/home/py-test/htdocs/py.test.local/.env
   chown py-test: /home/py-test/htdocs/py.test.local/.env
   call POST /sites/$PY/app/restart >/dev/null
