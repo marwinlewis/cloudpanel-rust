@@ -106,14 +106,33 @@ function renderFiles(el, { site }) {
     try { r = await api(`/sites/${site.id}/files/content?path=${encodeURIComponent(path)}`); } catch (e) { toast(e.message, 'error'); return; }
     const ta = h('textarea', { class: 'input mono editor', spellcheck: 'false', 'aria-label': `Edit ${path}` });
     ta.value = r.content;
+    // Grow with the content (CSS caps it at the viewport, then it scrolls). A height the user
+    // picks with the resize handle becomes the new floor, so typing doesn't undo it.
+    let userMin = 0;
+    const autoGrow = () => {
+      const top = ta.scrollTop; // collapsing to 'auto' would clamp it and jump the view
+      ta.style.height = 'auto';
+      const chrome = ta.offsetHeight - ta.clientHeight; // borders + horizontal scrollbar
+      ta.style.height = `${Math.max(ta.scrollHeight + chrome, userMin)}px`;
+      ta.scrollTop = top;
+    };
+    let heightAtPress = 0;
+    ta.addEventListener('pointerdown', () => { heightAtPress = ta.offsetHeight; });
+    document.addEventListener('pointerup', function onUp() {
+      if (!ta.isConnected) { document.removeEventListener('pointerup', onUp); return; }
+      if (heightAtPress && ta.offsetHeight !== heightAtPress) userMin = ta.offsetHeight;
+      heightAtPress = 0;
+    });
+    ta.addEventListener('input', autoGrow);
     ta.addEventListener('keydown', (e) => {
-      if (e.key === 'Tab') { e.preventDefault(); const s = ta.selectionStart; ta.setRangeText('    ', s, ta.selectionEnd, 'end'); }
+      if (e.key === 'Tab') { e.preventDefault(); const s = ta.selectionStart; ta.setRangeText('    ', s, ta.selectionEnd, 'end'); autoGrow(); }
       if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); save.click(); }
     });
     const save = h('button', { class: 'btn primary', type: 'button', text: 'Save' });
     const close = h('button', { class: 'btn', type: 'button', text: 'Close' });
     const d = openDialog({ title: path.split('/').pop(), description: path, wide: true, body: ta, footer: [close, save] });
     close.addEventListener('click', d.close);
+    autoGrow(); // the textarea is in the DOM now, so scrollHeight is real
     save.addEventListener('click', () => withBusy(save, async () => {
       await api(`/sites/${site.id}/files/content`, { method: 'PUT', body: { path, content: ta.value } });
       // This file is the one the Application tab edits; apps read it when they start.

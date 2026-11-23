@@ -154,7 +154,12 @@ export function openDialog({ title, description, body, footer, drawer = false, w
     footer && h('div', { class: 'dialog-foot' }, footer));
   const close = () => dlg.open && dlg.close();
   closeBtn.addEventListener('click', close);
-  dlg.addEventListener('click', (e) => { if (e.target === dlg) close(); });
+  // Close on backdrop clicks only when the press also started on the backdrop. A drag that
+  // starts inside (resizing a textarea, selecting text) and ends outside fires `click` on the
+  // common ancestor — the dialog itself — and must not close it.
+  let downOnBackdrop = false;
+  dlg.addEventListener('pointerdown', (e) => { downOnBackdrop = e.target === dlg; });
+  dlg.addEventListener('click', (e) => { if (e.target === dlg && downOnBackdrop) close(); downOnBackdrop = false; });
   dlg.addEventListener('close', () => { dlg.remove(); onClose && onClose(); });
   document.body.append(dlg);
   dlg.showModal();

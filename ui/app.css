@@ -315,7 +315,7 @@ dialog {
   box-shadow: var(--shadow-lg); width: min(480px, calc(100vw - 32px)); max-height: calc(100vh - 48px);
 }
 dialog::backdrop { background: rgb(9 9 11 / 0.45); backdrop-filter: blur(2px); }
-dialog[open] { animation: pop .16s ease-out; }
+dialog[open] { display: flex; flex-direction: column; animation: pop .16s ease-out; }
 @keyframes pop { from { opacity: 0; transform: translateY(6px) scale(.98); } }
 dialog.drawer {
   margin: 0 0 0 auto; height: 100vh; max-height: 100vh; width: min(520px, 100vw); border-radius: 0;
@@ -327,7 +327,8 @@ dialog.wide { width: min(880px, calc(100vw - 32px)); }
 .dialog-head { display: flex; align-items: flex-start; gap: 12px; padding: 18px 20px 0; }
 .dialog-head h2 { font-size: 16px; }
 .dialog-head p { font-size: 13px; color: var(--text-2); margin-top: 2px; }
-.dialog-body { padding: 18px 20px; overflow-y: auto; }
+.dialog-head, .dialog-foot { flex-shrink: 0; }
+.dialog-body { padding: 18px 20px; overflow-y: auto; min-height: 0; }
 .drawer .dialog-body { flex: 1; }
 .dialog-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 20px; border-top: 1px solid var(--border); background: var(--surface); }
 .logs { margin: 0; background: #0b0b0e; color: #d4d4d8; padding: 14px; border-radius: var(--radius-sm); min-height: 300px; max-height: calc(100vh - 220px); overflow: auto; white-space: pre-wrap; word-break: break-all; line-height: 1.55; }
@@ -396,7 +397,8 @@ code.secret { display: block; flex: 1; padding: 10px 12px; background: var(--sur
 .crumbs .sep { color: var(--text-3, var(--text-2)); }
 tr.clickable { cursor: pointer; }
 tr.selected td { background: var(--surface-2); }
-.editor { width: 100%; min-height: 60vh; font-size: 13px; line-height: 1.5; tab-size: 4; white-space: pre; }
+/* Height is set by autoGrow() in site-files.js; max-height leaves room for the dialog head and foot. */
+textarea.editor { display: block; width: 100%; min-height: 240px; max-height: calc(100vh - 220px); font-size: 13px; line-height: 1.5; tab-size: 4; white-space: pre; overflow: auto; }
 .qr { display: grid; place-items: center; padding: 12px; background: #fff; border-radius: var(--radius-sm); width: fit-content; margin: 0 auto; }
 .qr svg { width: 200px; height: 200px; display: block; }
 .codes { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; font-size: 14px; }
