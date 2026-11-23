@@ -6,6 +6,10 @@ A lightweight, self-contained server control panel written in Rust. One static b
 - **Small footprint**: Tokio + Axum + embedded SQLite.
 - **Secure defaults**: HTTPS out of the box, Argon2id passwords, optional TOTP 2FA, role-based access, an audit log, strict input validation and a strict Content-Security-Policy.
 
+[![GitHub release](https://img.shields.io/github/v/release/marwinlewis/cloudpanel-rust)](https://github.com/marwinlewis/cloudpanel-rust/releases)
+[![Changelog](https://img.shields.io/badge/changelog-CHANGELOG.md-blue)](CHANGELOG.md)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 ![The Overview page, with CPU, memory, disk and network cards, system details, storage and top processes](docs/screenshots/overview.png)
 
 More in [Screenshots](#screenshots).
@@ -294,9 +298,22 @@ scripts/debian-e2e/run.sh
 
 On Windows and in local development, system tools (nginx, ufw, certbot, systemctl, useradd, …) are skipped when they aren't installed, and configs are written under `./data`. The UI lives in `ui/` as plain ES modules (`ui/js/core.js` for shared helpers, one module per page under `ui/js/pages/`).
 
-### Releasing
+### Releasing & Changelog
 
-Push a tag such as `v0.3.0`. The release workflow builds static musl binaries for x86_64 and aarch64, publishes them with `.sha256` checksums, and the installer picks them up automatically. The binaries take their version from the tag, so `Cargo.toml` doesn't need bumping for a release to report the right one and for panels to stop offering it once it is installed. Builds from source report the version in `Cargo.toml`.
+Push a tag such as `v0.4.5`. The release workflow builds static musl binaries for x86_64 and aarch64, extracts release notes from [CHANGELOG.md](CHANGELOG.md) to populate the [GitHub Releases](https://github.com/marwinlewis/cloudpanel-rust/releases) page, and publishes the binaries with `.sha256` checksums. The binaries take their version from the tag, so `Cargo.toml` doesn't need bumping for a release to report the right one and for panels to stop offering it once it is installed. Builds from source report the version in `Cargo.toml`.
+
+To synchronize release notes from `CHANGELOG.md` to GitHub Releases (using `gh` CLI or `GITHUB_TOKEN`):
+
+```bash
+# Preview what will be synced
+python3 scripts/sync-release-notes.py --all --dry-run
+
+# Sync all releases to GitHub /releases page
+python3 scripts/sync-release-notes.py --all
+
+# Or sync a specific tag
+python3 scripts/sync-release-notes.py --tag v0.4.4
+```
 
 ## License
 

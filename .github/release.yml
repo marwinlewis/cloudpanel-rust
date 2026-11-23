@@ -1,0 +1,33 @@
+# Configuration for GitHub's automated release notes generator
+# https://docs.github.com/en/repositories/releasing-projects-on-github/automatically-generated-release-notes
+
+changelog:
+  categories:
+    - title: "🚀 Features & Enhancements"
+      labels:
+        - "feature"
+        - "enhancement"
+        - "feat"
+    - title: "🐛 Bug Fixes"
+      labels:
+        - "fix"
+        - "bug"
+        - "bugfix"
+    - title: "🔒 Security Hardening"
+      labels:
+        - "security"
+    - title: "🧪 Tests & Quality Assurance"
+      labels:
+        - "test"
+        - "testing"
+        - "ci"
+    - title: "📚 Documentation"
+      labels:
+        - "documentation"
+        - "docs"
+    - title: "🧰 Maintenance & Dependencies"
+      labels:
+        - "dependencies"
+        - "maintenance"
+        - "refactor"
+        - "chore"
